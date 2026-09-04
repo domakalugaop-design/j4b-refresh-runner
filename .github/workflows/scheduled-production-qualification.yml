@@ -1,0 +1,80 @@
+name: Scheduled production qualification
+
+on:
+  schedule:
+    # TEMPORARY qualification trigger: 2026-09-04 around 16:47 Moscow (13:47 UTC).
+    # Delete after the first scheduled run is observed and verified.
+    - cron: "47 13 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: j4b-refresh-production
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUN_MODE: production
+      ALLOW_PRODUCTION_WRITE: "true"
+      PRODUCTION_CONFIRMATION: J4B_PRODUCTION
+      PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+      PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+      PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+      GOOGLE_WORKSHEET: projects_current
+      PORTAL_REQUEST_DELAY: "0.15"
+
+    steps:
+      - name: Checkout production cutover branch
+        uses: actions/checkout@v4
+        with:
+          ref: production-cutover
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Public repository safety check
+        run: python scripts/public_repo_safety_check.py
+
+      - name: Unit and portability tests
+        run: python -m pytest -q
+
+      - name: Validate required runtime secrets
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          required = [
+              "PORTAL_BASE_URL",
+              "PORTAL_LOGIN",
+              "PORTAL_PASSWORD",
+              "GOOGLE_CLIENT_ID",
+              "GOOGLE_CLIENT_SECRET",
+              "GOOGLE_REFRESH_TOKEN",
+              "GOOGLE_SPREADSHEET_ID",
+          ]
+          missing = [name for name in required if not os.environ.get(name, "").strip()]
+          if missing:
+              raise SystemExit("Missing required GitHub Actions secrets: " + ", ".join(missing))
+          if os.environ.get("RUN_MODE") != "production":
+              raise SystemExit("RUN_MODE gate failed")
+          if os.environ.get("ALLOW_PRODUCTION_WRITE") != "true":
+              raise SystemExit("ALLOW_PRODUCTION_WRITE gate failed")
+          if os.environ.get("PRODUCTION_CONFIRMATION") != "J4B_PRODUCTION":
+              raise SystemExit("PRODUCTION_CONFIRMATION gate failed")
+          print("PRODUCTION_RUNTIME_GATE=PASS")
+          PY
+
+      - name: Run production refresh
+        run: python -m src.production
