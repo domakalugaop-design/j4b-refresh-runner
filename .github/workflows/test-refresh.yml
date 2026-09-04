@@ -41,7 +41,7 @@ jobs:
         run: python scripts/public_repo_safety_check.py
 
       - name: Unit and portability tests
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Validate required runtime secrets
         shell: bash
