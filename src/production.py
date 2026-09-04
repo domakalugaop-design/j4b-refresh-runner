@@ -107,7 +107,7 @@ def run() -> dict[str, Any]:
         publish(token, sid, candidate, previous)
         _stage("PUBLISH_PASS")
         _stage("READBACK_PASS")
-        _stage("TYPE_VALIDATION_PASS")
+        _stage("TYPE_VALIDATION=EXTERNAL_POSTCHECK_REQUIRED")
 
         failed = sum(p.get("acquisition_state") == "FAILED" for p in projects)
         finished_at = now()
