@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local configuration / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+*credentials*.json
+*token*.json
+
+# Runtime outputs / private artifacts
+artifacts/
+output/
+outputs/
+backups/
+snapshots/
+cache/
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# Raw data / exports
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.ndjson
+*.jsonl
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
