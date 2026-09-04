@@ -147,17 +147,33 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
     return record, visits
 
 
-def discover_universe(session: Any) -> list[dict[str, Any]]:
-    status, _content_type, body = session.request("/api/project", "GET", accept="application/json")
-    if status != 200:
-        raise RuntimeError(f"project universe request failed: HTTP {status}")
-    payload = json.loads(body.decode("utf-8", "replace"), strict=False)
-    if not isinstance(payload, dict):
-        raise RuntimeError("project universe response is not an object")
-    rows = []
-    for project_id, raw in payload.items():
-        if not str(project_id).isdigit():
-            continue
-        name = raw.get("name") if isinstance(raw, dict) else raw
-        rows.append({"project_id": str(project_id), "project_name": str(name) if name not in (None, "") else None})
-    return sorted(rows, key=lambda row: int(row["project_id"]))
+def discover_universe(session: Any, attempts: int = 3) -> list[dict[str, Any]]:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        status, content_type, body = session.request("/api/project", "GET", accept="application/json")
+        if status != 200:
+            last_error = RuntimeError(f"project universe request failed: HTTP {status}")
+        elif not body:
+            last_error = RuntimeError("project universe response body is empty")
+        else:
+            try:
+                payload = json.loads(body.decode("utf-8", "replace"), strict=False)
+            except json.JSONDecodeError as exc:
+                last_error = RuntimeError(
+                    f"project universe returned non-JSON body: content_type={content_type or 'unknown'} bytes={len(body)}"
+                )
+            else:
+                if not isinstance(payload, dict):
+                    last_error = RuntimeError("project universe response is not an object")
+                else:
+                    rows = []
+                    for project_id, raw in payload.items():
+                        if not str(project_id).isdigit():
+                            continue
+                        name = raw.get("name") if isinstance(raw, dict) else raw
+                        rows.append({"project_id": str(project_id), "project_name": str(name) if name not in (None, "") else None})
+                    return sorted(rows, key=lambda row: int(row["project_id"]))
+        if attempt < attempts:
+            print(f"UNIVERSE_DISCOVERY_RETRY | attempt={attempt + 1}/{attempts}", flush=True)
+            time.sleep(float(attempt))
+    raise last_error or RuntimeError("project universe discovery failed")
