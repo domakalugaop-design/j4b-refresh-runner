@@ -26,6 +26,9 @@ class Reader:
         self.cap = cap
         self.count = 0
         self.failures = 0
+        self.project_completed = 0
+        self.project_failures = 0
+        self.started_monotonic = time.monotonic()
 
     def _reserve(self) -> None:
         if self.count >= self.cap:
@@ -51,6 +54,25 @@ class Reader:
         except Exception:
             self.failures += 1
             return {"state": "REQUEST_FAILED", "http_status": None, "content_type": None, "body": b""}
+
+    def project_done(self, failed: bool) -> None:
+        self.project_completed += 1
+        if failed:
+            self.project_failures += 1
+        total = max(self.cap // 3, 1)
+        if self.project_completed % 10 != 0 and self.project_completed != total:
+            return
+        elapsed = max(time.monotonic() - self.started_monotonic, 0.001)
+        rate = self.project_completed / elapsed * 60.0
+        remaining = max(total - self.project_completed, 0)
+        eta_minutes = remaining / rate if rate > 0 else 0.0
+        print(
+            f"ACQUISITION {self.project_completed}/{total} | "
+            f"success={self.project_completed - self.project_failures} | "
+            f"failed={self.project_failures} | http={self.count} | "
+            f"elapsed={elapsed:.0f}s | {rate:.1f} proj/min | ETA={eta_minutes:.1f} min",
+            flush=True,
+        )
 
 
 def action_index(markup: str, project_id: str) -> dict[str, dict[str, Any]]:
@@ -121,6 +143,7 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
             "raw_status": field(raw, "VALUE_PRESENT" if raw else "UNKNOWN", f"/action?project={project_id}"),
             "assignment_state": field(action_row.get("assignment_state", "UNKNOWN"), "VALUE_PRESENT" if visit_id in actions else "UNKNOWN", f"/action?project={project_id}"),
         })
+    reader.project_done(failed)
     return record, visits
 
 
