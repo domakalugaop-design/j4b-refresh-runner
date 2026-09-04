@@ -158,7 +158,7 @@ def discover_universe(session: Any, attempts: int = 3) -> list[dict[str, Any]]:
         else:
             try:
                 payload = json.loads(body.decode("utf-8", "replace"), strict=False)
-            except json.JSONDecodeError as exc:
+            except json.JSONDecodeError:
                 last_error = RuntimeError(
                     f"project universe returned non-JSON body: content_type={content_type or 'unknown'} bytes={len(body)}"
                 )
@@ -174,6 +174,8 @@ def discover_universe(session: Any, attempts: int = 3) -> list[dict[str, Any]]:
                         rows.append({"project_id": str(project_id), "project_name": str(name) if name not in (None, "") else None})
                     return sorted(rows, key=lambda row: int(row["project_id"]))
         if attempt < attempts:
-            print(f"UNIVERSE_DISCOVERY_RETRY | attempt={attempt + 1}/{attempts}", flush=True)
+            print(f"UNIVERSE_DISCOVERY_REAUTH | attempt={attempt + 1}/{attempts}", flush=True)
+            session.close()
             time.sleep(float(attempt))
+            session.login()
     raise last_error or RuntimeError("project universe discovery failed")
