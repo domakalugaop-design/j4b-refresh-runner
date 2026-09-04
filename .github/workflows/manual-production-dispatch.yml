@@ -2,6 +2,10 @@ name: Manual production refresh
 
 on:
   workflow_dispatch:
+  schedule:
+    # TEMPORARY qualification trigger: 2026-09-04 around 16:05 Moscow (13:05 UTC).
+    # Remove immediately after the scheduled qualification run is verified.
+    - cron: "5 13 * * *"
 
 permissions:
   contents: read
