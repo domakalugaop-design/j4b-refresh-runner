@@ -21,9 +21,7 @@ jobs:
       PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
       PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
       PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
-      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
-      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
-      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
       GOOGLE_WORKSHEET: projects_current
       PORTAL_REQUEST_DELAY: "0.15"
@@ -56,9 +54,7 @@ jobs:
               "PORTAL_BASE_URL",
               "PORTAL_LOGIN",
               "PORTAL_PASSWORD",
-              "GOOGLE_CLIENT_ID",
-              "GOOGLE_CLIENT_SECRET",
-              "GOOGLE_REFRESH_TOKEN",
+              "GOOGLE_SERVICE_ACCOUNT_JSON",
               "GOOGLE_SPREADSHEET_ID",
           ]
           missing = [name for name in required if not os.environ.get(name, "").strip()]
