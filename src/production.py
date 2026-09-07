@@ -10,9 +10,9 @@ from urllib.error import HTTPError
 
 from .acquisition import Reader, acquire_project, discover_universe
 from .portal_transport import PortalSession
+from .google_service_account import google_token
 from .refresh import (
     COLUMNS,
-    google_token,
     materialize,
     merge_previous,
     now,
