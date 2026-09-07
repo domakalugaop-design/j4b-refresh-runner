@@ -187,8 +187,13 @@ def sheet_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
     return out
 
 
-def read_sheet(token: str, sid: str, rows: int = 10000) -> list[list[Any]]:
-    rng = urllib.parse.quote(f"{SHEET_NAME}!A1:{col(len(COLUMNS)-1)}{rows}", safe="!:")
+def read_sheet(token: str, sid: str, rows: int | None = None) -> list[list[Any]]:
+    # Read the full schema width without a fixed row bound. A hard-coded row
+    # endpoint can exceed the worksheet grid after Sheets compacts/resizes it,
+    # causing values.get to fail with HTTP 400 before the refresh can start.
+    # An open-ended A:AE range follows the actual grid and still returns only
+    # populated values.
+    rng = urllib.parse.quote(f"{SHEET_NAME}!A:{col(len(COLUMNS)-1)}", safe="!:")
     data = api_get(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{rng}?valueRenderOption=UNFORMATTED_VALUE", token)
     return data.get("values", [])
 
