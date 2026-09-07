@@ -6,6 +6,7 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.error import HTTPError
 
 from .acquisition import Reader, acquire_project, discover_universe
 from .portal_transport import PortalSession
@@ -136,6 +137,27 @@ def main() -> int:
         report = run()
         print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)
         return 0
+    except HTTPError as exc:
+        try:
+            response_body = exc.read().decode("utf-8", errors="replace")[:4000]
+        except Exception:
+            response_body = "<unavailable>"
+        print(
+            json.dumps(
+                {
+                    "FINAL_STATUS": "FAILED",
+                    "ERROR_TYPE": type(exc).__name__,
+                    "ERROR_MESSAGE": str(exc),
+                    "HTTP_STATUS": exc.code,
+                    "HTTP_REASON": exc.reason,
+                    "HTTP_RESPONSE_BODY": response_body,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 1
     except Exception as exc:
         print(
             json.dumps(
