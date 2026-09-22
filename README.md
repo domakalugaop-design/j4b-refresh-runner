@@ -79,7 +79,26 @@ No secret value belongs in the repository.
 
 The current workflow is intentionally **manual TEST only**. Code rejects `RUN_MODE != test` and rejects `ALLOW_PRODUCTION_WRITE=true` during qualification.
 
-Until an explicit cutover decision is made, the existing qualified local production writer remains authoritative. This repository must not be enabled as a recurring production writer in parallel with another production writer.
+This code-only cutover does not change a workflow or scheduler and does not
+enable a second recurring production writer.
+
+## Production Project Type contract
+
+The production materialized schema is 33 columns. The original 31 operational
+columns remain in A:AE, followed by `project_type_code` and
+`project_type_name` in AF:AG. The runner reads and maintains immutable qualified
+assignments in the persisted `project_types` tab; it does not issue a type
+detail request for an already assigned project. New or pending projects are
+eligible only when a valid MMYY marker in `project_name`, normalized to
+`(YYYY, MM)`, is September 2026 or later. A raw Portal type value of zero stays
+pending and may be retried. The code-to-name mapping is validated against the
+qualified dictionary in `src/project_types.py`.
+
+Publication is guarded: source acquisition, state validation, candidate
+validation, and diff planning happen before the production write authorization
+check. Project Type state and `projects_current` publication have rollback and
+readback safeguards, while semantic operational acquisition failures retain
+last-good materialized values.
 
 Migration sequence:
 
@@ -92,4 +111,6 @@ Migration sequence:
 
 ## Status
 
-Portable TEST runner is prepared on `migration/local-prod-port`. No live GitHub Actions refresh has been executed yet because TEST runtime Secrets are not configured through this chat connection. No scheduled production workflow is enabled.
+The production-cutover runner contains the 33-column Project Type contract.
+This code change does not execute or push a live refresh and does not enable a
+scheduled production workflow.

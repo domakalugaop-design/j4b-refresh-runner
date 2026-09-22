@@ -19,6 +19,8 @@ class PortalSession:
     def __init__(self, timeout: float = 60):
         self.timeout = timeout
         self.requests = 0
+        self.auth_get_count = 0
+        self.auth_post_count = 0
         self.cookie_path: Path | None = None
         self.base_url = _required("PORTAL_BASE_URL").rstrip("/")
         self.login_value = _required("PORTAL_LOGIN")
@@ -53,6 +55,7 @@ class PortalSession:
         handle.close()
         base = self._base_args()
         subprocess.run(base + ["--output", "/dev/null", self.base_url + "/"], check=True)
+        self.auth_get_count += 1
         form = urllib.parse.urlencode(
             {"_login": self.login_value, "_password": self.password_value, "_enter": "1"}
         )
@@ -71,6 +74,7 @@ class PortalSession:
             text=True,
             check=True,
         )
+        self.auth_post_count += 1
 
     def request(
         self,

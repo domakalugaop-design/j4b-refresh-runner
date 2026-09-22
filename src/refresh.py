@@ -17,9 +17,18 @@ from urllib.error import URLError
 
 from .acquisition import COMPLETED_CODES, Reader, acquire_project, discover_universe
 from .portal_transport import PortalSession
+from .project_types import STATE_COLUMNS, serialize_state, validate_state_rows
 
 SHEET_NAME = os.environ.get("GOOGLE_WORKSHEET", "projects_current")
-COLUMNS = ["project_id","project_name","period","plan","plan_value","plan_status","created","completed","unassigned","execution_pct","plan_missing_with_activity","has_period_marker","project_start","project_end","elapsed_pct","lag","risk_status","risk_reason","validation_state","last_refreshed","client","primary_manager","coordinators","date_from","date_to","scope","manager_payment","wave","assigned","questionnaire_filled","rejected"]
+BASE_COLUMNS = ["project_id","project_name","period","plan","plan_value","plan_status","created","completed","unassigned","execution_pct","plan_missing_with_activity","has_period_marker","project_start","project_end","elapsed_pct","lag","risk_status","risk_reason","validation_state","last_refreshed","client","primary_manager","coordinators","date_from","date_to","scope","manager_payment","wave","assigned","questionnaire_filled","rejected"]
+PROJECT_TYPE_COLUMNS = BASE_COLUMNS + ["project_type_code", "project_type_name"]
+# The normal runner contract is the production schema. BASE_COLUMNS remains
+# explicit for validating and upgrading legacy 31-column baselines.
+COLUMNS = PROJECT_TYPE_COLUMNS
+UNMAPPED_PRESERVE_COLUMNS = [
+    "period", "unassigned", "has_period_marker", "project_start", "project_end", "elapsed_pct", "lag",
+    "project_type_code", "project_type_name",
+]
 
 
 def now() -> str:
@@ -72,11 +81,18 @@ def google_token() -> str:
 
 
 def api(url: str, token: str, body: Any = None, method: str | None = None) -> Any:
+    request_method = method or ("POST" if body is not None else "GET")
+    if (
+        "sheets.googleapis.com/" in url
+        and request_method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+        and os.environ.get("DRY_RUN", "false").strip().lower() == "true"
+    ):
+        raise RuntimeError("DRY_RUN blocked Google Sheets mutation")
     req = urllib.request.Request(
         url,
         data=None if body is None else json.dumps(body).encode(),
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method=method or ("POST" if body is not None else "GET"),
+        method=request_method,
     )
     with urllib.request.urlopen(req, timeout=120) as response:
         return json.load(response)
@@ -177,47 +193,56 @@ def sheets_serial(raw: Any) -> Any:
     return (dt - datetime(1899, 12, 30, tzinfo=timezone.utc)).total_seconds() / 86400
 
 
-def sheet_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
-    out = [COLUMNS]
+def sheet_rows(rows: list[dict[str, Any]], columns: list[str] | None = None) -> list[list[Any]]:
+    columns = columns or COLUMNS
+    out = [columns]
     for row in rows:
-        line = [row.get(c) if row.get(c) is not None else "" for c in COLUMNS]
+        line = [row.get(c) if row.get(c) is not None else "" for c in columns]
         for name in ("date_from", "date_to", "last_refreshed"):
-            line[COLUMNS.index(name)] = sheets_serial(line[COLUMNS.index(name)])
+            line[columns.index(name)] = sheets_serial(line[columns.index(name)])
         out.append(line)
     return out
 
 
-def read_sheet(token: str, sid: str, rows: int | None = None) -> list[list[Any]]:
+def read_sheet(token: str, sid: str, rows: int | None = None, columns: list[str] | None = None) -> list[list[Any]]:
+    columns = columns or COLUMNS
     # Read the full schema width without a fixed row bound. A hard-coded row
     # endpoint can exceed the worksheet grid after Sheets compacts/resizes it,
     # causing values.get to fail with HTTP 400 before the refresh can start.
     # An open-ended A:AE range follows the actual grid and still returns only
     # populated values.
-    rng = urllib.parse.quote(f"{SHEET_NAME}!A:{col(len(COLUMNS)-1)}", safe="!:")
+    rng = urllib.parse.quote(f"{SHEET_NAME}!A:{col(len(columns)-1)}", safe="!:")
     data = api_get(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{rng}?valueRenderOption=UNFORMATTED_VALUE", token)
     return data.get("values", [])
 
 
-def _pad(row: list[Any]) -> list[Any]:
-    return list(row) + [""] * (len(COLUMNS) - len(row))
+def _pad(row: list[Any], columns: list[str] | None = None) -> list[Any]:
+    columns = columns or COLUMNS
+    return list(row) + [""] * max(0, len(columns) - len(row))
 
 
-def merge_previous(rows: list[dict[str, Any]], previous: list[list[Any]], selected_ids: set[str], timestamp: str) -> list[dict[str, Any]]:
-    old = {str(r[0]): _pad(r) for r in previous[1:] if r and r[0] != ""}
+def merge_previous(rows: list[dict[str, Any]], previous: list[list[Any]], selected_ids: set[str], timestamp: str, columns: list[str] | None = None) -> list[dict[str, Any]]:
+    columns = columns or COLUMNS
+    old = {str(r[0]): _pad(r, columns) for r in previous[1:] if r and r[0] != ""}
     merged: dict[str, dict[str, Any]] = {}
     for row in rows:
         pid = str(row["project_id"])
         prior = old.get(pid)
-        if row.get("_acquisition_state") == "FAILED" and prior:
-            carried = {c: prior[i] for i, c in enumerate(COLUMNS)}
+        if row.get("_acquisition_state") in {"FAILED", "SEMANTIC_FAILURE"} and prior:
+            carried = {c: prior[i] for i, c in enumerate(columns)}
             carried["last_refreshed"] = timestamp
-            carried["_acquisition_state"] = "FAILED"
+            carried["_acquisition_state"] = row["_acquisition_state"]
+            carried["_acquisition_failure_reasons"] = row.get("_acquisition_failure_reasons", [])
             merged[pid] = carried
         else:
+            if prior:
+                for name in UNMAPPED_PRESERVE_COLUMNS:
+                    if row.get(name) is None:
+                        row[name] = prior[COLUMNS.index(name)] if name in COLUMNS else None
             merged[pid] = row
     for pid, prior in old.items():
         if pid not in selected_ids:
-            carried = {c: prior[i] for i, c in enumerate(COLUMNS)}
+            carried = {c: prior[i] for i, c in enumerate(columns)}
             carried["last_refreshed"] = timestamp
             merged[pid] = carried
     return [merged[k] for k in sorted(merged, key=int)]
@@ -228,7 +253,92 @@ def summary(rows: list[list[Any]]) -> dict[str, int]:
     return {"rows": len(ids), "unique": len(set(ids)), "duplicates": len(ids) - len(set(ids))}
 
 
-def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[list[Any]]) -> None:
+def read_project_type_state_rows(token: str, sid: str) -> list[list[Any]]:
+    encoded = urllib.parse.quote("project_types!A:C", safe="!:")
+    payload = api_get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE",
+        token,
+    )
+    return payload.get("values", [])
+
+
+def read_project_type_state(token: str, sid: str) -> dict[str, tuple[str, str]]:
+    return validate_state_rows(read_project_type_state_rows(token, sid))
+
+
+def _write_project_type_state_rows(token: str, sid: str, rows: list[list[Any]]) -> None:
+    rng = f"project_types!A1:C{max(len(rows), 1)}"
+    api(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate",
+        token,
+        {"valueInputOption": "RAW", "data": [{"range": rng, "majorDimension": "ROWS", "values": rows}]},
+    )
+
+
+def publish_project_type_state(
+    token: str,
+    sid: str,
+    new_state: dict[str, tuple[str, str]],
+    previous_rows: list[list[Any]],
+) -> list[list[str]]:
+    candidate = serialize_state(new_state)
+    if candidate == previous_rows:
+        return candidate
+    try:
+        _write_project_type_state_rows(token, sid, candidate)
+        actual = read_project_type_state_rows(token, sid)
+        if actual != candidate:
+            raise RuntimeError("project_types readback mismatch")
+        validate_state_rows(actual)
+        return candidate
+    except Exception:
+        try:
+            if previous_rows:
+                _write_project_type_state_rows(token, sid, previous_rows)
+            else:
+                api(
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/project_types%21A%3AC:clear",
+                    token,
+                    {},
+                    method="POST",
+                )
+        except Exception as rollback_exc:
+            raise RuntimeError("project_types rollback failed") from rollback_exc
+        raise
+
+
+def publish_project_type_refresh(
+    token: str,
+    sid: str,
+    candidate: list[list[Any]],
+    previous: list[list[Any]],
+    columns: list[str],
+    new_state: dict[str, tuple[str, str]],
+    previous_state_rows: list[list[Any]],
+) -> None:
+    try:
+        publish_project_type_state(token, sid, new_state, previous_state_rows)
+        publish(token, sid, candidate, previous, columns=columns)
+    except Exception:
+        try:
+            if previous_state_rows:
+                _write_project_type_state_rows(token, sid, previous_state_rows)
+            else:
+                api(
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/project_types%21A%3AC:clear",
+                    token,
+                    {},
+                    method="POST",
+                )
+            if read_project_type_state_rows(token, sid) != previous_state_rows:
+                raise RuntimeError("project_types rollback readback mismatch")
+        except Exception as rollback_exc:
+            raise RuntimeError("Project Type state rollback failed; workbook state requires recovery") from rollback_exc
+        raise
+
+
+def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[list[Any]], columns: list[str] | None = None) -> None:
+    columns = columns or COLUMNS
     before = summary(previous)
     after = summary(candidate)
     if after["duplicates"] != 0:
@@ -239,19 +349,19 @@ def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[lis
     target = next((s["properties"] for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == SHEET_NAME), None)
     if not target:
         raise RuntimeError("target worksheet not found")
-    rng = f"{SHEET_NAME}!A1:{col(len(COLUMNS)-1)}{len(candidate)}"
+    rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{len(candidate)}"
     encoded = urllib.parse.quote(rng, safe="!:")
     previous_copy = previous
     try:
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": rng, "majorDimension": "ROWS", "values": candidate}]})
-        date_cols = [COLUMNS.index("date_from"), COLUMNS.index("date_to"), COLUMNS.index("last_refreshed")]
+        date_cols = [columns.index("date_from"), columns.index("date_to"), columns.index("last_refreshed")]
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"repeatCell": {"range": {"sheetId": target["sheetId"], "startRowIndex": 1, "endRowIndex": len(candidate), "startColumnIndex": c, "endColumnIndex": c + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE_TIME" if c == date_cols[-1] else "DATE", "pattern": "yyyy-mm-dd hh:mm:ss" if c == date_cols[-1] else "yyyy-mm-dd"}}}, "fields": "userEnteredFormat.numberFormat"}} for c in date_cols]})
-        actual = read_sheet(token, sid, len(candidate) + 10)
+        actual = read_sheet(token, sid, len(candidate) + 10, columns=columns)
         if summary(actual) != after or actual[:1] != candidate[:1]:
             raise RuntimeError("readback summary mismatch")
     except Exception:
-        restore_rng = f"{SHEET_NAME}!A1:{col(len(COLUMNS)-1)}{len(previous_copy)}"
+        restore_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{len(previous_copy)}"
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(restore_rng, safe='!:')}:clear", token, {}, method="POST")
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": restore_rng, "majorDimension": "ROWS", "values": previous_copy}]})
         raise
@@ -290,6 +400,7 @@ def run() -> dict[str, Any]:
         candidate = sheet_rows(merged)
         publish(token, sid, candidate, previous)
         failed = sum(p.get("acquisition_state") == "FAILED" for p in projects)
+        semantic_failed = sum(p.get("acquisition_state") == "SEMANTIC_FAILURE" for p in projects)
         finished_at = now()
         wall = (datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds()
         return {
@@ -299,8 +410,9 @@ def run() -> dict[str, Any]:
             "WALL_SECONDS": wall,
             "UNIVERSE_COUNT": len(universe),
             "SELECTED_COUNT": len(selected),
-            "SUCCESS_COUNT": len(projects) - failed,
+            "SUCCESS_COUNT": len(projects) - failed - semantic_failed,
             "FAILED_COUNT": failed,
+            "SEMANTIC_FAILURE_COUNT": semantic_failed,
             "PORTAL_HTTP_REQUEST_COUNT": session.requests,
             "FINAL_MASTER_UNIQUE_IDS": summary(candidate)["unique"],
             "FINAL_STATUS": "SUCCESS",

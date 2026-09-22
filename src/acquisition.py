@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import html
 import time
 from typing import Any
 
-from .parsers import parse_action_table, parse_edit, parse_visit_table
+from .parsers import parse_action_table, parse_edit, parse_visit_table, plain_text
 
 ACTION_STATE_CODES = ("20", "30", "35", "37", "39", "40", "50")
 COMPLETED_CODES = {"37", "40", "50"}
@@ -25,9 +26,11 @@ class Reader:
         self.session = session
         self.cap = cap
         self.count = 0
+        self.post_count = 0
         self.failures = 0
         self.project_completed = 0
         self.project_failures = 0
+        self.project_semantic_failures = 0
         self.started_monotonic = time.monotonic()
 
     def _reserve(self) -> None:
@@ -47,6 +50,7 @@ class Reader:
 
     def post(self, path: str, data: dict[str, str]) -> dict[str, Any]:
         self._reserve()
+        self.post_count += 1
         try:
             status, content_type, body = self.session.request(path, "POST", data, accept="text/html, application/json")
             state = "VALUE_PRESENT" if body else "SOURCE_RETURNED_EMPTY_BODY"
@@ -55,10 +59,12 @@ class Reader:
             self.failures += 1
             return {"state": "REQUEST_FAILED", "http_status": None, "content_type": None, "body": b""}
 
-    def project_done(self, failed: bool) -> None:
+    def project_done(self, acquisition_state: str) -> None:
         self.project_completed += 1
-        if failed:
+        if acquisition_state == "FAILED":
             self.project_failures += 1
+        elif acquisition_state == "SEMANTIC_FAILURE":
+            self.project_semantic_failures += 1
         total = max(self.cap // 3, 1)
         if self.project_completed % 10 != 0 and self.project_completed != total:
             return
@@ -68,8 +74,8 @@ class Reader:
         eta_minutes = remaining / rate if rate > 0 else 0.0
         print(
             f"ACQUISITION {self.project_completed}/{total} | "
-            f"success={self.project_completed - self.project_failures} | "
-            f"failed={self.project_failures} | http={self.count} | "
+            f"success={self.project_completed - self.project_failures - self.project_semantic_failures} | "
+            f"failed={self.project_failures} | semantic_failed={self.project_semantic_failures} | http={self.count} | "
             f"elapsed={elapsed:.0f}s | {rate:.1f} proj/min | ETA={eta_minutes:.1f} min",
             flush=True,
         )
@@ -88,6 +94,59 @@ def action_index(markup: str, project_id: str) -> dict[str, dict[str, Any]]:
             "action_id": row.get("action_id") or None,
         }
     return result
+
+
+def _response_failure(name: str, response: dict[str, Any]) -> str | None:
+    if response.get("state") == "REQUEST_FAILED":
+        return f"{name}:REQUEST_FAILED"
+    if response.get("http_status") != 200:
+        return f"{name}:HTTP_{response.get('http_status')}"
+    if not response.get("body"):
+        return f"{name}:EMPTY_BODY"
+    return None
+
+
+def _semantic_failures(
+    project: dict[str, Any],
+    edit: dict[str, Any],
+    action: dict[str, Any],
+    edit_fields: dict[str, Any],
+    canonical_name: Any,
+) -> list[str]:
+    """Fail closed when a 200 response does not satisfy the qualified page contract."""
+    failures = [
+        reason
+        for name, response in (("project", project), ("edit", edit), ("action", action))
+        if (reason := _response_failure(name, response)) is not None
+    ]
+    project_html = project.get("body", b"").decode("utf-8", "replace")
+    edit_html = edit.get("body", b"").decode("utf-8", "replace")
+    action_html = action.get("body", b"").decode("utf-8", "replace")
+    if canonical_name in (None, ""):
+        failures.append("universe:PROJECT_NAME_MISSING")
+    elif canonical_name not in plain_text(project_html):
+        failures.append("project:CANONICAL_NAME_NOT_PRESENT")
+
+    expected_edit_fields = (
+        "project_name", "date_from", "date_to", "planned_visit_count", "client",
+        "primary_manager", "coordinators", "scope", "manager_payment", "wave",
+    )
+    if not edit_fields:
+        failures.append("edit:PARSE_EMPTY")
+    for name in expected_edit_fields:
+        field_data = edit_fields.get(name)
+        if not isinstance(field_data, dict) or field_data.get("state") == "FIELD_NOT_EXPOSED":
+            failures.append(f"edit:FIELD_NOT_EXPOSED:{name}")
+    edit_name = edit_fields.get("project_name", {}).get("value") if edit_fields else None
+    if not edit_name:
+        failures.append("edit:PROJECT_NAME_EMPTY")
+    elif canonical_name not in (None, "") and html.unescape(str(edit_name)).strip() != str(canonical_name).strip():
+        failures.append("edit:CANONICAL_NAME_MISMATCH")
+    if edit_html and ("<html" not in edit_html.lower() and "<!doctype" not in edit_html.lower()):
+        failures.append("edit:NOT_HTML_DOCUMENT")
+    if action_html and ("<html" not in action_html.lower() and "<!doctype" not in action_html.lower()):
+        failures.append("action:NOT_HTML_DOCUMENT")
+    return failures
 
 
 def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -116,7 +175,12 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
     plan = edit_fields.get("planned_visit_count", {"value": None, "state": edit["state"]})
     visit_ids = [row["visit_id"] for row in parse_visit_table(project_html)] if project_html else []
     actions = action_index(action_html, project_id) if action_html else {}
-    failed = any(item["state"] == "REQUEST_FAILED" for item in (project, edit, action))
+    failed = any(
+        item["state"] == "REQUEST_FAILED" or item.get("http_status") != 200 or not item.get("body")
+        for item in (project, edit, action)
+    )
+    semantic_failures = _semantic_failures(project, edit, action, edit_fields, _text(spec.get("project_name")))
+    acquisition_state = "FAILED" if failed else "SEMANTIC_FAILURE" if semantic_failures else "ACQUIRED"
 
     record = {
         "project_id": project_id,
@@ -130,7 +194,8 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
         "scope": edit_fields.get("scope", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "manager_payment": edit_fields.get("manager_payment", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "wave": edit_fields.get("wave", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
-        "acquisition_state": "FAILED" if failed else "ACQUIRED",
+        "acquisition_state": acquisition_state,
+        "acquisition_failure_reasons": semantic_failures,
     }
 
     visits: list[dict[str, Any]] = []
@@ -143,7 +208,7 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
             "raw_status": field(raw, "VALUE_PRESENT" if raw else "UNKNOWN", f"/action?project={project_id}"),
             "assignment_state": field(action_row.get("assignment_state", "UNKNOWN"), "VALUE_PRESENT" if visit_id in actions else "UNKNOWN", f"/action?project={project_id}"),
         })
-    reader.project_done(failed)
+    reader.project_done(acquisition_state)
     return record, visits
 
 
