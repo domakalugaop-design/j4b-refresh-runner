@@ -24,6 +24,19 @@ post-publication validation
 
 The design principle is deliberately simple: **one runner, one process, one end-to-end job**. Google Apps Script continuation/state orchestration is intentionally not reproduced.
 
+## Codex/Git bootstrap contract
+
+- Canonical repository: `domakalugaop-design/j4b-refresh-runner`.
+- Production branch: `production-cutover`.
+- Persistent local clone: `/Volumes/ExHDD/Github/j4b-refresh-runner`.
+- Codex workspaces are disposable execution contexts; GitHub is the canonical source.
+- Before work, verify branch, status, origin and upstream, and stop/report on dirty or divergent state. After work, validate, review, commit and push.
+- Do not use `reset --hard`, `clean`, merge/rebase to hide divergence, force-push or delete checkouts as automatic repair.
+- Portal discovery remains read-only; heavy acquisition requires a concrete unresolved question and expected value.
+- Runtime credentials are supplied through protected environment variables/GitHub Actions Secrets; no secret values belong in this repository.
+
+The canonical project-level contract, including web-login metadata and the bounded auth-smoke procedure, is documented in `JustForBusy/portal/project_pipeline/CODEX_INFRASTRUCTURE_AND_MANAGEMENT_ANALYTICS_CHECKPOINT_2026-09-24.md`.
+
 ## Security boundary
 
 Public repository content may include:
