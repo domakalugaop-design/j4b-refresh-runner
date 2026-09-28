@@ -135,6 +135,7 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
             "action_id": action_id,
             "participant_assigned": "table-red" not in row_class or bool(action_id),
             "visit_status": codes[-1] if codes else "",
+            "workflow_state_codes": codes,
             "visit_status_label": status_label,
         })
     return rows

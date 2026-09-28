@@ -6,8 +6,9 @@ import time
 from typing import Any
 
 from .parsers import parse_action_table, parse_edit, parse_visit_table, plain_text
+from .workflow_analytics import WORKFLOW_STATE_CODES
 
-ACTION_STATE_CODES = ("20", "30", "35", "37", "39", "40", "50")
+ACTION_STATE_CODES = tuple(str(code) for code in WORKFLOW_STATE_CODES)
 COMPLETED_CODES = {"37", "40", "50"}
 
 
@@ -96,6 +97,22 @@ def action_index(markup: str, project_id: str) -> dict[str, dict[str, Any]]:
     return result
 
 
+def action_memberships(markup: str, project_id: str) -> list[dict[str, Any]]:
+    """Expand every predicate code in the combined /action response."""
+    memberships: list[dict[str, Any]] = []
+    for row in parse_action_table(markup, project_id):
+        codes = row.get("workflow_state_codes") or ([row["visit_status"]] if row.get("visit_status") else [])
+        for code in codes:
+            memberships.append({
+                "project_id": str(project_id),
+                "visit_id": str(row["visit_id"]),
+                "workflow_state_code": int(code),
+                "action_id": row.get("action_id") or None,
+                "predicate_source": "action_response",
+            })
+    return memberships
+
+
 def _response_failure(name: str, response: dict[str, Any]) -> str | None:
     if response.get("state") == "REQUEST_FAILED":
         return f"{name}:REQUEST_FAILED"
@@ -175,6 +192,7 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
     plan = edit_fields.get("planned_visit_count", {"value": None, "state": edit["state"]})
     visit_ids = [row["visit_id"] for row in parse_visit_table(project_html)] if project_html else []
     actions = action_index(action_html, project_id) if action_html else {}
+    memberships = action_memberships(action_html, project_id) if action_html else []
     failed = any(
         item["state"] == "REQUEST_FAILED" or item.get("http_status") != 200 or not item.get("body")
         for item in (project, edit, action)
@@ -196,6 +214,7 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
         "wave": edit_fields.get("wave", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "acquisition_state": acquisition_state,
         "acquisition_failure_reasons": semantic_failures,
+        "workflow_memberships": memberships,
     }
 
     visits: list[dict[str, Any]] = []
