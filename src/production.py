@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 from urllib.error import HTTPError
@@ -36,6 +37,15 @@ from .refresh import (
     summary,
     api,
 )
+from .workflow_publication import (
+    PRIMARY_ANALYTICS_COLUMNS,
+    THIRD_TAB_NAME,
+    backup_snapshot,
+    primary_columns,
+    third_tab_rows,
+    validate_materialized_rows,
+    validate_readback,
+)
 
 PRODUCTION_TITLE = "J4B Portal — DataLens Materialized Layer"
 
@@ -51,19 +61,20 @@ def _destination_preflight(token: str, sid: str, expected_title: str = PRODUCTIO
     return meta
 
 
-def _plan_project_type_layout(meta: dict[str, Any]) -> dict[str, Any]:
+def _plan_project_type_layout(meta: dict[str, Any], target_columns: list[str] | None = None) -> dict[str, Any]:
     """Describe a required schema migration without mutating the workbook."""
     sheets = meta.get("sheets", [])
     current = next((s.get("properties", {}) for s in sheets if s.get("properties", {}).get("title") == "projects_current"), None)
     if not current:
         raise RuntimeError("projects_current tab not found")
     column_count = current.get("gridProperties", {}).get("columnCount")
-    if column_count not in (len(BASE_COLUMNS), len(PROJECT_TYPE_SCHEMA)):
+    target_columns = target_columns or PROJECT_TYPE_SCHEMA
+    if column_count not in (len(BASE_COLUMNS), len(PROJECT_TYPE_SCHEMA), len(target_columns)):
         raise RuntimeError(f"projects_current unexpected column count: {column_count}")
     state = next((s.get("properties", {}) for s in sheets if s.get("properties", {}).get("title") == "project_types"), None)
     requests: list[dict[str, Any]] = []
-    if column_count == len(BASE_COLUMNS):
-        requests.append({"appendDimension": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "length": 2}})
+    if column_count < len(target_columns):
+        requests.append({"appendDimension": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "length": len(target_columns) - column_count}})
     if not state:
         requests.append({"addSheet": {"properties": {"title": "project_types", "gridProperties": {"rowCount": 1000, "columnCount": 3, "frozenRowCount": 1}}}})
     return {
@@ -72,7 +83,8 @@ def _plan_project_type_layout(meta: dict[str, Any]) -> dict[str, Any]:
         "source_column_count": column_count,
         "state_exists": state is not None,
         "requests": requests,
-        "planned": (["EXPAND projects_current A:AE -> A:AG"] if column_count == len(BASE_COLUMNS) else [])
+        "target_column_count": len(target_columns),
+        "planned": ([("EXPAND projects_current A:AE -> A:AG" if len(target_columns) == len(PROJECT_TYPE_SCHEMA) else f"EXPAND projects_current to {len(target_columns)} columns")] if column_count < len(target_columns) else [])
         + (["CREATE project_types"] if not state else []),
     }
 
@@ -88,7 +100,7 @@ def _execute_project_type_layout(token: str, sid: str, plan: dict[str, Any]) -> 
     fresh_sheets = fresh.get("sheets", [])
     current = next((s.get("properties", {}) for s in fresh_sheets if s.get("properties", {}).get("title") == "projects_current"), None)
     state = next((s.get("properties", {}) for s in fresh_sheets if s.get("properties", {}).get("title") == "project_types"), None)
-    if not current or current.get("gridProperties", {}).get("columnCount") != len(PROJECT_TYPE_SCHEMA) or not state:
+    if not current or current.get("gridProperties", {}).get("columnCount") != plan["target_column_count"] or not state:
         raise RuntimeError("Project Type schema migration failed")
     api(
         f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate",
@@ -96,7 +108,7 @@ def _execute_project_type_layout(token: str, sid: str, plan: dict[str, Any]) -> 
         {"requests": [
             {"repeatCell": {"range": {"sheetId": current["sheetId"], "startRowIndex": 1, "startColumnIndex": len(BASE_COLUMNS), "endColumnIndex": len(BASE_COLUMNS) + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}},
             {"repeatCell": {"range": {"sheetId": state["sheetId"], "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 2}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}},
-            {"autoResizeDimensions": {"dimensions": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "startIndex": len(BASE_COLUMNS), "endIndex": len(PROJECT_TYPE_SCHEMA)}}},
+            {"autoResizeDimensions": {"dimensions": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "startIndex": len(BASE_COLUMNS), "endIndex": plan["target_column_count"]}}},
             {"autoResizeDimensions": {"dimensions": {"sheetId": state["sheetId"], "dimension": "COLUMNS", "startIndex": 0, "endIndex": 3}}},
         ]},
     )
@@ -117,7 +129,7 @@ def _rollback_project_type_layout(token: str, sid: str, plan: dict[str, Any], pr
     requests: list[dict[str, Any]] = []
     if not plan["state_exists"] and state:
         requests.append({"deleteSheet": {"sheetId": state["sheetId"]}})
-    if plan["source_column_count"] == len(BASE_COLUMNS):
+    if plan["source_column_count"] < plan["target_column_count"]:
         actual_count = current.get("gridProperties", {}).get("columnCount", 0)
         if actual_count > len(BASE_COLUMNS):
             requests.append({"deleteDimension": {"range": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "startIndex": len(BASE_COLUMNS), "endIndex": actual_count}}})
@@ -202,20 +214,73 @@ def _resolve_project_type_state(
     return rows, state, "LOCAL_VALIDATED_ARTIFACT", digest
 
 
-def _upgrade_projects_rows(rows: list[list[Any]], source_columns: list[str]) -> list[list[Any]]:
+def _upgrade_projects_rows(rows: list[list[Any]], source_columns: list[str], target_columns: list[str] | None = None) -> list[list[Any]]:
+    target_columns = target_columns or PROJECT_TYPE_SCHEMA
     if not rows:
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
     if source_columns == PROJECT_TYPE_SCHEMA:
+        if rows[0] == target_columns:
+            return [list(row) + [""] * max(0, len(target_columns) - len(row)) for row in rows]
         if rows[0] == PROJECT_TYPE_SCHEMA:
-            return [list(row) + [""] * max(0, len(PROJECT_TYPE_SCHEMA) - len(row)) for row in rows]
+            return [target_columns] + [list(row) + [""] * (len(target_columns) - len(PROJECT_TYPE_SCHEMA)) for row in rows[1:]]
         if rows[0] == BASE_COLUMNS:
-            return [PROJECT_TYPE_SCHEMA] + [list(row) + [""] * 2 for row in rows[1:]]
+            return [target_columns] + [list(row) + [""] * (len(target_columns) - len(BASE_COLUMNS)) for row in rows[1:]]
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
     if rows[0] != source_columns:
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
     if source_columns != BASE_COLUMNS:
         raise RuntimeError("unsupported projects_current source schema")
-    return [PROJECT_TYPE_SCHEMA] + [list(row) + ["", ""] for row in rows[1:]]
+    return [target_columns] + [list(row) + [""] * (len(target_columns) - len(BASE_COLUMNS)) for row in rows[1:]]
+
+
+def _workflow_enabled() -> bool:
+    return os.environ.get("ENABLE_WORKFLOW_ANALYTICS_PUBLICATION", "false").strip().lower() == "true"
+
+
+def _capture_workflow_backup(token: str, sid: str, previous_raw: list[list[Any]], previous_state_rows: list[list[Any]], meta: dict[str, Any]) -> dict[str, Any]:
+    """Capture affected tabs before the first Phase-2 mutation."""
+    existing = {s.get("properties", {}).get("title") for s in meta.get("sheets", [])}
+    third: list[list[Any]] = []
+    if THIRD_TAB_NAME in existing:
+        encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
+        third = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
+    return backup_snapshot(sid, {"projects_current": previous_raw, "project_types": previous_state_rows, THIRD_TAB_NAME: third}, {"existing_tabs": sorted(existing)})
+
+
+def _publish_workflow_tab(token: str, sid: str, rows: list[dict[str, Any]], backup: dict[str, Any]) -> list[list[Any]]:
+    rendered = third_tab_rows(rows)
+    meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
+    tab = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
+    if not tab:
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"addSheet": {"properties": {"title": THIRD_TAB_NAME, "gridProperties": {"rowCount": max(1000, len(rendered)), "columnCount": len(rendered[0]), "frozenRowCount": 1}}}}]})
+        meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
+        tab = next(s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME)
+    old_rows = int(tab.get("gridProperties", {}).get("rowCount", len(rendered)))
+    encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A1:Y{max(len(rendered), 1)}", safe="!:")
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:Y{len(rendered)}", "majorDimension": "ROWS", "values": rendered}]})
+    if old_rows > len(rendered):
+        tail = urllib.parse.quote(f"{THIRD_TAB_NAME}!A{len(rendered)+1}:Y{old_rows}", safe="!:")
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{tail}:clear", token, {}, method="POST")
+    actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
+    validate_readback(actual, rendered)
+    return rendered
+
+
+def _rollback_workflow_tab(token: str, sid: str, backup: dict[str, Any]) -> None:
+    sheets = backup["payload"]["sheets"]
+    meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId)", token)
+    tab = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
+    previous = sheets.get(THIRD_TAB_NAME, [])
+    if not previous:
+        if tab:
+            api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"deleteSheet": {"sheetId": tab["sheetId"]}}]})
+        return
+    encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:{'Y'}{len(previous)}", "majorDimension": "ROWS", "values": previous}]})
+    actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
+    validate_readback(actual, previous)
 
 
 def _require_production_gate() -> str:
@@ -256,7 +321,8 @@ def run() -> dict[str, Any]:
     # Keep this schema unconditional so a missing feature flag cannot silently
     # publish the legacy 31-column layout over AF:AG.
     project_type_enabled = True
-    columns = PROJECT_TYPE_SCHEMA
+    workflow_enabled = _workflow_enabled()
+    columns = primary_columns(PROJECT_TYPE_SCHEMA) if workflow_enabled else PROJECT_TYPE_SCHEMA
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
     _stage("BASELINE_READ_START")
@@ -272,10 +338,10 @@ def run() -> dict[str, Any]:
     if project_type_enabled and destination_meta:
         current_meta = next((s.get("properties", {}) for s in destination_meta.get("sheets", []) if s.get("properties", {}).get("title") == "projects_current"), {})
         physical_columns = current_meta.get("gridProperties", {}).get("columnCount")
-        source_columns = BASE_COLUMNS if physical_columns == len(BASE_COLUMNS) else PROJECT_TYPE_SCHEMA if physical_columns == len(PROJECT_TYPE_SCHEMA) else []
+        source_columns = BASE_COLUMNS if physical_columns == len(BASE_COLUMNS) else columns if physical_columns == len(columns) else PROJECT_TYPE_SCHEMA if physical_columns == len(PROJECT_TYPE_SCHEMA) else []
         previous_raw = read_sheet(token, sid, columns=source_columns) if source_columns else []
-        previous = _upgrade_projects_rows(previous_raw, source_columns)
-        layout_plan = _plan_project_type_layout(destination_meta)
+        previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
+        layout_plan = _plan_project_type_layout(destination_meta, columns)
         _stage(f"PROJECT_TYPE_BASELINE_SCHEMA | source_columns={len(source_columns)} | rows={len(previous)-1}")
         if layout_plan["state_exists"]:
             previous_state_rows = read_project_type_state_rows(token, sid)
@@ -330,7 +396,9 @@ def run() -> dict[str, Any]:
                 f"valid={type_telemetry.valid_assignments_acquired} | http_additional={type_telemetry.detail_get_additional}"
             )
 
-        selected = select_scope(universe, previous)
+        selected = universe if workflow_enabled and os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true" else select_scope(universe, previous)
+        if workflow_enabled and len(selected) != len(universe):
+            raise RuntimeError("workflow publication requires WORKFLOW_ANALYTICS_FULL_ACQUISITION=true")
         _stage(f"SCOPE_SELECTION_PASS | selected={len(selected)}")
         reader = Reader(session, max(3 * len(selected), 3))
         projects: list[dict[str, Any]] = []
@@ -363,6 +431,10 @@ def run() -> dict[str, Any]:
         _stage("MATERIALIZATION_START")
         rows = materialize(projects, visits, timestamp)
         merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp, columns=columns)
+        workflow_backup: dict[str, Any] | None = None
+        if workflow_enabled:
+            validate_materialized_rows(merged)
+            workflow_backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, destination_meta)
         if project_type_enabled:
             apply_canonical_project_names(merged, universe)
             applicable_ids = project_type_applicable_ids(universe)
@@ -402,6 +474,7 @@ def run() -> dict[str, Any]:
                 "CANDIDATE_DUPLICATES": candidate_summary["duplicates"],
                 "BASELINE_ROWS": len(previous) - 1,
                 "BOOTSTRAP_VALID": bool(bootstrap_rows or layout_plan["state_exists"]),
+                "WORKFLOW_PUBLICATION": workflow_enabled,
             }
 
         # Authorization is deliberately late: all acquisition, candidate validation,
@@ -414,9 +487,18 @@ def run() -> dict[str, Any]:
                 _execute_project_type_layout(token, sid, layout_plan)
                 _stage("MIGRATION_PASS")
                 _stage("PUBLISH_START")
+                if workflow_enabled:
+                    _stage("WORKFLOW_PUBLICATION_START")
+                    _publish_workflow_tab(token, sid, merged, workflow_backup or {})
+                    _stage("WORKFLOW_PUBLICATION_PASS")
                 publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
                 _stage("PUBLISH_PASS")
             except Exception:
+                if workflow_enabled and workflow_backup is not None:
+                    try:
+                        _rollback_workflow_tab(token, sid, workflow_backup)
+                    except Exception as rollback_exc:
+                        raise RuntimeError("workflow publication rollback failed") from rollback_exc
                 if layout_plan.get("planned"):
                     _rollback_project_type_layout(token, sid, layout_plan, previous_raw)
                 raise
