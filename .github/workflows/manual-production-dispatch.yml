@@ -25,6 +25,8 @@ jobs:
       GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
       GOOGLE_WORKSHEET: projects_current
       PORTAL_REQUEST_DELAY: "0.15"
+      ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
+      WORKFLOW_ANALYTICS_FULL_ACQUISITION: "true"
 
     steps:
       - name: Checkout production cutover branch
