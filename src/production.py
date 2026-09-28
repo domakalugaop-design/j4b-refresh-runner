@@ -5,7 +5,7 @@ import json
 import os
 import time
 import urllib.parse
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.error import HTTPError
 
@@ -258,6 +258,11 @@ def _select_reporting_year_scope(catalogue: list[dict[str, Any]], current_rows: 
     def parse_day(raw: Any) -> date | None:
         if raw in (None, ""):
             return None
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            try:
+                return date(1899, 12, 30) + timedelta(days=float(raw))
+            except (OverflowError, ValueError):
+                return None
         text = str(raw).strip()
         for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
             try:

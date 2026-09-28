@@ -60,3 +60,15 @@ def test_2026_scope_is_closed_interval_and_handles_one_bound():
     baseline = [header, row(10, "2026-12-31", ""), row(11, "", "2026-01-01")]
     catalogue = [{"project_id": "10"}, {"project_id": "11"}]
     assert [item["project_id"] for item in production._select_reporting_year_scope(catalogue, baseline, 2026)] == ["10", "11"]
+
+
+def test_2026_scope_accepts_google_sheets_date_serials():
+    header = PROJECT_TYPE_COLUMNS
+    def row(pid, start, end):
+        values = [""] * len(header)
+        values[header.index("project_id")] = str(pid)
+        values[header.index("date_from")] = start
+        values[header.index("date_to")] = end
+        return values
+    baseline = [header, row(20, 46023, 46388)]  # 2026-01-01 .. 2026-12-31
+    assert [item["project_id"] for item in production._select_reporting_year_scope([{ "project_id": "20" }], baseline, 2026)] == ["20"]
