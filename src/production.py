@@ -5,7 +5,7 @@ import json
 import os
 import time
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 from urllib.error import HTTPError
 
@@ -237,6 +237,56 @@ def _workflow_enabled() -> bool:
     return os.environ.get("ENABLE_WORKFLOW_ANALYTICS_PUBLICATION", "false").strip().lower() == "true"
 
 
+def _select_reporting_year_scope(catalogue: list[dict[str, Any]], current_rows: list[list[Any]], year: int) -> list[dict[str, Any]]:
+    """Select projects whose persisted date interval intersects the reporting year.
+
+    This is the same closed-interval year rule used by the dashboard cache:
+    a project is in scope when its known [date_from, date_to] interval
+    intersects January 1 through December 31 of ``year``.  Projects without
+    usable persisted date evidence are excluded rather than guessed in.
+    """
+    if not current_rows:
+        raise RuntimeError("2026 backfill requires a non-empty materialized baseline")
+    header = current_rows[0]
+    try:
+        id_index = header.index("project_id")
+        start_index = header.index("date_from")
+        end_index = header.index("date_to")
+    except ValueError as exc:
+        raise RuntimeError("2026 backfill baseline lacks date interval columns") from exc
+
+    def parse_day(raw: Any) -> date | None:
+        if raw in (None, ""):
+            return None
+        text = str(raw).strip()
+        for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+            try:
+                return datetime.strptime(text[:10], fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    year_start = date(year, 1, 1)
+    year_end = date(year, 12, 31)
+    evidence: dict[str, tuple[date | None, date | None]] = {}
+    for row in current_rows[1:]:
+        if len(row) <= max(id_index, start_index, end_index) or row[id_index] in (None, ""):
+            continue
+        evidence[str(row[id_index])] = (parse_day(row[start_index]), parse_day(row[end_index]))
+
+    selected: list[dict[str, Any]] = []
+    for item in catalogue:
+        pid = str(item["project_id"])
+        start, end = evidence.get(pid, (None, None))
+        if start is None and end is None:
+            continue
+        start = start or end
+        end = end or start
+        if start <= year_end and end >= year_start:
+            selected.append(dict(item))
+    return sorted(selected, key=lambda row: int(row["project_id"]))
+
+
 def _capture_workflow_backup(token: str, sid: str, previous_raw: list[list[Any]], previous_state_rows: list[list[Any]], meta: dict[str, Any]) -> dict[str, Any]:
     """Capture affected tabs before the first Phase-2 mutation."""
     existing = {s.get("properties", {}).get("title") for s in meta.get("sheets", [])}
@@ -396,9 +446,18 @@ def run() -> dict[str, Any]:
                 f"valid={type_telemetry.valid_assignments_acquired} | http_additional={type_telemetry.detail_get_additional}"
             )
 
-        selected = universe if workflow_enabled and os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true" else select_scope(universe, previous)
-        if workflow_enabled and len(selected) != len(universe):
-            raise RuntimeError("workflow publication requires WORKFLOW_ANALYTICS_FULL_ACQUISITION=true")
+        backfill_scope = os.environ.get("BACKFILL_SCOPE", "").strip()
+        if workflow_enabled and backfill_scope == "2026":
+            if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
+                raise RuntimeError("2026 backfill refuses full-universe acquisition fallback")
+            selected = _select_reporting_year_scope(universe, previous, 2026)
+            if not 1000 <= len(selected) <= 3000:
+                raise RuntimeError(f"2026 backfill scope count outside expected order of magnitude: {len(selected)}")
+            _stage(f"BACKFILL_SCOPE_GUARD_PASS | scope=2026_ONLY | projects={len(selected)} | pre2026=0")
+        else:
+            selected = universe if workflow_enabled and os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true" else select_scope(universe, previous)
+            if workflow_enabled and len(selected) != len(universe):
+                raise RuntimeError("workflow publication requires WORKFLOW_ANALYTICS_FULL_ACQUISITION=true")
         _stage(f"SCOPE_SELECTION_PASS | selected={len(selected)}")
         reader = Reader(session, max(3 * len(selected), 3))
         projects: list[dict[str, Any]] = []

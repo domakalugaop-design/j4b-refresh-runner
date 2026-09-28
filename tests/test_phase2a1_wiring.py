@@ -28,3 +28,35 @@ def test_legacy_schema_upgrade_remains_33_columns_when_gate_off():
     assert upgraded[0] == PROJECT_TYPE_COLUMNS
     assert len(upgraded[1]) == len(PROJECT_TYPE_COLUMNS)
 
+
+def test_2026_scope_uses_persisted_interval_and_excludes_pre_and_future():
+    header = PROJECT_TYPE_COLUMNS
+    def row(pid, start, end):
+        values = [""] * len(header)
+        values[header.index("project_id")] = str(pid)
+        values[header.index("date_from")] = start
+        values[header.index("date_to")] = end
+        return values
+    baseline = [
+        header,
+        row(1, "2025-01-01", "2025-12-31"),
+        row(2, "2026-01-01", "2026-12-31"),
+        row(3, "2027-01-01", "2027-12-31"),
+        row(4, "", ""),
+    ]
+    catalogue = [{"project_id": str(i), "project_name": f"P{i}"} for i in range(1, 5)]
+    selected = production._select_reporting_year_scope(catalogue, baseline, 2026)
+    assert [item["project_id"] for item in selected] == ["2"]
+
+
+def test_2026_scope_is_closed_interval_and_handles_one_bound():
+    header = PROJECT_TYPE_COLUMNS
+    def row(pid, start, end):
+        values = [""] * len(header)
+        values[header.index("project_id")] = str(pid)
+        values[header.index("date_from")] = start
+        values[header.index("date_to")] = end
+        return values
+    baseline = [header, row(10, "2026-12-31", ""), row(11, "", "2026-01-01")]
+    catalogue = [{"project_id": "10"}, {"project_id": "11"}]
+    assert [item["project_id"] for item in production._select_reporting_year_scope(catalogue, baseline, 2026)] == ["10", "11"]
