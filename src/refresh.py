@@ -275,6 +275,18 @@ def _write_project_type_state_rows(token: str, sid: str, rows: list[list[Any]]) 
     )
 
 
+def _clear_project_type_state_tail(token: str, sid: str, start_row: int, end_row: int) -> None:
+    if start_row > end_row:
+        return
+    tail = urllib.parse.quote(f"project_types!A{start_row}:C{end_row}", safe="!:")
+    api(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{tail}:clear",
+        token,
+        {},
+        method="POST",
+    )
+
+
 def publish_project_type_state(
     token: str,
     sid: str,
@@ -286,6 +298,7 @@ def publish_project_type_state(
         return candidate
     try:
         _write_project_type_state_rows(token, sid, candidate)
+        _clear_project_type_state_tail(token, sid, len(candidate) + 1, len(previous_rows))
         actual = read_project_type_state_rows(token, sid)
         if actual != candidate:
             raise RuntimeError("project_types readback mismatch")
