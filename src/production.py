@@ -364,11 +364,123 @@ def _stage(name: str) -> None:
     print(name, flush=True)
 
 
+CHECKPOINT_FORBIDDEN_KEYS = {
+    "password", "token", "secret", "authorization", "cookie", "session",
+    "refresh_token", "client_secret", "api_key",
+}
+
+
+def serialize_acquisition_checkpoint(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Write a replayable, secret-free acquisition payload and verify it."""
+    def scan(value: Any, key: str = "") -> None:
+        lowered = key.casefold()
+        if any(part in lowered for part in CHECKPOINT_FORBIDDEN_KEYS):
+            raise ValueError(f"checkpoint secret-like field rejected: {key}")
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                scan(child_value, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                scan(child, key)
+
+    scan(payload)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    target = os.path.abspath(path)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "wb") as handle:
+        handle.write(encoded)
+    os.chmod(target, 0o600)
+    with open(target, "rb") as handle:
+        restored = json.load(handle)
+    restored_encoded = json.dumps(restored, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(encoded).hexdigest()
+    if restored_encoded != encoded or hashlib.sha256(restored_encoded).hexdigest() != digest:
+        raise ValueError("acquisition checkpoint roundtrip mismatch")
+    return {"path": target, "bytes": len(encoded), "sha256": digest, "payload": restored}
+
+
+def load_acquisition_checkpoint(path: str) -> dict[str, Any]:
+    with open(path, "rb") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("unsupported acquisition checkpoint")
+    for required in ("universe", "selected", "projects", "visits", "previous_raw", "previous_state_rows", "state"):
+        if required not in payload:
+            raise ValueError(f"acquisition checkpoint missing {required}")
+    return payload
+
+
+def run_from_acquisition_checkpoint() -> dict[str, Any]:
+    """Replay downstream production processing without Portal acquisition."""
+    checkpoint = load_acquisition_checkpoint(os.environ.get("ACQUISITION_CHECKPOINT_PATH", "/tmp/j4b-acquisition-checkpoint.json"))
+    sid = _production_target()
+    token = google_token()
+    workflow_enabled = _workflow_enabled()
+    columns = primary_columns(PROJECT_TYPE_SCHEMA) if workflow_enabled else PROJECT_TYPE_SCHEMA
+    universe = checkpoint["universe"]
+    selected = checkpoint["selected"]
+    projects = checkpoint["projects"]
+    visits = checkpoint["visits"]
+    previous_raw = checkpoint["previous_raw"]
+    previous_state_rows = checkpoint["previous_state_rows"]
+    state = {str(pid): tuple(value) for pid, value in checkpoint["state"].items()}
+    meta = _destination_preflight(token, sid)
+    physical = next(s.get("properties", {}) for s in meta["sheets"] if s.get("properties", {}).get("title") == "projects_current")
+    source_columns = BASE_COLUMNS if physical.get("gridProperties", {}).get("columnCount") == len(BASE_COLUMNS) else PROJECT_TYPE_SCHEMA
+    previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
+    plan = _plan_project_type_layout(meta, columns)
+    _stage("MATERIALIZATION_START")
+    timestamp = now()
+    rows = materialize(projects, visits, timestamp)
+    merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp, columns=columns)
+    validate_materialized_rows(merged)
+    backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, meta)
+    apply_canonical_project_names(merged, universe)
+    applicable = project_type_applicable_ids(universe)
+    materialize_project_types(merged, state, applicable)
+    candidate = sheet_rows(merged, columns=columns)
+    candidate_summary = summary(candidate)
+    if candidate_summary["duplicates"] or candidate_summary["unique"] < summary(previous)["unique"]:
+        raise RuntimeError("candidate validation failed")
+    _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
+    _stage("CANDIDATE_VALIDATION_PASS")
+    _require_production_gate()
+    _stage("WRITE_AUTHORIZATION_PASS")
+    try:
+        _stage("MIGRATION_START")
+        _execute_project_type_layout(token, sid, plan)
+        _stage("MIGRATION_PASS")
+        _stage("PUBLISH_START")
+        _stage("WORKFLOW_PUBLICATION_START")
+        _publish_workflow_tab(token, sid, merged, backup)
+        _stage("WORKFLOW_PUBLICATION_PASS")
+        publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+        _stage("PUBLISH_PASS")
+    except Exception:
+        try:
+            _rollback_workflow_tab(token, sid, backup)
+        finally:
+            if plan.get("planned"):
+                _rollback_project_type_layout(token, sid, plan, previous_raw)
+        raise
+    _stage("READBACK_PASS")
+    _stage("TYPE_VALIDATION=EXTERNAL_POSTCHECK_REQUIRED")
+    return {
+        "RUN_ID": checkpoint.get("run_id"), "FINAL_STATUS": "SUCCESS",
+        "SELECTED_COUNT": len(selected), "SUCCESS_COUNT": sum(p.get("acquisition_state") not in {"FAILED", "SEMANTIC_FAILURE"} for p in projects),
+        "SEMANTIC_FAILURE_COUNT": sum(p.get("acquisition_state") == "SEMANTIC_FAILURE" for p in projects),
+        "PORTAL_HTTP_REQUEST_COUNT": 0, "FINAL_ROWS": candidate_summary["rows"],
+        "FINAL_UNIQUE_IDS": candidate_summary["unique"], "FINAL_DUPLICATES": candidate_summary["duplicates"],
+    }
+
+
 def run() -> dict[str, Any]:
     run_mode = os.environ.get("RUN_MODE", "test").strip().lower()
     dry_run = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
     if run_mode != "production":
         raise RuntimeError("RUN_MODE must be production")
+    if os.environ.get("REPLAY_ACQUISITION_CHECKPOINT", "false").strip().lower() == "true":
+        return run_from_acquisition_checkpoint()
     sid = _production_target()
     started_at = now()
     started_monotonic = time.monotonic()
@@ -490,6 +602,35 @@ def run() -> dict[str, Any]:
                     f"http={reader.count} | elapsed={elapsed:.0f}s | {rate:.1f} proj/min | ETA={eta_min:.1f} min",
                     flush=True,
                 )
+
+        checkpoint_path = os.environ.get("ACQUISITION_CHECKPOINT_PATH", "/tmp/j4b-acquisition-checkpoint.json")
+        checkpoint = serialize_acquisition_checkpoint(checkpoint_path, {
+            "version": 1,
+            "run_id": run_id,
+            "scope": "2026" if workflow_enabled and os.environ.get("BACKFILL_SCOPE", "").strip() == "2026" else "normal",
+            "universe": universe,
+            "selected": selected,
+            "projects": projects,
+            "visits": visits,
+            "previous_raw": previous_raw,
+            "previous_state_rows": previous_state_rows,
+            "state": state,
+            "layout_plan": layout_plan,
+            "columns": columns,
+        })
+        _stage(
+            f"ACQUISITION_CHECKPOINT_PASS | path={checkpoint['path']} | projects={len(projects)} | "
+            f"bytes={checkpoint['bytes']} | sha256={checkpoint['sha256']}"
+        )
+        if os.environ.get("ACQUISITION_ONLY", "false").strip().lower() == "true":
+            _stage("ACQUISITION_ONLY_PASS")
+            return {
+                "RUN_ID": run_id,
+                "FINAL_STATUS": "ACQUISITION_CHECKPOINT_PASS",
+                "ACQUISITION_CHECKPOINT": checkpoint,
+                "SELECTED_COUNT": len(selected),
+                "PORTAL_HTTP_REQUEST_COUNT": session.requests,
+            }
 
         timestamp = now()
         _stage("MATERIALIZATION_START")

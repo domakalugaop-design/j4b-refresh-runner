@@ -1,6 +1,8 @@
 from datetime import date
+import pytest
 
 from src.refresh import BASE_COLUMNS, COLUMNS, PROJECT_TYPE_COLUMNS, materialize, merge_previous, select_scope, sheet_rows, sheets_serial, summary
+from src.production import load_acquisition_checkpoint, serialize_acquisition_checkpoint
 
 
 def test_selector_current_previous_and_new():
@@ -109,3 +111,21 @@ def test_merge_previous_carries_last_good_fields_on_semantic_failure():
 def test_materializer_does_not_redefine_unmapped_has_period_marker():
     row = materialize([{"project_id": "1", "project_name": {"value": "Example_0926"}}], [], "2026-09-22T00:00:00+00:00")[0]
     assert row["has_period_marker"] is None
+
+
+def test_acquisition_checkpoint_roundtrip_and_secret_scan(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    payload = {
+        "version": 1, "universe": [{"project_id": "1"}], "selected": [{"project_id": "1"}],
+        "projects": [{"project_id": "1", "acquisition_state": "ACQUIRED"}], "visits": [],
+        "previous_raw": [], "previous_state_rows": [], "state": {},
+    }
+    result = serialize_acquisition_checkpoint(str(path), payload)
+    assert result["bytes"] > 0
+    assert load_acquisition_checkpoint(str(path))["projects"][0]["project_id"] == "1"
+    assert path.stat().st_mode & 0o077 == 0
+
+
+def test_acquisition_checkpoint_rejects_secret_like_fields(tmp_path):
+    with pytest.raises(ValueError, match="secret-like"):
+        serialize_acquisition_checkpoint(str(tmp_path / "bad.json"), {"version": 1, "token": "must-not-persist"})
