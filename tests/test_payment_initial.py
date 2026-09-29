@@ -1,8 +1,10 @@
 import json
+from unittest.mock import patch
 
 import pytest
 
-from src.payment_initial import materialize_complete_checkpoint
+from src.google_service_account import _service_account_info
+from src.payment_initial import _keychain_credential, materialize_complete_checkpoint
 from src.payment_materialization import PROJECT_PUBLICATION_COLUMNS, VISIT_PUBLICATION_COLUMNS
 from src.payment_refresh import load_checkpoint, new_checkpoint, record_result, save_checkpoint
 
@@ -38,3 +40,31 @@ def test_checkpoint_internal_hash_detects_tampering(tmp_path):
     path.chmod(0o600)
     with pytest.raises(ValueError, match="integrity"):
         load_checkpoint(path)
+
+
+def test_google_service_account_can_load_private_file_without_printing_it(tmp_path, monkeypatch):
+    path = tmp_path / "service-account.json"
+    path.write_text(json.dumps({"type": "service_account", "private_key": "private"}))
+    path.chmod(0o600)
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON_FILE", str(path))
+    assert _service_account_info() == {"type": "service_account", "private_key": "private"}
+
+
+def test_google_service_account_rejects_broad_file_permissions(tmp_path, monkeypatch):
+    path = tmp_path / "service-account.json"
+    path.write_text(json.dumps({"type": "service_account"}))
+    path.chmod(0o644)
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_JSON", raising=False)
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_JSON_FILE", str(path))
+    with pytest.raises(RuntimeError, match="permissions"):
+        _service_account_info()
+
+
+def test_keychain_error_does_not_include_captured_credential():
+    with patch("src.payment_initial.subprocess.run", return_value=type(
+        "Result", (), {"returncode": 1, "stdout": "SECRET", "stderr": "SECRET"}
+    )()):
+        with pytest.raises(RuntimeError) as error:
+            _keychain_credential("password")
+    assert "SECRET" not in str(error.value)

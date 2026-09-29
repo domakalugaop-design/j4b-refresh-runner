@@ -16,15 +16,22 @@ def _required(name: str) -> str:
 
 
 class PortalSession:
-    def __init__(self, timeout: float = 60):
+    def __init__(
+        self,
+        timeout: float = 60,
+        *,
+        base_url: str | None = None,
+        login: str | None = None,
+        password: str | None = None,
+    ):
         self.timeout = timeout
         self.requests = 0
         self.auth_get_count = 0
         self.auth_post_count = 0
         self.cookie_path: Path | None = None
-        self.base_url = _required("PORTAL_BASE_URL").rstrip("/")
-        self.login_value = _required("PORTAL_LOGIN")
-        self.password_value = _required("PORTAL_PASSWORD")
+        self.base_url = (base_url or _required("PORTAL_BASE_URL")).rstrip("/")
+        self.login_value = login if login is not None else _required("PORTAL_LOGIN")
+        self.password_value = password if password is not None else _required("PORTAL_PASSWORD")
         self.curl = shutil.which("curl")
         if not self.curl:
             raise RuntimeError("curl is required on PATH")

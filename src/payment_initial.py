@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import urllib.parse
 from pathlib import Path
@@ -48,6 +49,34 @@ BATCH_SIZE = 25
 CHECKPOINT_PATH = Path.home() / "Library/Application Support/J4B/payment-initial-2026/checkpoint.json"
 BACKUP_PATH = Path.home() / "Library/Application Support/J4B/payment-initial-2026/prepublication-tabs.json"
 PAYMENT_TABS = (production.PAYMENT_VISIT_TAB, production.PAYMENT_PROJECT_TAB)
+PORTAL_KEYCHAIN_SERVICE = "j4b-web-login"
+
+
+def _keychain_credential(account: str) -> str:
+    """Read a Portal credential without exposing it in argv, logs, or errors."""
+    result = subprocess.run(
+        ["/usr/bin/security", "find-generic-password", "-s", PORTAL_KEYCHAIN_SERVICE,
+         "-a", account, "-w"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    value = result.stdout.rstrip("\r\n")
+    if result.returncode != 0 or not value:
+        raise RuntimeError(
+            f"Portal Keychain credential unavailable (service={PORTAL_KEYCHAIN_SERVICE}, account={account})"
+        )
+    return value
+
+
+def _initial_portal_session() -> PortalSession:
+    if os.environ.get("PORTAL_LOGIN") and os.environ.get("PORTAL_PASSWORD"):
+        return PortalSession()
+    return PortalSession(
+        base_url=os.environ.get("PORTAL_BASE_URL", "https://lk.j4b.ru"),
+        login=_keychain_credential("login"),
+        password=_keychain_credential("password"),
+    )
 NON_PAYMENT_TABS = {
     "projects_current": "A:AG",
     "project_types": "A:C",
@@ -269,7 +298,7 @@ def run_initial_2026(*, checkpoint_path: Path = CHECKPOINT_PATH, batch_size: int
     meta = production._destination_preflight(token, sid)
     project_rows = read_sheet(token, sid, columns=list(PROJECT_TYPE_COLUMNS))
     # Project universe must come from the authenticated Portal session; resolve it before checkpoint validation.
-    session = PortalSession()
+    session = _initial_portal_session()
     try:
         session.login()
         catalogue = discover_universe(session)
