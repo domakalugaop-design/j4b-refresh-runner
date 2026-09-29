@@ -332,6 +332,31 @@ def _capture_workflow_backup(token: str, sid: str, previous_raw: list[list[Any]]
     )
 
 
+def _validate_project_type_state_materialization(
+    rows: list[dict[str, Any]],
+    state: dict[str, tuple[str, str]],
+    applicable_ids: set[str],
+) -> None:
+    """Validate assignments present in the candidate without requiring full-universe grain.
+
+    The persisted state is universe-scoped, while a workflow candidate may be
+    a bounded operational scope.  Therefore an applicable state row may be
+    absent from the candidate; any assignment that is present must still match
+    the immutable persisted value.
+    """
+    if not applicable_ids.issuperset(state):
+        invalid = sorted(set(state) - applicable_ids, key=int)
+        raise RuntimeError(f"candidate contains pre-0926 Project Type assignment: {','.join(invalid)}")
+    for row in rows:
+        project_id = str(row.get("project_id", ""))
+        assignment = state.get(project_id)
+        if not assignment:
+            continue
+        actual = (row.get("project_type_code"), row.get("project_type_name"))
+        if actual != assignment:
+            raise RuntimeError(f"candidate changes immutable Project Type assignment: {project_id}")
+
+
 def _publish_workflow_tab(token: str, sid: str, rows: list[dict[str, Any]], backup: dict[str, Any]) -> list[list[Any]]:
     rendered = third_tab_rows(rows)
     meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
@@ -476,11 +501,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     candidate_summary = summary(candidate)
     if candidate_summary["duplicates"] or candidate_summary["unique"] < summary(previous)["unique"]:
         raise RuntimeError("candidate validation failed")
-    candidate_ids = {str(row[0]) for row in candidate[1:] if row and row[0] not in (None, "")}
-    if not set(state).issubset(candidate_ids):
-        raise RuntimeError("candidate omits immutable Project Type assignments")
-    if not project_type_applicable_ids(universe).issuperset(state):
-        raise RuntimeError("candidate contains pre-0926 Project Type assignment")
+    _validate_project_type_state_materialization(merged, state, project_type_applicable_ids(universe))
     _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
     _stage("CANDIDATE_VALIDATION_PASS")
     _require_production_gate()
@@ -691,10 +712,7 @@ def run() -> dict[str, Any]:
             raise RuntimeError("candidate master shrinks previous unique project set")
         if project_type_enabled:
             candidate_ids = {str(r[0]) for r in candidate[1:] if r and r[0] not in (None, "")}
-            if not set(state).issubset(candidate_ids):
-                raise RuntimeError("candidate omits immutable Project Type assignments")
-            if not applicable_ids.issuperset(state):
-                raise RuntimeError("candidate contains pre-0926 Project Type assignment")
+            _validate_project_type_state_materialization(merged, state, applicable_ids)
             layout_plan["planned"] = layout_plan.get("planned", []) + (["WRITE project_types state"] if state != validate_state_rows(previous_state_rows) else [])
             layout_plan["planned"] = layout_plan.get("planned", []) + ["WRITE projects_current A:AG"]
         _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")

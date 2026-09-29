@@ -212,3 +212,16 @@ def test_schema_rollback_uses_exact_saved_baseline_width_and_headers(width):
     assert delete["startIndex"] == width
     assert delete["endIndex"] == width + 1
     assert plan["source_columns"] == source
+
+
+def test_project_type_state_can_cover_applicable_project_outside_bounded_candidate_scope():
+    state = {"8186": ("0005", PROJECT_TYPE_DICTIONARY["0005"])}
+    rows = [{"project_id": "8110", "project_type_code": "0005", "project_type_name": PROJECT_TYPE_DICTIONARY["0005"]}]
+    production._validate_project_type_state_materialization(rows, state, {"8110", "8186"})
+
+
+def test_project_type_state_rejects_immutable_value_change_in_candidate():
+    state = {"8110": ("0005", PROJECT_TYPE_DICTIONARY["0005"])}
+    rows = [{"project_id": "8110", "project_type_code": "0002", "project_type_name": PROJECT_TYPE_DICTIONARY["0002"]}]
+    with pytest.raises(RuntimeError, match="immutable Project Type"):
+        production._validate_project_type_state_materialization(rows, state, {"8110"})
