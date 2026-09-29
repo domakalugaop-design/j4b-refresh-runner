@@ -187,3 +187,28 @@ def test_schema_rollback_removes_only_new_tab_and_expansion():
     mutation_body = sheet_api.call_args_list[1].args[2]
     requests = mutation_body["requests"]
     assert {next(iter(request)) for request in requests} == {"deleteSheet", "deleteDimension"}
+
+
+@pytest.mark.parametrize("width", [33, 47])
+def test_schema_rollback_uses_exact_saved_baseline_width_and_headers(width):
+    source = [f"baseline_{i}" for i in range(width)]
+    previous = [source, [f"v{i}" for i in range(width)]]
+    plan = production._plan_project_type_layout(
+        _meta(columns=width, include_state=True),
+        target_columns=[*source, "workflow_metric"],
+        source_columns=source,
+    )
+    expanded = {"sheets": [
+        {"properties": {"title": "projects_current", "sheetId": 17, "gridProperties": {"columnCount": width + 1}}},
+        {"properties": {"title": "project_types", "sheetId": 18, "gridProperties": {"columnCount": 3}}},
+    ]}
+    restored = _meta(columns=width, include_state=True)
+    with patch("src.production.api", side_effect=[expanded, {}, restored]) as sheet_api, patch(
+        "src.production.read_sheet", return_value=previous
+    ):
+        production._rollback_project_type_layout("token", "sheet-1", plan, previous)
+    mutation_body = sheet_api.call_args_list[1].args[2]
+    delete = next(request["deleteDimension"]["range"] for request in mutation_body["requests"] if "deleteDimension" in request)
+    assert delete["startIndex"] == width
+    assert delete["endIndex"] == width + 1
+    assert plan["source_columns"] == source
