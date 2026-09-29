@@ -14,6 +14,15 @@ def action_row(visit, codes, project="42", action="100"):
     return f'<tr class=""><td><a href="/proj/{project}">P</a></td><td><a href="/visit/{visit}">V</a>{links}</td></tr>'
 
 
+def labeled_action_row(visit, code, label, project="42", action="100"):
+    return (
+        f'<tr class="table-success"><td><a href="/proj/{project}">P</a></td>'
+        f'<td><a href="/visit/{visit}">V</a>'
+        f'<a href="/action/{action}">{code}</a>'
+        f'<a href="/action/{action}">{label}</a></td></tr>'
+    )
+
+
 class Session:
     def __init__(self, responses):
         self.responses = iter(responses)
@@ -81,3 +90,41 @@ def test_state_39_is_valid_membership_and_unknown_state_fails_closed():
     with pytest.raises(ValueError, match="unknown workflow state"):
         deduplicate_memberships([{ "project_id": "42", "visit_id": "1", "workflow_state_code": 99 }])
 
+
+def test_unrelated_numeric_action_id_362206_is_not_a_workflow_state():
+    html = (
+        '<tr class="table-success"><td><a href="/proj/42">P</a>'
+        '<a href="/visit/1">V</a><a href="/action/362206">362206</a></td></tr>'
+    )
+    row = parse_action_table(html, "42")[0]
+    assert row["action_id"] == "362206"
+    assert row["workflow_state_codes"] == []
+
+
+def test_all_fourteen_canonical_states_parse_as_state_controls():
+    html = "".join(labeled_action_row(str(code), code, label) for code, label in {
+        0: "Отправлено приглашение", 5: "Приглашение отклонено",
+        10: "Приглашение принято", 15: "Отклонено менеджером",
+        20: "Подтверждено менеджером", 25: "Провалено пользователем",
+        30: "Выполнено пользователем", 35: "Анкета отклонена",
+        37: "Анкета проверена", 38: "Вопрос координатору",
+        39: "Есть претензия", 40: "Анкета утверждена",
+        45: "В оплате отказано", 50: "Оплачено",
+    }.items())
+    rows = parse_action_table(html, "42")
+    assert {int(row["workflow_state_codes"][0]) for row in rows} == set(WORKFLOW_STATE_CODES)
+
+
+def test_unknown_code_in_state_control_fails_closed():
+    html = labeled_action_row("1", 362206, "Оплачено")
+    with pytest.raises(ValueError, match="unknown workflow state code: 362206"):
+        parse_action_table(html, "42")
+
+
+def test_unrelated_numeric_control_with_non_state_label_is_ignored():
+    html = (
+        '<tr class="table-success"><td><a href="/proj/42">P</a>'
+        '<a href="/visit/1">V</a><a href="/action/362206">362206</a>'
+        '<a href="/action/362206">Открыть действие</a></td></tr>'
+    )
+    assert parse_action_table(html, "42")[0]["workflow_state_codes"] == []

@@ -4,6 +4,8 @@ import html as html_lib
 import re
 from typing import Any
 
+from .workflow_analytics import WORKFLOW_STATES
+
 TAG_RE = re.compile(r"<[^>]+>")
 INPUT_RE = re.compile(r"<input\b([^>]*)>", re.IGNORECASE)
 SELECT_RE = re.compile(r"<select\b([^>]*)>(.*?)</select\s*>", re.IGNORECASE | re.DOTALL)
@@ -12,6 +14,15 @@ OPTION_OPEN_RE = re.compile(r"<option\b([^>]*)>", re.IGNORECASE)
 NAME_RE = re.compile(r"\bname\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
 VALUE_RE = re.compile(r"\bvalue\s*=\s*[\"']([^\"']*)[\"']", re.IGNORECASE)
 VISIT_LINK_RE = re.compile(r"/visit/(\d+)", re.IGNORECASE)
+ACTION_LINK_RE = re.compile(r'<a\b[^>]*href=["\']/action/(\d+)["\'][^>]*>(.*?)</a\s*>', re.IGNORECASE | re.DOTALL)
+
+# The action page contains both the workflow-state link text and unrelated
+# numeric action identifiers.  Only the former are admitted to analytics.
+_WORKFLOW_LABELS = {" ".join(str(label).split()).casefold() for label in WORKFLOW_STATES.values()}
+_WORKFLOW_LABELS.update({
+    "отчет выполнен", "отчет принят", "оплачено", "ожидает оплату",
+    "анкета подтверждена", "есть претензия",
+})
 
 
 def plain_text(fragment: str) -> str:
@@ -122,8 +133,20 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
             continue
         action_match = re.search(r"/action/(\d+)", row)
         action_id = action_match.group(1) if action_match else ""
-        codes = re.findall(r'/action/\d+["\'][^>]*>(\d+)</a>', row)
-        labels = re.findall(r'/action/\d+["\'][^>]*>([^<]+)</a>', row)
+        links = [(identifier, plain_text(body)) for identifier, body in ACTION_LINK_RE.findall(row)]
+        numeric = [text for _, text in links if text.isdigit()]
+        codes = [text for text in numeric if int(text) in WORKFLOW_STATES]
+        labels = [text for _, text in links if not text.isdigit()]
+        # A structurally valid state control is represented by an action link
+        # with a visible state label.  If such a control has no canonical code,
+        # fail closed; bare numeric action IDs and other numeric controls are
+        # ignored.  When a canonical code is present, unrelated IDs in the
+        # same row remain metadata and must not poison the row.
+        normalized_labels = {" ".join(label.split()).casefold() for label in labels}
+        if not codes and labels and (normalized_labels & _WORKFLOW_LABELS):
+            unknown = next((text for text in numeric if int(text) not in WORKFLOW_STATES), None)
+            if unknown is not None:
+                raise ValueError(f"unknown workflow state code: {unknown}")
         status_label = ""
         for label in reversed(labels):
             label = label.strip()
