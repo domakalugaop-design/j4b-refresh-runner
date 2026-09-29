@@ -57,6 +57,10 @@ class PaymentWorkbookError(ValueError):
     """The export is not a structurally valid payment workbook."""
 
 
+class PaymentTransportError(RuntimeError):
+    """The payment export endpoint did not return a successful response."""
+
+
 class PaymentFeatureDisabled(RuntimeError):
     """Raised when the explicitly opt-in acquisition path is not enabled."""
 
@@ -362,16 +366,27 @@ def acquire_project_payment_assignments(
         headers={"Accept": XLSX_MIME},
         method="GET",
     )
-    if hasattr(authenticated_session, "open"):
+    if hasattr(authenticated_session, "request"):
+        status, content_type, body = authenticated_session.request(
+            route, "GET", accept=XLSX_MIME, follow_redirects=False
+        )
+        content_type = content_type.split(";", 1)[0].strip().lower()
+    elif hasattr(authenticated_session, "open"):
         opener = authenticated_session
+        with opener.open(request, timeout=timeout) as response:
+            status = int(response.status)
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            body = response.read()
     else:
         opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(authenticated_session), _NoRedirect()
         )
-    with opener.open(request, timeout=timeout) as response:
-        status = int(response.status)
-        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        body = response.read()
-    if status != 200 or content_type != XLSX_MIME:
+        with opener.open(request, timeout=timeout) as response:
+            status = int(response.status)
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+            body = response.read()
+    if status != 200:
+        raise PaymentTransportError(f"payment export request failed (HTTP {status})")
+    if content_type != XLSX_MIME:
         raise PaymentWorkbookError(f"payment export response contract failed (HTTP {status}, content type mismatch)")
     return parse_payment_detail_xlsx(body), status

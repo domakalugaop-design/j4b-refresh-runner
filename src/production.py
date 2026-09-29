@@ -5,11 +5,21 @@ import json
 import os
 import time
 import urllib.parse
+import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.error import HTTPError
 
 from .acquisition import Reader, acquire_project, discover_universe
+from .payment_detail_xlsx import acquire_project_payment_assignments
+from .payment_materialization import (
+    PROJECT_PUBLICATION_COLUMNS,
+    VISIT_PUBLICATION_COLUMNS,
+    build_publication_payloads,
+    materialize_payment_data,
+    serialize_sheet_payload,
+)
+from .payment_refresh import normalize_payment_sheet_values, publish_payment_pair, replace_by_project
 from .portal_transport import PortalSession
 from .google_service_account import google_token
 from .project_types import (
@@ -49,6 +59,95 @@ from .workflow_publication import (
 )
 
 PRODUCTION_TITLE = "J4B Portal — DataLens Materialized Layer"
+PAYMENT_VISIT_TAB = "Выплаты по визитам"
+PAYMENT_PROJECT_TAB = "Выплаты по проектам"
+
+
+def _payment_refresh_enabled() -> bool:
+    return os.environ.get("PAYMENT_REFRESH_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def _read_payment_tab(token: str, sid: str, title: str) -> list[list[Any]]:
+    encoded = urllib.parse.quote(f"'{title}'!A:Z", safe="!:'")
+    values = api_get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE",
+        token,
+    ).get("values", [])
+    return normalize_payment_sheet_values(title, values)
+
+
+def _exact_google_batch(token: str, sid: str, requests: list[dict[str, Any]]) -> Any:
+    if os.environ.get("DRY_RUN", "false").strip().lower() == "true":
+        raise RuntimeError("DRY_RUN blocked payment Sheet mutation")
+    body = serialize_sheet_payload({"requests": requests}).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate",
+        data=body,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as response:
+        return json.load(response)
+
+
+def _prepare_regular_payment_publication(
+    token: str,
+    sid: str,
+    meta: dict[str, Any],
+    session: PortalSession,
+    selected: list[dict[str, Any]],
+    acquired_projects: list[dict[str, Any]],
+) -> tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int]]:
+    """Acquire complete selected scope and prepare both replacement payloads before writes."""
+    sheet_ids = {
+        props.get("title"): props.get("sheetId")
+        for sheet in meta.get("sheets", [])
+        for props in [sheet.get("properties", {})]
+        if props.get("title") in {PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB}
+    }
+    if set(sheet_ids) != {PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB} or any(not isinstance(x, int) for x in sheet_ids.values()):
+        raise RuntimeError("payment tabs are missing from destination metadata")
+    expected_headers = {
+        PAYMENT_VISIT_TAB: list(VISIT_PUBLICATION_COLUMNS),
+        PAYMENT_PROJECT_TAB: list(PROJECT_PUBLICATION_COLUMNS),
+    }
+    projects_by_id = {str(row["project_id"]): row for row in acquired_projects}
+    selected_ids = [str(row["project_id"]) for row in selected]
+    if len(selected_ids) != len(set(selected_ids)) or set(selected_ids) != set(projects_by_id):
+        raise RuntimeError("payment selected/acquired project set mismatch")
+    failed = [pid for pid, row in projects_by_id.items() if row.get("acquisition_state") != "ACQUIRED"]
+    if failed:
+        raise RuntimeError(f"payment acquisition blocked by incomplete operational project set: {len(failed)}")
+    visit_rows: list[list[Any]] = []
+    project_rows: list[list[Any]] = []
+    for index, pid in enumerate(selected_ids, start=1):
+        payment_rows, status = acquire_project_payment_assignments(
+            pid, session, feature_enabled=True, timeout=60
+        )
+        if status != 200:
+            raise RuntimeError("payment XLSX acquisition returned non-200 status")
+        record = projects_by_id[pid]
+        materialized = materialize_payment_data(pid, record, payment_rows, record.get("workflow_memberships", []))
+        if not all(materialized["invariants"].values()):
+            raise RuntimeError(f"payment materialization invariant failure for project_id={pid}")
+        payload = build_publication_payloads(materialized)
+        visit_rows.extend(payload[PAYMENT_VISIT_TAB][1:])
+        project_rows.extend(payload[PAYMENT_PROJECT_TAB][1:])
+        if index % 25 == 0 or index == len(selected_ids):
+            _stage(f"PAYMENT_ACQUISITION {index}/{len(selected_ids)} | success={index}")
+    # Read/reconstruct the previous accepted snapshot only after every selected
+    # project's Portal and payment acquisition has succeeded.
+    previous = {PAYMENT_VISIT_TAB: _read_payment_tab(token, sid, PAYMENT_VISIT_TAB),
+                PAYMENT_PROJECT_TAB: _read_payment_tab(token, sid, PAYMENT_PROJECT_TAB)}
+    for tab, headers in expected_headers.items():
+        if not previous[tab] or previous[tab][0] != headers:
+            raise RuntimeError(f"existing payment schema mismatch: {tab}")
+    incoming = {
+        PAYMENT_VISIT_TAB: [expected_headers[PAYMENT_VISIT_TAB], *visit_rows],
+        PAYMENT_PROJECT_TAB: [expected_headers[PAYMENT_PROJECT_TAB], *project_rows],
+    }
+    candidate = replace_by_project(previous, incoming, selected_ids)
+    return previous, candidate, sheet_ids
 
 
 def _destination_preflight(token: str, sid: str, expected_title: str = PRODUCTION_TITLE) -> dict[str, Any]:
@@ -549,6 +648,7 @@ def run() -> dict[str, Any]:
     # publish the legacy 31-column layout over AF:AG.
     project_type_enabled = True
     workflow_enabled = _workflow_enabled()
+    payment_enabled = _payment_refresh_enabled()
     columns = primary_columns(PROJECT_TYPE_SCHEMA) if workflow_enabled else PROJECT_TYPE_SCHEMA
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
@@ -663,6 +763,14 @@ def run() -> dict[str, Any]:
                     flush=True,
                 )
 
+        payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int]] | None = None
+        if payment_enabled:
+            _stage("PAYMENT_STAGE_START | mode=REGULAR | cross_run_checkpoint=NO")
+            payment_publication = _prepare_regular_payment_publication(
+                token, sid, destination_meta, session, selected, projects
+            )
+            _stage("PAYMENT_ACQUISITION_AND_CANDIDATE_VALIDATION_PASS")
+
         checkpoint_path = os.environ.get("ACQUISITION_CHECKPOINT_PATH", "/tmp/j4b-acquisition-checkpoint.json")
         checkpoint = serialize_acquisition_checkpoint(checkpoint_path, {
             "version": 1,
@@ -737,6 +845,7 @@ def run() -> dict[str, Any]:
                 "BASELINE_ROWS": len(previous) - 1,
                 "BOOTSTRAP_VALID": bool(bootstrap_rows or layout_plan["state_exists"]),
                 "WORKFLOW_PUBLICATION": workflow_enabled,
+                "PAYMENT_PUBLICATION": bool(payment_publication),
             }
 
         # Authorization is deliberately late: all acquisition, candidate validation,
@@ -754,6 +863,17 @@ def run() -> dict[str, Any]:
                     _publish_workflow_tab(token, sid, merged, workflow_backup or {})
                     _stage("WORKFLOW_PUBLICATION_PASS")
                 publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+                if payment_publication is not None:
+                    old_payment, new_payment, payment_sheet_ids = payment_publication
+                    _stage("PAYMENT_PUBLICATION_START | tabs=2")
+                    payment_result = publish_payment_pair(
+                        sheet_ids=payment_sheet_ids,
+                        previous=old_payment,
+                        candidate=new_payment,
+                        write_batch=lambda requests: _exact_google_batch(token, sid, requests),
+                        read_tab=lambda tab: _read_payment_tab(token, sid, tab),
+                    )
+                    _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
                 _stage("PUBLISH_PASS")
             except Exception:
                 if workflow_enabled and workflow_backup is not None:
@@ -768,6 +888,17 @@ def run() -> dict[str, Any]:
             if run_mode == "production":
                 _require_production_gate()
             publish(token, sid, candidate, previous, columns=columns)
+            if payment_publication is not None:
+                old_payment, new_payment, payment_sheet_ids = payment_publication
+                _stage("PAYMENT_PUBLICATION_START | tabs=2")
+                payment_result = publish_payment_pair(
+                    sheet_ids=payment_sheet_ids,
+                    previous=old_payment,
+                    candidate=new_payment,
+                    write_batch=lambda requests: _exact_google_batch(token, sid, requests),
+                    read_tab=lambda tab: _read_payment_tab(token, sid, tab),
+                )
+                _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
         _stage("READBACK_PASS")
         _stage("TYPE_VALIDATION=EXTERNAL_POSTCHECK_REQUIRED")
 
@@ -825,6 +956,8 @@ def run() -> dict[str, Any]:
             "PROJECT_TYPE_PENDING_BEFORE_IDS": sorted(type_telemetry.pending_ids, key=int) if type_telemetry else [],
             "PROJECT_TYPE_PENDING_AFTER_IDS": sorted(applicable_ids - set(state), key=int) if project_type_enabled else [],
             "PROJECT_TYPE_APPLICABLE_IDS": sorted(applicable_ids, key=int) if project_type_enabled else [],
+            "PAYMENT_REFRESH_ENABLED": payment_enabled,
+            "PAYMENT_PUBLICATION": bool(payment_publication),
             "FINAL_MASTER_UNIQUE_IDS": candidate_summary["unique"],
             "FINAL_STATUS": "SUCCESS",
         }

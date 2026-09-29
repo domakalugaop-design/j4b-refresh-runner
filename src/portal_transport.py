@@ -82,11 +82,12 @@ class PortalSession:
         method: str = "GET",
         data: dict[str, str] | None = None,
         accept: str = "text/html",
+        follow_redirects: bool = True,
     ) -> tuple[int, str, bytes]:
         if not self.cookie_path:
             raise RuntimeError("Portal session is not authenticated")
         with tempfile.NamedTemporaryFile() as body, tempfile.NamedTemporaryFile() as headers:
-            args = self._base_args() + [
+            args = [arg for arg in self._base_args() if arg != "--location"] + [
                 "--header",
                 f"Accept: {accept}",
                 "--output",
@@ -96,6 +97,8 @@ class PortalSession:
                 "--write-out",
                 "%{http_code}",
             ]
+            if follow_redirects:
+                args.append("--location")
             if method == "POST":
                 args += [
                     "--request",
