@@ -70,7 +70,25 @@ jobs:
           print("PRODUCTION_RUNTIME_GATE=PASS")
           PY
 
-      - name: Run production refresh
+      - name: Acquire 2026 scope and save checkpoint
         env:
           ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
+          ACQUISITION_ONLY: "true"
+          ACQUISITION_CHECKPOINT_PATH: /tmp/j4b-acquisition-checkpoint.json
+        run: python -m src.production
+
+      - name: Upload acquisition checkpoint
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: j4b-workflow-acquisition-${{ github.run_id }}
+          path: /tmp/j4b-acquisition-checkpoint.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Run production refresh from checkpoint
+        env:
+          ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
+          REPLAY_ACQUISITION_CHECKPOINT: "true"
+          ACQUISITION_CHECKPOINT_PATH: /tmp/j4b-acquisition-checkpoint.json
         run: python -m src.production
