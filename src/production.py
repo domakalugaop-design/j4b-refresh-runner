@@ -198,7 +198,11 @@ def _plan_project_type_layout(
             raise RuntimeError("source columns are required for an arbitrary baseline width")
     else:
         source_columns = list(source_columns)
-    if column_count != len(source_columns):
+    # Sheets grid capacity may be larger than the populated header (for
+    # example, a 54-column workflow-enabled grid with a 33-column legacy
+    # header).  The header width is the source schema; capacity is only a
+    # lower bound for it.
+    if not isinstance(column_count, int) or column_count < len(source_columns):
         raise RuntimeError("projects_current source schema width mismatch")
     state = next((s.get("properties", {}) for s in sheets if s.get("properties", {}).get("title") == "project_types"), None)
     requests: list[dict[str, Any]] = []
@@ -353,6 +357,10 @@ def _upgrade_projects_rows(rows: list[list[Any]], source_columns: list[str], tar
     target_columns = target_columns or PROJECT_TYPE_SCHEMA
     if not rows:
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
+    if source_columns == target_columns:
+        if rows[0] != target_columns:
+            raise RuntimeError("baseline sheet unavailable or schema mismatch")
+        return [target_columns] + [list(row) + [""] * max(0, len(target_columns) - len(row)) for row in rows[1:]]
     if source_columns == PROJECT_TYPE_SCHEMA:
         if rows[0] == target_columns:
             return [list(row) + [""] * max(0, len(target_columns) - len(row)) for row in rows]
@@ -661,6 +669,24 @@ def _stage(name: str) -> None:
     print(name, flush=True)
 
 
+def _safe_failure_class(exc: BaseException) -> str:
+    """Map internal failures to a non-sensitive operational diagnostic."""
+    message = str(exc).casefold()
+    classifications = (
+        ("source schema width mismatch", "SHEET_SOURCE_SCHEMA_WIDTH_MISMATCH"),
+        ("baseline sheet header schema mismatch", "SHEET_HEADER_SCHEMA_MISMATCH"),
+        ("baseline sheet unavailable or schema mismatch", "SHEET_BASELINE_SCHEMA_MISMATCH"),
+        ("production destination title verification failed", "SHEET_DESTINATION_GUARD_FAILED"),
+        ("missing required environment variable", "RUNTIME_SECRET_OR_CONFIG_MISSING"),
+        ("project_types state is absent", "PROJECT_TYPE_STATE_MISSING"),
+        ("portal", "PORTAL_FAILURE"),
+    )
+    for needle, classification in classifications:
+        if needle in message:
+            return classification
+    return type(exc).__name__.upper()
+
+
 def _encode_private_backup(value: Any) -> Any:
     """JSON-safe, type-preserving encoding for private prepublication backups."""
     if isinstance(value, Decimal):
@@ -880,7 +906,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     meta = _destination_preflight(token, sid)
     physical = next(s.get("properties", {}) for s in meta["sheets"] if s.get("properties", {}).get("title") == "projects_current")
     source_columns = list(previous_raw[0]) if previous_raw else []
-    if physical.get("gridProperties", {}).get("columnCount") != len(source_columns):
+    if physical.get("gridProperties", {}).get("columnCount", 0) < len(source_columns):
         raise RuntimeError("checkpoint baseline schema does not match destination width")
     previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
     plan = _plan_project_type_layout(meta, columns, source_columns=source_columns)
@@ -1013,9 +1039,18 @@ def run() -> dict[str, Any]:
     bootstrap_sha256 = "NONE"
     if project_type_enabled and destination_meta:
         current_meta = next((s.get("properties", {}) for s in destination_meta.get("sheets", []) if s.get("properties", {}).get("title") == "projects_current"), {})
-        physical_columns = current_meta.get("gridProperties", {}).get("columnCount")
-        source_columns = BASE_COLUMNS if physical_columns == len(BASE_COLUMNS) else columns if physical_columns == len(columns) else PROJECT_TYPE_SCHEMA if physical_columns == len(PROJECT_TYPE_SCHEMA) else []
-        previous_raw = read_sheet(token, sid, columns=source_columns) if source_columns else []
+        # Read the populated header using the target range, then distinguish
+        # schema width from the worksheet's allocated grid capacity.
+        previous_raw = read_sheet(token, sid, columns=columns)
+        header = previous_raw[0] if previous_raw else []
+        if header == BASE_COLUMNS:
+            source_columns = BASE_COLUMNS
+        elif header == PROJECT_TYPE_SCHEMA:
+            source_columns = PROJECT_TYPE_SCHEMA
+        elif header == columns:
+            source_columns = columns
+        else:
+            raise RuntimeError("baseline sheet header schema mismatch")
         previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
         layout_plan = _plan_project_type_layout(destination_meta, columns, source_columns=source_columns)
         _stage(f"PROJECT_TYPE_BASELINE_SCHEMA | source_columns={len(source_columns)} | rows={len(previous)-1}")
@@ -1365,6 +1400,7 @@ def main() -> int:
                     "FINAL_STATUS": "FAILED",
                     "ERROR_TYPE": type(exc).__name__,
                     "HTTP_STATUS": exc.code,
+                    "FAILURE_CLASS": "HTTP_FAILURE",
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1375,7 +1411,11 @@ def main() -> int:
     except Exception as exc:
         print(
             json.dumps(
-                {"FINAL_STATUS": "FAILED", "ERROR_TYPE": type(exc).__name__},
+                {
+                    "FINAL_STATUS": "FAILED",
+                    "ERROR_TYPE": type(exc).__name__,
+                    "FAILURE_CLASS": _safe_failure_class(exc),
+                },
                 ensure_ascii=False,
                 sort_keys=True,
             ),

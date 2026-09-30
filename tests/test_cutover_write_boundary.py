@@ -261,6 +261,32 @@ def test_schema_rollback_uses_exact_saved_baseline_width_and_headers(width):
     assert plan["source_columns"] == source
 
 
+def test_grid_capacity_may_exceed_populated_legacy_header():
+    # Google Sheets retains allocated columns after a prior workflow schema;
+    # capacity must not be mistaken for the populated source header width.
+    meta = _meta(columns=54, include_state=True)
+    plan = production._plan_project_type_layout(
+        meta,
+        target_columns=PROJECT_TYPE_COLUMNS,
+        source_columns=BASE_COLUMNS,
+    )
+    assert plan["source_column_count"] == len(BASE_COLUMNS)
+    assert plan["target_column_count"] == len(PROJECT_TYPE_COLUMNS)
+    assert plan["requests"] == []
+
+
+def test_workflow_width_header_is_accepted_as_source_schema():
+    target = production.primary_columns(PROJECT_TYPE_COLUMNS)
+    rows = [target, ["8110"] + [""] * (len(target) - 1)]
+    upgraded = production._upgrade_projects_rows(rows, target, target)
+    assert upgraded == rows
+
+
+def test_failure_diagnostic_is_symbolic_and_secret_free():
+    exc = RuntimeError("projects_current source schema width mismatch; token=private")
+    assert production._safe_failure_class(exc) == "SHEET_SOURCE_SCHEMA_WIDTH_MISMATCH"
+
+
 def test_project_type_state_can_cover_applicable_project_outside_bounded_candidate_scope():
     state = {"8186": ("0005", PROJECT_TYPE_DICTIONARY["0005"])}
     rows = [{"project_id": "8110", "project_type_code": "0005", "project_type_name": PROJECT_TYPE_DICTIONARY["0005"]}]
