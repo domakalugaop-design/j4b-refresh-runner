@@ -17,6 +17,7 @@ from src.payment_refresh import (
     save_checkpoint,
     publish_payment_pair,
     normalize_payment_sheet_values,
+    diagnose_payment_readback,
 )
 
 
@@ -427,3 +428,87 @@ def test_sheet_readback_money_is_normalized_to_decimal_and_ids_to_string():
     assert rows[1][0] == "123" and rows[1][4] == "456"
     assert rows[1][6] == Decimal("500.25") and rows[1][7] == Decimal("0.0")
     assert rows[1][5] == 1 and rows[1][9] == 1
+
+
+def test_readback_diagnostics_preserve_existing_equality_for_numeric_types():
+    assert diagnose_payment_readback("t", [["metric"], [3]], [["metric"], [3]])["matches_existing_contract"]
+    assert diagnose_payment_readback("t", [["metric"], [3]], [["metric"], [3.0]])["matches_existing_contract"]
+    mismatch = diagnose_payment_readback("t", [["metric"], [3]], [["metric"], ["3"]])
+    assert not mismatch["matches_existing_contract"]
+    assert mismatch["first_mismatch"]["class"] == "STRING_VS_NUMBER"
+
+
+def test_readback_diagnostics_report_trailing_blank_cells_without_waiving_other_differences():
+    result = diagnose_payment_readback("t", [["id", "note"], ["x", ""]], [["id", "note"], ["x"]])
+    assert result["matches_existing_contract"]
+    assert result["mismatch_counts_by_class"] == {"MISSING_TRAILING_EMPTY": 1}
+    assert result["total_mismatched_cells"] == 0
+
+
+def test_readback_diagnostics_keep_null_and_empty_distinct_but_ignore_trailing_empty_columns():
+    mismatch = diagnose_payment_readback("t", [["id", "note", "tail"], ["x", None, "kept"]], [["id", "note", "tail"], ["x", "", "kept"]])
+    assert not mismatch["matches_existing_contract"]
+    assert mismatch["first_mismatch"]["class"] == "NULL_VS_EMPTY"
+    padded = diagnose_payment_readback("t", [["id", "note", ""], ["x", "y", ""]], [["id", "note"], ["x", "y"]])
+    assert padded["matches_existing_contract"]
+    assert "MISSING_TRAILING_EMPTY" in padded["mismatch_counts_by_class"]
+
+
+def test_readback_diagnostics_distinguish_leading_and_interior_empty_cells():
+    same = diagnose_payment_readback("t", [["a", "b", "c"], ["", "", "z"]], [["a", "b", "c"], ["", "", "z"]])
+    assert same["matches_existing_contract"]
+    changed = diagnose_payment_readback("t", [["a", "b", "c"], ["", "x", "z"]], [["a", "b", "c"], ["", "", "z"]])
+    assert changed["first_mismatch"]["a1"] == "B2"
+    assert changed["first_mismatch"]["class"] == "TEXT_VALUE"
+
+
+def test_readback_diagnostics_numeric_precision_unicode_and_a1_coordinates():
+    decimal = diagnose_payment_readback("t", [["amount"], [Decimal("10.50")]], [["amount"], [10.5]])
+    assert decimal["matches_existing_contract"]
+    large = diagnose_payment_readback("t", [["count"], [9007199254740993]], [["count"], [float(9007199254740993)]])
+    assert not large["matches_existing_contract"]
+    assert large["first_mismatch"]["class"] == "NUMERIC_VALUE"
+    unicode_same = diagnose_payment_readback("t", [["name"], ["Клиент 東京"]], [["name"], ["Клиент 東京"]])
+    assert unicode_same["matches_existing_contract"]
+    unicode_diff = diagnose_payment_readback("t", [["name"], ["Клиент 東京"]], [["name"], ["Клиент 京都"]])
+    assert unicode_diff["first_mismatch"]["a1"] == "A2"
+    assert unicode_diff["first_mismatch"]["class"] == "TEXT_VALUE"
+
+
+def test_readback_diagnostics_summarize_row_column_and_systematic_mismatches():
+    row_count = diagnose_payment_readback("t", [["a", "b"], [1, 2], [3, 4]], [["a", "b"], [1, 2]])
+    assert row_count["mismatch_counts_by_class"]["ROW_COUNT"] == 1
+    assert row_count["mismatched_rows"] == 1
+    short_row = diagnose_payment_readback("t", [["a", "b"], [1, 2]], [["a", "b"], [1]])
+    assert short_row["first_mismatch"]["a1"] == "B2"
+    assert short_row["first_mismatch"]["class"] == "OTHER"
+    column_count = diagnose_payment_readback("t", [["a", "b"], [1, 2]], [["a"], [1]])
+    assert column_count["mismatch_counts_by_class"]["COLUMN_COUNT"] == 1
+    assert column_count["mismatch_counts_by_class"]["OTHER"] == 1
+    systematic = diagnose_payment_readback("t", [["code"], [100], [200], [300]], [["code"], ["100"], ["200"], ["300"]])
+    assert systematic["total_mismatched_cells"] == 3
+    assert systematic["mismatched_rows"] == 3
+    assert systematic["mismatch_counts_by_column"] == {"A: code": 3}
+    assert systematic["mismatch_counts_by_class"] == {"STRING_VS_NUMBER": 3}
+    assert systematic["first_mismatch"]["row"] == 2
+
+
+def test_readback_diagnostics_single_cell_and_row_shift():
+    single = diagnose_payment_readback("t", [["id", "label"], ["1", "ok"]], [["id", "label"], ["1", "bad"]])
+    assert single["total_mismatched_cells"] == 1
+    assert single["mismatch_counts_by_class"] == {"TEXT_VALUE": 1}
+    shifted = diagnose_payment_readback("t", [["id"], ["a"], ["b"]], [["id"], ["b"], ["a"]])
+    assert shifted["mismatch_counts_by_class"]["ROW_SHIFT"] == 2
+
+
+def test_readback_diagnostics_never_expose_cell_pii():
+    import json
+
+    pii = "person@example.test / +7-999-111-22-33"
+    result = diagnose_payment_readback("t", [["client"], [pii]], [["client"], ["different private value"]])
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert pii not in serialized
+    assert "person@example" not in serialized
+    assert result["first_mismatch"]["expected"]["type"] == "str"
+    assert result["first_mismatch"]["expected"]["length"] == len(pii)
+    assert len(result["first_mismatch"]["expected"]["sha256"]) == 64

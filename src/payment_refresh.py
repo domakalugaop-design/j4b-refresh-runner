@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import tempfile
 import copy
 import time
@@ -285,6 +286,140 @@ def _normalized_readback(rows: list[list[Any]]) -> list[list[Any]]:
     return [row[:next((i + 1 for i in range(len(row) - 1, -1, -1) if row[i] not in (None, "")), 0)] for row in result]
 
 
+def _column_letters(index: int) -> str:
+    """Return spreadsheet column letters for a zero-based index."""
+    value = index + 1
+    letters = ""
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _safe_value_descriptor(value: Any) -> dict[str, Any]:
+    """Describe a value without disclosing its contents (which may be PII)."""
+    if value is None:
+        canonical = "null"
+    elif isinstance(value, bool):
+        canonical = "true" if value else "false"
+    elif isinstance(value, Decimal):
+        canonical = format(value, "f")
+    else:
+        canonical = str(value)
+    return {
+        "type": type(value).__name__,
+        "empty": value is None or value == "",
+        "length": len(canonical),
+        "sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    }
+
+
+def _mismatch_class(expected: Any, actual: Any) -> str:
+    if expected is None and actual == "" or actual is None and expected == "":
+        return "NULL_VS_EMPTY"
+    numeric = (int, float, Decimal)
+    if isinstance(expected, str) and isinstance(actual, numeric) or isinstance(actual, str) and isinstance(expected, numeric):
+        return "STRING_VS_NUMBER"
+    if isinstance(expected, numeric) and not isinstance(expected, bool) and isinstance(actual, numeric) and not isinstance(actual, bool):
+        return "NUMERIC_VALUE"
+    if isinstance(expected, str) or isinstance(actual, str):
+        return "TEXT_VALUE"
+    return "OTHER"
+
+
+def diagnose_payment_readback(tab: str, expected: list[list[Any]], actual: list[list[Any]]) -> dict[str, Any]:
+    """Summarize all value/shape differences without logging cell contents.
+
+    Equality deliberately remains the existing _normalized_readback contract:
+    trailing blank cells/rows are ignored; numeric strings are not coerced.
+    """
+    expected_normalized = _normalized_readback(expected)
+    actual_normalized = _normalized_readback(actual)
+    expected_columns = len(expected[0]) if expected else 0
+    actual_max_columns = max((len(row) for row in actual), default=0)
+    expected_rows = len(expected)
+    actual_rows = len(actual)
+    mismatch_counts_by_class: dict[str, int] = {}
+    mismatch_counts_by_column: dict[str, int] = {}
+    mismatch_rows: set[int] = set()
+    mismatches: list[dict[str, Any]] = []
+
+    if expected_rows != actual_rows:
+        mismatch_counts_by_class["ROW_COUNT"] = abs(expected_rows - actual_rows)
+    if expected_columns != actual_max_columns:
+        mismatch_counts_by_class["COLUMN_COUNT"] = abs(expected_columns - actual_max_columns)
+
+    # Report accepted structural normalization separately; it does not change
+    # equality or contribute to mismatched-cell totals.
+    trailing_empty_differences = 0
+    for row_index in range(max(len(expected), len(actual))):
+        e_row = expected[row_index] if row_index < len(expected) else []
+        a_row = actual[row_index] if row_index < len(actual) else []
+        e_norm = expected_normalized[row_index] if row_index < len(expected_normalized) else []
+        a_norm = actual_normalized[row_index] if row_index < len(actual_normalized) else []
+        if e_row != a_row and e_norm == a_norm:
+            trailing_empty_differences += 1
+
+    max_rows = max(len(expected_normalized), len(actual_normalized))
+    max_cols = max((len(row) for row in expected_normalized + actual_normalized), default=0)
+    for row_index in range(max_rows):
+        e_row = expected_normalized[row_index] if row_index < len(expected_normalized) else []
+        a_row = actual_normalized[row_index] if row_index < len(actual_normalized) else []
+        if e_row != a_row:
+            mismatch_rows.add(row_index + 1)
+        for col_index in range(max_cols):
+            e_value = e_row[col_index] if col_index < len(e_row) else None
+            a_value = a_row[col_index] if col_index < len(a_row) else None
+            if e_value == a_value:
+                continue
+            kind = _mismatch_class(e_value, a_value)
+            column = _column_letters(col_index)
+            header = expected[0][col_index] if expected and col_index < len(expected[0]) else None
+            # Header labels are schema metadata, not business row values.
+            column_label = f"{column}: {header}" if isinstance(header, str) and len(header) <= 80 and not re.search(r"[\r\n]", header) else column
+            mismatch_counts_by_class[kind] = mismatch_counts_by_class.get(kind, 0) + 1
+            mismatch_counts_by_column[column_label] = mismatch_counts_by_column.get(column_label, 0) + 1
+            if not mismatches:
+                mismatches.append({
+                    "row": row_index + 1,
+                    "column": column,
+                    "a1": f"{column}{row_index + 1}",
+                    "expected_type": type(e_value).__name__,
+                    "actual_type": type(a_value).__name__,
+                    "class": kind,
+                    "expected": _safe_value_descriptor(e_value),
+                    "actual": _safe_value_descriptor(a_value),
+                })
+
+    if trailing_empty_differences:
+        mismatch_counts_by_class["MISSING_TRAILING_EMPTY"] = trailing_empty_differences
+
+    # A row displaced by exactly one position is useful forensic context, but
+    # retain the underlying cell classifications and equality result.
+    shifted_rows: list[int] = []
+    for index, row in enumerate(expected_normalized):
+        if index < len(actual_normalized) and row != actual_normalized[index]:
+            if ((index > 0 and row == actual_normalized[index - 1]) or
+                    (index + 1 < len(actual_normalized) and row == actual_normalized[index + 1])):
+                shifted_rows.append(index + 1)
+    if shifted_rows:
+        mismatch_counts_by_class["ROW_SHIFT"] = len(shifted_rows)
+
+    return {
+        "tab": tab,
+        "expected_rows": expected_rows,
+        "actual_rows": actual_rows,
+        "expected_columns": expected_columns,
+        "actual_max_columns": actual_max_columns,
+        "total_mismatched_cells": sum(mismatch_counts_by_column.values()),
+        "mismatched_rows": len(mismatch_rows),
+        "mismatch_counts_by_column": mismatch_counts_by_column,
+        "mismatch_counts_by_class": mismatch_counts_by_class,
+        "first_mismatch": mismatches[0] if mismatches else None,
+        "matches_existing_contract": expected_normalized == actual_normalized,
+    }
+
+
 def _payment_write_chunks(requests: list[dict[str, Any]], max_bytes: int) -> list[dict[str, Any]]:
     """Split updateCells requests into request bodies bounded by serialized bytes."""
     if max_bytes <= 0:
@@ -519,6 +654,11 @@ def publish_payment_pair(
     if matches(actual, candidate_copy):
         return {"status": "PASS", "ambiguous_write_response": ambiguous_write_response,
                 "requests": len(requests), "chunks_written": chunks_written}
+    diagnostics = {
+        tab: diagnose_payment_readback(tab, candidate_copy[tab], actual[tab])
+        for tab in sheet_ids
+    }
+    print("PAYMENT_READBACK_DIAGNOSTIC=" + json.dumps(diagnostics, ensure_ascii=False, sort_keys=True), flush=True)
     try:
         write_chunked(atomic_two_tab_update_requests(sheet_ids, actual, saved, strict_headers=False))
         restore_grid_rows()
