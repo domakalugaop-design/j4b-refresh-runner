@@ -541,7 +541,7 @@ def test_qualified_nullable_money_none_does_not_equal_zero_or_numeric_text(actua
     assert not matches and equivalences == 0
 
 
-def test_nullable_money_rule_is_directional_and_does_not_normalize_text_columns():
+def test_nullable_money_rule_is_symmetric_only_for_qualified_fields():
     headers = ["client", "Оплачено по данным портала", "note"]
     expected_empty_text = [headers, [None, Decimal("4"), "keep"]]
     actual_empty_text = [headers, ["", Decimal("4"), "keep"]]
@@ -549,7 +549,22 @@ def test_nullable_money_rule_is_directional_and_does_not_normalize_text_columns(
 
     expected_empty_string = [headers, ["x", "", "keep"]]
     actual_null = [headers, ["x", None, "keep"]]
-    assert not _payment_readback_comparison("Выплаты по визитам", expected_empty_string, actual_null)[0]
+    matches, equivalences = _payment_readback_comparison("Выплаты по визитам", expected_empty_string, actual_null)
+    assert matches and equivalences == 1
+
+    # The same empty/null pair is not interchangeable in an unqualified field.
+    text_headers = ["client", "note"]
+    assert not _payment_readback_comparison(
+        "Выплаты по визитам", [text_headers, [None, "keep"]], [text_headers, ["", "keep"]]
+    )[0]
+
+
+def test_nullable_money_blank_and_null_are_equivalent_in_chunk_rows():
+    headers = ["project_id", "Оплачено по данным портала", "note"]
+    matches, equivalences = _payment_readback_comparison(
+        "Выплаты по визитам", [["x", "", "keep"]], [["x", None, "keep"]], headers=headers
+    )
+    assert matches and equivalences == 1
 
 
 def test_payment_readback_preserves_numeric_and_real_amount_mismatch_semantics():

@@ -297,22 +297,28 @@ def _payment_readback_comparison(
     *,
     headers: list[Any] | tuple[Any, ...] | None = None,
 ) -> tuple[bool, int]:
-    """Compare exact rows with a narrow, directional nullable-money allowance."""
+    """Compare rows, allowing blank/null only in qualified nullable money fields."""
     expected_normalized = _normalized_readback(expected)
     actual_normalized = _normalized_readback(actual)
     header_row = headers if headers is not None else (expected[0] if expected else ())
     allowed_fields = NULLABLE_PAYMENT_MONEY_FIELDS.get(tab, set())
     allowed_indices = {index for index, field in enumerate(header_row) if field in allowed_fields}
     equivalences = 0
-    for row_index, expected_row in enumerate(expected_normalized):
-        if row_index >= len(actual_normalized):
-            continue
-        actual_row = actual_normalized[row_index]
+    first_data_row = 0 if headers is not None else 1
+    for row_index, (expected_row, actual_row) in enumerate(zip(expected_normalized, actual_normalized)):
+        if row_index < first_data_row:
+            continue  # Headers are schema, never nullable business values.
         for column_index in allowed_indices:
-            if (column_index < len(expected_row) and column_index < len(actual_row)
-                    and expected_row[column_index] is None and actual_row[column_index] == ""):
-                actual_row[column_index] = None
-                equivalences += 1
+            if column_index < len(expected_row) and column_index < len(actual_row):
+                expected_value = expected_row[column_index]
+                actual_value = actual_row[column_index]
+                if expected_value in (None, "") and actual_value in (None, ""):
+                    if expected_value != actual_value:
+                        equivalences += 1
+                    expected_row[column_index] = None
+                    actual_row[column_index] = None
+                else:
+                    continue
     return expected_normalized == actual_normalized, equivalences
 
 
