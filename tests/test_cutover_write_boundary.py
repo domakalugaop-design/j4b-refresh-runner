@@ -178,6 +178,10 @@ def test_persistent_backup_upload_marker_is_a_hard_gate(tmp_path, monkeypatch):
     backup_dir.mkdir(mode=0o700)
     marker = backup_dir / "upload.ok"
     monkeypatch.setenv("RUN_MODE", "production")
+    monkeypatch.delenv("J4B_PERSISTENT_BACKUP_DIR", raising=False)
+    monkeypatch.delenv("J4B_PERSISTENT_BACKUP_UPLOAD_MARKER", raising=False)
+    with pytest.raises(RuntimeError, match="path is not configured"):
+        production._require_persistent_backup_upload()
     monkeypatch.setenv("J4B_PERSISTENT_BACKUP_DIR", str(backup_dir))
     monkeypatch.setenv("J4B_PERSISTENT_BACKUP_UPLOAD_MARKER", str(marker))
     with pytest.raises(RuntimeError, match="marker"):
@@ -188,12 +192,35 @@ def test_persistent_backup_upload_marker_is_a_hard_gate(tmp_path, monkeypatch):
 
 
 def test_main_workflow_uploads_backup_before_replay_publication():
+    import yaml
+
     workflow = Path(__file__).parents[1] / ".github/workflows/manual-production-dispatch.yml"
-    text = workflow.read_text(encoding="utf-8")
-    assert "PREPUBLICATION_BACKUP_ONLY" in text
-    assert "actions/upload-artifact@v4" in text
-    assert text.index("Upload private pre-publication backup artifact") < text.index("Run production refresh from checkpoint")
-    assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" in text
+    parsed = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    job = parsed["jobs"]["refresh"]
+    job_env = job.get("env", {})
+    assert "J4B_PERSISTENT_BACKUP_DIR" not in job_env
+    assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" not in job_env
+
+    steps = job["steps"]
+    by_name = {step.get("name"): step for step in steps}
+    test_env = by_name["Unit and portability tests"].get("env", {})
+    assert "J4B_PERSISTENT_BACKUP_DIR" not in test_env
+    assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" not in test_env
+    assert "J4B_PERSISTENT_BACKUP_DIR" not in job_env
+
+    for step_name in (
+        "Create persistent pre-publication backup",
+        "Verify backup integrity before artifact upload",
+        "Run production refresh from checkpoint",
+    ):
+        env = by_name[step_name].get("env", {})
+        assert "J4B_PERSISTENT_BACKUP_DIR" in env
+    for step_name in ("Confirm persistent backup artifact upload", "Run production refresh from checkpoint"):
+        assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" in by_name[step_name].get("env", {})
+
+    artifact_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload private pre-publication backup artifact")
+    replay_index = next(i for i, step in enumerate(steps) if step.get("name") == "Run production refresh from checkpoint")
+    assert artifact_index < replay_index
 
 
 def test_prepublication_baseline_guard_fails_closed_on_external_change():
