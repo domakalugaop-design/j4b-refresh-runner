@@ -185,8 +185,8 @@ def _column_name(index: int) -> str:
 
 
 def _workflow_mismatch_class(expected: Any, actual: Any, *, missing_cell: bool = False) -> str:
-    if missing_cell and expected in (None, ""):
-        return "MISSING_TRAILING_EMPTY"
+    if missing_cell:
+        return "MISSING_TRAILING_VALUE" if expected not in (None, "") else "MISSING_CELL"
     if (expected is None and actual == "") or (actual is None and expected == ""):
         return "NULL_VS_EMPTY"
     if isinstance(expected, bool) or isinstance(actual, bool):
@@ -201,8 +201,27 @@ def _workflow_mismatch_class(expected: Any, actual: Any, *, missing_cell: bool =
     return "OTHER"
 
 
+def _workflow_row_matches_with_trailing_blanks(expected: list[Any], actual: list[Any], width: int) -> bool:
+    if expected == actual:
+        return True
+    return (
+        len(actual) < width
+        and len(expected) == width
+        and expected[:len(actual)] == actual
+        and all(value == "" for value in expected[len(actual):])
+    )
+
+
 def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]]) -> dict[str, Any]:
-    """Return strict-comparison diagnostics containing no raw cell values."""
+    """Compare fixed-width rows, allowing only omitted expected-empty suffixes.
+
+    Google Sheets Values API may trim physically blank cells at the end of a
+    row. This is a directional transport normalization: a shortened actual
+    row is equivalent only when every omitted expected cell is the explicit
+    empty string. It does not equate None with blank, pad interior holes, or
+    forgive row/schema differences. Payment tabs intentionally retain their
+    separate, previously qualified nullable-money contract.
+    """
     expected_rows, actual_rows = len(expected), len(actual)
     expected_columns = len(expected[0]) if expected else 0
     actual_columns = max((len(row) for row in actual), default=0)
@@ -211,6 +230,8 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
     mismatch_row_indexes: set[int] = set()
     mismatch_samples: list[dict[str, Any]] = []
     first: dict[str, Any] | None = None
+    trailing_blank_omissions_accepted = 0
+    rows_with_trailing_blank_omissions: set[int] = set()
     max_rows = max(expected_rows, actual_rows)
     max_columns = max(expected_columns, actual_columns,
                       max((len(row) for row in expected), default=0),
@@ -221,14 +242,41 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
     if expected_columns != actual_columns:
         by_class["COLUMN_COUNT"] = abs(expected_columns - actual_columns)
 
+    expected_widths = {len(row) for row in expected}
+    if len(expected_widths) > 1:
+        by_class["EXPECTED_SCHEMA_WIDTH"] = len(expected_widths) - 1
+
+    actual_header_width = len(actual[0]) if actual else 0
+    if expected and actual and actual_header_width != expected_columns:
+        by_class["SCHEMA_WIDTH"] = abs(expected_columns - actual_header_width)
+
     for row_index in range(max_rows):
         expected_row = expected[row_index] if row_index < expected_rows else []
         actual_row = actual[row_index] if row_index < actual_rows else []
+        # Accept omissions as one complete row suffix only. Do not normalize
+        # short expected rows, header/schema width, or any suffix containing
+        # a non-empty or None expected value.
+        valid_omitted_suffix = (
+            row_index > 0
+            and row_index < expected_rows
+            and row_index < actual_rows
+            and len(expected_row) == expected_columns
+            and actual_header_width == expected_columns
+            and len(expected_widths) == 1
+            and len(actual_row) < expected_columns
+            and all(value == "" for value in expected_row[len(actual_row):])
+        )
+        if valid_omitted_suffix:
+            omitted = expected_columns - len(actual_row)
+            trailing_blank_omissions_accepted += omitted
+            rows_with_trailing_blank_omissions.add(row_index + 1)
         for column_index in range(max_columns):
             expected_present = column_index < len(expected_row)
             actual_present = column_index < len(actual_row)
             expected_value = expected_row[column_index] if expected_present else None
             actual_value = actual_row[column_index] if actual_present else None
+            if valid_omitted_suffix and column_index >= len(actual_row) and column_index < expected_columns:
+                continue
             if expected_present == actual_present and expected_value == actual_value:
                 continue
             mismatch_row_indexes.add(row_index + 1)
@@ -267,7 +315,7 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
 
     shift_count = 0
     for index, expected_row in enumerate(expected):
-        if index < len(actual) and expected_row != actual[index]:
+        if index < len(actual) and not _workflow_row_matches_with_trailing_blanks(expected_row, actual[index], expected_columns):
             if ((index > 0 and expected_row == actual[index - 1]) or
                     (index + 1 < len(actual) and expected_row == actual[index + 1])):
                 shift_count += 1
@@ -275,7 +323,7 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
         by_class["ROW_SHIFT"] = shift_count
 
     return {
-        "matches": expected == actual,
+        "matches": not by_class,
         "expected_rows": expected_rows,
         "actual_rows": actual_rows,
         "expected_columns": expected_columns,
@@ -286,15 +334,24 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
         "mismatch_rows": len(mismatch_row_indexes),
         "mismatch_by_column": by_column,
         "mismatch_by_class": by_class,
+        "trailing_blank_omissions_accepted": trailing_blank_omissions_accepted,
+        "rows_with_trailing_blank_omissions": len(rows_with_trailing_blank_omissions),
     }
 
 
 def validate_readback(actual: list[list[Any]], expected: list[list[Any]]) -> dict[str, Any]:
-    if actual != expected:
+    diagnostic = diagnose_workflow_readback(expected, actual)
+    if not diagnostic["matches"]:
         raise ValueError("publication readback mismatch")
     if not actual or actual[0] != expected[0]:
         raise ValueError("publication header mismatch")
     ids = [str(row[0]) for row in actual[1:] if row and row[0] not in (None, "")]
     if len(ids) != len(set(ids)):
         raise ValueError("publication readback contains duplicate project_id")
-    return {"status": "PASS", "rows": len(ids), "columns": len(actual[0])}
+    return {
+        "status": "PASS",
+        "rows": len(ids),
+        "columns": len(expected[0]),
+        "trailing_blank_omissions_accepted": diagnostic["trailing_blank_omissions_accepted"],
+        "rows_with_trailing_blank_omissions": diagnostic["rows_with_trailing_blank_omissions"],
+    }

@@ -225,9 +225,10 @@ def test_workflow_readback_diagnostic_mismatch_classes(expected_value, actual_va
 
 def test_workflow_readback_diagnostic_counts_dimensions_trailing_blanks_and_row_shift():
     trailing = diagnose_workflow_readback([["id", "note"], ["1", ""]], [["id", "note"], ["1"]])
-    assert not trailing["matches"]
-    assert trailing["first_mismatch"]["a1"] == "B2"
-    assert trailing["mismatch_by_class"] == {"MISSING_TRAILING_EMPTY": 1}
+    assert trailing["matches"]
+    assert trailing["trailing_blank_omissions_accepted"] == 1
+    assert trailing["rows_with_trailing_blank_omissions"] == 1
+    assert trailing["mismatch_by_class"] == {}
 
     shifted = diagnose_workflow_readback([["id"], ["a"], ["b"]], [["id"], ["b"], ["a"]])
     assert shifted["mismatch_by_class"]["ROW_SHIFT"] == 2
@@ -235,6 +236,53 @@ def test_workflow_readback_diagnostic_counts_dimensions_trailing_blanks_and_row_
     dimensions = diagnose_workflow_readback([["id", "x"], ["a", "b"], ["c", "d"]], [["id"], ["a"]])
     assert dimensions["mismatch_by_class"]["ROW_COUNT"] == 1
     assert dimensions["mismatch_by_class"]["COLUMN_COUNT"] == 1
+
+
+def test_trailing_blank_transport_contract_matrix():
+    from src.workflow_publication import validate_readback
+
+    cases = [
+        ([["a", "b", "c"], ["a", "b", "c"]], [["a", "b", "c"], ["a", "b", "c"]], True, 0),
+        ([["a", "b", ""], ["a", "b", ""]], [["a", "b", ""], ["a", "b"]], True, 1),
+        ([["a", "b", "c", "d"], ["a", "", "", ""]], [["a", "b", "c", "d"], ["a"]], True, 3),
+        ([["a", "b", "c"], ["", "", ""]], [["a", "b", "c"], []], True, 3),
+        ([["a", "b", "c"], ["a", "", "X"]], [["a", "b", "c"], ["a"]], False, 0),
+        ([["a", "b", "c"], ["a", "b", "c"]], [["a", "b", "c"], ["a", "b", "d"]], False, 0),
+        ([["a", "b"], ["a", 0]], [["a", "b"], ["a"]], False, 0),
+        ([["a", "b"], ["a", "0"]], [["a", "b"], ["a"]], False, 0),
+        ([["a", "b"], ["a", None]], [["a", "b"], ["a"]], False, 0),
+        ([["a", "b"], ["a", "b"]], [["a", "b"], ["a", "b", "c"]], False, 0),
+        ([["a", "b"], ["a", "b"], ["c", "d"]], [["a", "b"], ["a", "b"]], False, 0),
+        ([["a", "b", "c"], ["a", "b", ""]], [["a", "b"], ["a", "b"]], False, 0),
+        ([["a", "b", "c"], ["a", "", "c"]], [["a", "b", "c"], ["a", "X", "c"]], False, 0),
+    ]
+    for expected, actual, should_match, accepted in cases:
+        result = diagnose_workflow_readback(expected, actual)
+        assert result["matches"] is should_match, (expected, actual, result)
+        assert result["trailing_blank_omissions_accepted"] == accepted
+        if should_match:
+            assert validate_readback(actual, expected)["status"] == "PASS"
+        else:
+            with pytest.raises(ValueError, match="publication readback mismatch"):
+                validate_readback(actual, expected)
+
+
+def test_workflow_25_column_real_shape_accepts_only_trailing_empty_suffix():
+    from src.workflow_publication import THIRD_TAB_COLUMNS
+
+    expected = [THIRD_TAB_COLUMNS, ["8110", "project", "", "", *([""] * 21)]]
+    actual = [THIRD_TAB_COLUMNS, ["8110", "project"]]
+    result = diagnose_workflow_readback(expected, actual)
+    assert result["matches"]
+    assert result["trailing_blank_omissions_accepted"] == 23
+    assert result["rows_with_trailing_blank_omissions"] == 1
+
+    # A non-empty workflow metric in the omitted suffix remains a hard error.
+    nonempty = [list(expected[0]), list(expected[1])]
+    nonempty[1][12] = 1
+    rejected = diagnose_workflow_readback(nonempty, actual)
+    assert not rejected["matches"]
+    assert rejected["trailing_blank_omissions_accepted"] == 0
 
 
 def test_shrink_plan_clears_obsolete_tail_rows():

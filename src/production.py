@@ -512,7 +512,10 @@ def _validate_workflow_readback(
             diagnostic["schema_sha256"] = candidate_manifest["schema_sha256"]
         print("WORKFLOW_READBACK_DIAGNOSTIC=" + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), flush=True)
         raise ValueError("workflow publication readback mismatch")
-    return validate_readback(actual, expected)
+    result = validate_readback(actual, expected)
+    _stage(f"TRAILING_BLANK_OMISSIONS_ACCEPTED={result['trailing_blank_omissions_accepted']}")
+    _stage(f"ROWS_WITH_TRAILING_BLANK_OMISSIONS={result['rows_with_trailing_blank_omissions']}")
+    return result
 
 
 def _rollback_workflow_tab(token: str, sid: str, backup: dict[str, Any]) -> None:
