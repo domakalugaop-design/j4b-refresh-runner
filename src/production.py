@@ -60,6 +60,8 @@ from .workflow_publication import (
     backup_snapshot,
     primary_columns,
     third_tab_rows,
+    diagnose_workflow_readback,
+    persist_private_workflow_candidate,
     validate_materialized_rows,
     validate_readback,
 )
@@ -472,6 +474,12 @@ def _validate_project_type_state_materialization(
 
 def _publish_workflow_tab(token: str, sid: str, rows: list[dict[str, Any]], backup: dict[str, Any]) -> list[list[Any]]:
     rendered = third_tab_rows(rows)
+    candidate_manifest = persist_private_workflow_candidate(rendered)
+    _stage(
+        f"WORKFLOW_CANDIDATE_PRIVATE_PASS | rows={candidate_manifest['rows']} | "
+        f"columns={candidate_manifest['columns']} | schema_sha256={candidate_manifest['schema_sha256']} | "
+        f"candidate_sha256={candidate_manifest['candidate_sha256']}"
+    )
     meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
     tab = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
     if not tab:
@@ -487,11 +495,50 @@ def _publish_workflow_tab(token: str, sid: str, rows: list[dict[str, Any]], back
         tail = urllib.parse.quote(f"{THIRD_TAB_NAME}!A{len(rendered)+1}:{end_column}{old_rows}", safe="!:")
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{tail}:clear", token, {}, method="POST")
     actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
-    validate_readback(actual, rendered)
+    _validate_workflow_readback(actual, rendered, candidate_manifest=candidate_manifest)
     return rendered
 
 
+def _validate_workflow_readback(
+    actual: list[list[Any]],
+    expected: list[list[Any]],
+    *,
+    candidate_manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    diagnostic = diagnose_workflow_readback(expected, actual)
+    if not diagnostic["matches"]:
+        if candidate_manifest:
+            diagnostic["candidate_sha256"] = candidate_manifest["candidate_sha256"]
+            diagnostic["schema_sha256"] = candidate_manifest["schema_sha256"]
+        print("WORKFLOW_READBACK_DIAGNOSTIC=" + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), flush=True)
+        raise ValueError("workflow publication readback mismatch")
+    return validate_readback(actual, expected)
+
+
 def _rollback_workflow_tab(token: str, sid: str, backup: dict[str, Any]) -> None:
+    _stage("WORKFLOW_ROLLBACK_REQUIRED=YES")
+    _stage("WORKFLOW_ROLLBACK_ATTEMPTED=YES")
+    readback_started = False
+    def mark_readback_start() -> None:
+        nonlocal readback_started
+        readback_started = True
+    try:
+        _rollback_workflow_tab_body(token, sid, backup, on_readback_start=mark_readback_start)
+    except Exception:
+        _stage("WORKFLOW_ROLLBACK_READBACK=FAIL" if readback_started else "WORKFLOW_ROLLBACK_READBACK=NOT_COMPLETED")
+        _stage("WORKFLOW_ROLLBACK_RESULT=FAIL")
+        raise RuntimeError("WORKFLOW_ROLLBACK_INCOMPLETE") from None
+    _stage("WORKFLOW_ROLLBACK_READBACK=PASS")
+    _stage("WORKFLOW_ROLLBACK_RESULT=PASS")
+
+
+def _rollback_workflow_tab_body(
+    token: str,
+    sid: str,
+    backup: dict[str, Any],
+    *,
+    on_readback_start: Any,
+) -> None:
     sheets = backup["payload"]["sheets"]
     meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId)", token)
     tab = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
@@ -499,13 +546,18 @@ def _rollback_workflow_tab(token: str, sid: str, backup: dict[str, Any]) -> None
     if not previous:
         if tab:
             api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"deleteSheet": {"sheetId": tab["sheetId"]}}]})
+        on_readback_start()
+        verified = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title)", token)
+        if any(s.get("properties", {}).get("title") == THIRD_TAB_NAME for s in verified.get("sheets", [])):
+            raise RuntimeError("workflow rollback tab-removal readback mismatch")
         return
     encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
     api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
     end_column = col(len(previous[0]) - 1)
     api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:{end_column}{len(previous)}", "majorDimension": "ROWS", "values": previous}]})
+    on_readback_start()
     actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
-    validate_readback(actual, previous)
+    _validate_workflow_readback(actual, previous)
 
 
 def _rollback_full_refresh(

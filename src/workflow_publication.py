@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
+import stat
+import tempfile
 from typing import Any, Iterable
 
 from .workflow_analytics import WORKFLOW_COUNTER_FIELDS, WORKFLOW_STATES, validate_workflow_metrics
@@ -105,6 +109,184 @@ def rollback_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     if hashlib.sha256(encoded).hexdigest() != snapshot["sha256"]:
         raise ValueError("backup snapshot hash mismatch")
     return payload["sheets"]
+
+
+def persist_private_workflow_candidate(rows: list[list[Any]]) -> dict[str, Any]:
+    """Persist the exact workflow matrix outside the repository with private permissions."""
+    encoded = json.dumps(rows, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    header = rows[0] if rows else []
+    schema_encoded = json.dumps(header, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    directory = tempfile.mkdtemp(prefix="j4b-workflow-candidate-")
+    os.chmod(directory, 0o700)
+    path = os.path.join(directory, "candidate.json")
+    descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(path, 0o600)
+    with open(path, "rb") as handle:
+        persisted = handle.read()
+    digest = hashlib.sha256(encoded).hexdigest()
+    if (
+        persisted != encoded
+        or hashlib.sha256(persisted).hexdigest() != digest
+        or stat.S_IMODE(os.stat(directory).st_mode) != 0o700
+        or stat.S_IMODE(os.stat(path).st_mode) != 0o600
+    ):
+        raise RuntimeError("private workflow candidate integrity mismatch")
+    return {
+        "path": path,
+        "bytes": len(encoded),
+        "rows": len(rows),
+        "columns": max((len(row) for row in rows), default=0),
+        "candidate_sha256": digest,
+        "schema_sha256": hashlib.sha256(schema_encoded).hexdigest(),
+    }
+
+
+def _value_class(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if value == "":
+        return "EMPTY_STRING"
+    if isinstance(value, bool):
+        return "BOOLEAN"
+    if isinstance(value, (int, float)):
+        return "NUMBER"
+    if isinstance(value, str):
+        return "TEXT"
+    return "OTHER"
+
+
+def _safe_value_fingerprint(value: Any) -> dict[str, Any]:
+    """Describe a mismatched value without exposing its contents."""
+    if value is None:
+        encoded = b"null"
+    elif isinstance(value, str):
+        encoded = value.encode("utf-8", errors="replace")
+    elif isinstance(value, bool):
+        encoded = b"true" if value else b"false"
+    elif isinstance(value, (int, float)):
+        encoded = repr(value).encode("ascii")
+    else:
+        encoded = repr(value).encode("utf-8", errors="replace")
+    return {"class": _value_class(value), "type": type(value).__name__, "length": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest()}
+
+
+def _column_name(index: int) -> str:
+    result = ""
+    value = index + 1
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def _workflow_mismatch_class(expected: Any, actual: Any, *, missing_cell: bool = False) -> str:
+    if missing_cell and expected in (None, ""):
+        return "MISSING_TRAILING_EMPTY"
+    if (expected is None and actual == "") or (actual is None and expected == ""):
+        return "NULL_VS_EMPTY"
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return "BOOLEAN_VALUE"
+    if ((isinstance(expected, str) and isinstance(actual, (int, float))) or
+            (isinstance(actual, str) and isinstance(expected, (int, float)))):
+        return "STRING_VS_NUMBER"
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return "NUMERIC_VALUE"
+    if isinstance(expected, str) or isinstance(actual, str):
+        return "TEXT_VALUE"
+    return "OTHER"
+
+
+def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]]) -> dict[str, Any]:
+    """Return strict-comparison diagnostics containing no raw cell values."""
+    expected_rows, actual_rows = len(expected), len(actual)
+    expected_columns = len(expected[0]) if expected else 0
+    actual_columns = max((len(row) for row in actual), default=0)
+    by_class: dict[str, int] = {}
+    by_column: dict[str, int] = {}
+    mismatch_row_indexes: set[int] = set()
+    mismatch_samples: list[dict[str, Any]] = []
+    first: dict[str, Any] | None = None
+    max_rows = max(expected_rows, actual_rows)
+    max_columns = max(expected_columns, actual_columns,
+                      max((len(row) for row in expected), default=0),
+                      max((len(row) for row in actual), default=0))
+
+    if expected_rows != actual_rows:
+        by_class["ROW_COUNT"] = abs(expected_rows - actual_rows)
+    if expected_columns != actual_columns:
+        by_class["COLUMN_COUNT"] = abs(expected_columns - actual_columns)
+
+    for row_index in range(max_rows):
+        expected_row = expected[row_index] if row_index < expected_rows else []
+        actual_row = actual[row_index] if row_index < actual_rows else []
+        for column_index in range(max_columns):
+            expected_present = column_index < len(expected_row)
+            actual_present = column_index < len(actual_row)
+            expected_value = expected_row[column_index] if expected_present else None
+            actual_value = actual_row[column_index] if actual_present else None
+            if expected_present == actual_present and expected_value == actual_value:
+                continue
+            mismatch_row_indexes.add(row_index + 1)
+            kind = _workflow_mismatch_class(
+                expected_value, actual_value,
+                missing_cell=(not expected_present or not actual_present),
+            )
+            by_class[kind] = by_class.get(kind, 0) + 1
+            column = _column_name(column_index)
+            header = expected[0][column_index] if expected and column_index < len(expected[0]) else None
+            label = f"{column}: {header}" if isinstance(header, str) and len(header) <= 80 and not any(c in header for c in "\r\n") else column
+            by_column[label] = by_column.get(label, 0) + 1
+            if first is None:
+                first = {
+                    "row_index": row_index + 1,
+                    "column_index": column_index + 1,
+                    "a1": f"{column}{row_index + 1}",
+                    "column": column,
+                    "column_name": header if isinstance(header, str) else None,
+                    "expected_type": type(expected_value).__name__,
+                    "actual_type": type(actual_value).__name__,
+                    "expected_value": _safe_value_fingerprint(expected_value),
+                    "actual_value": _safe_value_fingerprint(actual_value),
+                    "class": kind,
+                }
+            if len(mismatch_samples) < 25:
+                mismatch_samples.append({
+                    "row_index": row_index + 1,
+                    "column_index": column_index + 1,
+                    "a1": f"{column}{row_index + 1}",
+                    "column_name": header if isinstance(header, str) else None,
+                    "expected_value": _safe_value_fingerprint(expected_value),
+                    "actual_value": _safe_value_fingerprint(actual_value),
+                    "class": kind,
+                })
+
+    shift_count = 0
+    for index, expected_row in enumerate(expected):
+        if index < len(actual) and expected_row != actual[index]:
+            if ((index > 0 and expected_row == actual[index - 1]) or
+                    (index + 1 < len(actual) and expected_row == actual[index + 1])):
+                shift_count += 1
+    if shift_count:
+        by_class["ROW_SHIFT"] = shift_count
+
+    return {
+        "matches": expected == actual,
+        "expected_rows": expected_rows,
+        "actual_rows": actual_rows,
+        "expected_columns": expected_columns,
+        "actual_columns": actual_columns,
+        "first_mismatch": first,
+        "mismatch_samples": mismatch_samples,
+        "total_mismatch_cells": sum(by_column.values()),
+        "mismatch_rows": len(mismatch_row_indexes),
+        "mismatch_by_column": by_column,
+        "mismatch_by_class": by_class,
+    }
 
 
 def validate_readback(actual: list[list[Any]], expected: list[list[Any]]) -> dict[str, Any]:

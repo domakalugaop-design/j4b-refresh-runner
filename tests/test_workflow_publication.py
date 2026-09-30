@@ -1,3 +1,8 @@
+import json
+import os
+import stat
+from pathlib import Path
+
 import pytest
 
 from src.refresh import COLUMNS
@@ -6,6 +11,8 @@ from src.workflow_publication import (
     THIRD_TAB_COLUMNS,
     THIRD_TAB_NAME,
     backup_snapshot,
+    diagnose_workflow_readback,
+    persist_private_workflow_candidate,
     primary_columns,
     publication_plan,
     rollback_snapshot,
@@ -80,6 +87,154 @@ def test_readback_validator_rejects_stale_or_changed_rows():
     assert validate_readback(expected, expected)["status"] == "PASS"
     with pytest.raises(ValueError, match="readback mismatch"):
         validate_readback(expected + [["stale"]], expected)
+
+
+def test_workflow_readback_diagnostics_are_strict_and_report_first_cell_without_values():
+    expected = [["project_id", "client"], ["8110", "private client"]]
+    actual = [["project_id", "client"], ["8110", "different private client"]]
+    diagnostic = diagnose_workflow_readback(expected, actual)
+    assert not diagnostic["matches"]
+    assert diagnostic["expected_rows"] == diagnostic["actual_rows"] == 2
+    assert diagnostic["expected_columns"] == diagnostic["actual_columns"] == 2
+    assert diagnostic["first_mismatch"]["a1"] == "B2"
+    assert diagnostic["first_mismatch"]["column_name"] == "client"
+    assert diagnostic["first_mismatch"]["expected_type"] == "str"
+    assert diagnostic["first_mismatch"]["actual_type"] == "str"
+    assert diagnostic["first_mismatch"]["class"] == "TEXT_VALUE"
+    encoded = __import__("json").dumps(diagnostic)
+    assert "private client" not in encoded
+    assert diagnostic["total_mismatch_cells"] == 1
+    assert diagnostic["mismatch_rows"] == 1
+    assert diagnostic["mismatch_by_column"] == {"B: client": 1}
+    assert diagnostic["mismatch_by_class"] == {"TEXT_VALUE": 1}
+
+
+def test_production_readback_failure_logs_safe_diagnostic(capsys):
+    from src.production import _validate_workflow_readback
+
+    with pytest.raises(ValueError, match="workflow publication readback mismatch"):
+        _validate_workflow_readback([["client"], ["redacted actual"]], [["client"], ["redacted expected"]])
+    output = capsys.readouterr().out
+    assert output.startswith("WORKFLOW_READBACK_DIAGNOSTIC=")
+    assert "redacted actual" not in output
+    assert "redacted expected" not in output
+
+
+def test_workflow_candidate_sha_is_deterministic_and_file_is_private(tmp_path, monkeypatch):
+    first_dir = tmp_path / "candidate-one"
+    second_dir = tmp_path / "candidate-two"
+    first_dir.mkdir(mode=0o700)
+    second_dir.mkdir(mode=0o700)
+    directories = iter([str(first_dir), str(second_dir)])
+    monkeypatch.setattr("src.workflow_publication.tempfile.mkdtemp", lambda **_kwargs: next(directories))
+    candidate = [["project_id", "project_name"], ["1", "private business name"]]
+
+    first = persist_private_workflow_candidate(candidate)
+    second = persist_private_workflow_candidate(candidate)
+
+    assert first["candidate_sha256"] == second["candidate_sha256"]
+    assert first["schema_sha256"] == second["schema_sha256"]
+    assert first["rows"] == 2
+    assert first["columns"] == 2
+    assert stat.S_IMODE(os.stat(first["path"]).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(Path(first["path"]).parent).st_mode) == 0o700
+    assert json.loads(Path(first["path"]).read_text()) == candidate
+
+
+@pytest.mark.parametrize(("expected", "actual", "kind"), [
+    ([["id"], ["1"]], [["id"]], "ROW_COUNT"),
+    ([["id", "value"], ["1", "x"]], [["id"], ["1"]], "COLUMN_COUNT"),
+])
+def test_workflow_dimension_mismatch_has_structured_diagnostics(expected, actual, kind):
+    diagnostic = diagnose_workflow_readback(expected, actual)
+    assert not diagnostic["matches"]
+    assert diagnostic["mismatch_by_class"][kind] >= 1
+
+
+def test_workflow_diagnostic_samples_fingerprint_text_without_pii(capsys):
+    private_a = "Sensitive customer/project value A"
+    private_b = "Sensitive customer/project value B"
+    from src.production import _validate_workflow_readback
+
+    with pytest.raises(ValueError, match="workflow publication readback mismatch"):
+        _validate_workflow_readback([["client"], [private_b]], [["client"], [private_a]])
+    output = capsys.readouterr().out
+    assert "mismatch_samples" in output
+    assert private_a not in output
+    assert private_b not in output
+
+
+def _rollback_fixture(expected, actual):
+    from src.workflow_publication import backup_snapshot
+
+    backup = backup_snapshot("sheet", {THIRD_TAB_NAME: expected})
+
+    def api(url, _token, body=None, method=None):
+        if "fields=sheets.properties(title,sheetId)" in url:
+            return {"sheets": [{"properties": {"title": THIRD_TAB_NAME, "sheetId": 123}}]}
+        if ":clear" in url or ":batchUpdate" in url:
+            return {}
+        if "/values/" in url:
+            return {"values": actual}
+        raise AssertionError("unexpected rollback test request")
+
+    return backup, api
+
+
+def test_workflow_rollback_success_is_explicit(monkeypatch, capsys):
+    from src import production
+
+    expected = [["project_id", "client"], ["1", "private name"]]
+    backup, fake_api = _rollback_fixture(expected, expected)
+    monkeypatch.setattr(production, "api", fake_api)
+    production._rollback_workflow_tab("token-unused", "sheet", backup)
+    output = capsys.readouterr().out
+    assert "WORKFLOW_ROLLBACK_REQUIRED=YES" in output
+    assert "WORKFLOW_ROLLBACK_ATTEMPTED=YES" in output
+    assert "WORKFLOW_ROLLBACK_READBACK=PASS" in output
+    assert "WORKFLOW_ROLLBACK_RESULT=PASS" in output
+
+
+def test_workflow_rollback_failure_is_explicit_and_unambiguous(monkeypatch, capsys):
+    from src import production
+
+    expected = [["project_id", "client"], ["1", "private name"]]
+    actual = [["project_id", "client"], ["1", "different private name"]]
+    backup, fake_api = _rollback_fixture(expected, actual)
+    monkeypatch.setattr(production, "api", fake_api)
+    with pytest.raises(RuntimeError, match="WORKFLOW_ROLLBACK_INCOMPLETE"):
+        production._rollback_workflow_tab("token-unused", "sheet", backup)
+    output = capsys.readouterr().out
+    assert "WORKFLOW_ROLLBACK_READBACK=FAIL" in output
+    assert "WORKFLOW_ROLLBACK_RESULT=FAIL" in output
+    assert "private name" not in output
+
+
+@pytest.mark.parametrize(("expected_value", "actual_value", "kind"), [
+    (None, "", "NULL_VS_EMPTY"),
+    ("3", 3, "STRING_VS_NUMBER"),
+    (3, 4, "NUMERIC_VALUE"),
+    ("left", "right", "TEXT_VALUE"),
+    (True, False, "BOOLEAN_VALUE"),
+])
+def test_workflow_readback_diagnostic_mismatch_classes(expected_value, actual_value, kind):
+    diagnostic = diagnose_workflow_readback([["value"], [expected_value]], [["value"], [actual_value]])
+    assert diagnostic["mismatch_by_class"] == {kind: 1}
+    assert diagnostic["first_mismatch"]["class"] == kind
+
+
+def test_workflow_readback_diagnostic_counts_dimensions_trailing_blanks_and_row_shift():
+    trailing = diagnose_workflow_readback([["id", "note"], ["1", ""]], [["id", "note"], ["1"]])
+    assert not trailing["matches"]
+    assert trailing["first_mismatch"]["a1"] == "B2"
+    assert trailing["mismatch_by_class"] == {"MISSING_TRAILING_EMPTY": 1}
+
+    shifted = diagnose_workflow_readback([["id"], ["a"], ["b"]], [["id"], ["b"], ["a"]])
+    assert shifted["mismatch_by_class"]["ROW_SHIFT"] == 2
+
+    dimensions = diagnose_workflow_readback([["id", "x"], ["a", "b"], ["c", "d"]], [["id"], ["a"]])
+    assert dimensions["mismatch_by_class"]["ROW_COUNT"] == 1
+    assert dimensions["mismatch_by_class"]["COLUMN_COUNT"] == 1
 
 
 def test_shrink_plan_clears_obsolete_tail_rows():
