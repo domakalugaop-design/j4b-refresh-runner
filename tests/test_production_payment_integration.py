@@ -22,6 +22,33 @@ def test_payment_feature_gate_is_off_unless_explicitly_enabled(monkeypatch):
     assert production._payment_refresh_enabled() is True
 
 
+def test_incomplete_unified_operational_acquisition_fails_before_publication():
+    with pytest.raises(RuntimeError, match="operational acquisition acceptance failed"):
+        production._require_complete_operational_acquisition([
+            {"project_id": "1", "acquisition_state": "ACQUIRED"},
+            {"project_id": "2", "acquisition_state": "SEMANTIC_FAILURE"},
+        ])
+    production._require_complete_operational_acquisition([
+        {"project_id": "1", "acquisition_state": "ACQUIRED"},
+    ])
+
+
+def test_full_refresh_rollback_restores_core_after_a_later_stage_failure():
+    before = [list(production.PROJECT_TYPE_SCHEMA), ["1", "Old"] + [""] * (len(production.PROJECT_TYPE_SCHEMA) - 2)]
+    changed = [list(production.PROJECT_TYPE_SCHEMA), ["1", "New"] + [""] * (len(production.PROJECT_TYPE_SCHEMA) - 2)]
+    with patch("src.production.read_sheet", return_value=changed), \
+         patch("src.production.read_project_type_state_rows", return_value=[]), \
+         patch("src.production.publish") as restore_core:
+        production._rollback_full_refresh(
+            "opaque", "sheet", columns=list(production.PROJECT_TYPE_SCHEMA),
+            previous=before, previous_raw=before, previous_state_rows=[],
+            workflow_backup=None, payment_publication=None,
+            layout_plan={"planned": []},
+        )
+    restore_core.assert_called_once_with("opaque", "sheet", before, changed,
+                                         columns=list(production.PROJECT_TYPE_SCHEMA))
+
+
 def test_read_payment_tab_uses_authenticated_values_reader_and_normalizes_types():
     values = [list(VISIT_PUBLICATION_COLUMNS), [123, "Project", None, None, 456, 1.0, 500.0, 250.0, 1.0, 0.0, "[]", "COMPLETE"]]
     with patch.object(production, "api_get", return_value={"values": values}) as read:

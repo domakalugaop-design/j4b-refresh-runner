@@ -141,6 +141,35 @@ def select_scope(catalogue: list[dict[str, Any]], current_rows: list[list[Any]],
     return sorted(selected.values(), key=lambda row: int(row["project_id"]))
 
 
+def regular_scope_counts(catalogue: list[dict[str, Any]], current_rows: list[list[Any]], today: date) -> dict[str, int]:
+    """Report the regular new/current-period/previous-period scope before deduplication."""
+    baseline = {str(r[0]): r for r in current_rows[1:] if r and r[0] not in (None, "")}
+    catalogue_ids = {str(row["project_id"]) for row in catalogue}
+    new_ids = catalogue_ids - set(baseline)
+    current_marker = f"{today.month:02d}{today.year % 100:02d}"
+    previous_year = today.year if today.month > 1 else today.year - 1
+    previous_month = (today.month - 2) % 12 + 1
+    previous_marker = f"{previous_month:02d}{previous_year % 100:02d}"
+    current_ids: set[str] = set()
+    previous_ids: set[str] = set()
+    for item in catalogue:
+        pid = str(item["project_id"])
+        old = baseline.get(pid)
+        name = str(old[1] if old and len(old) > 1 else item.get("project_name") or "")
+        marker = re.search(r"(?:^|[^0-9])(0[1-9]|1[0-2])(\d{2})(?!\d)", name)
+        value = marker.group(1) + marker.group(2) if marker else None
+        if value == current_marker:
+            current_ids.add(pid)
+        elif value == previous_marker:
+            previous_ids.add(pid)
+    return {
+        "new": len(new_ids),
+        "current_month": len(current_ids),
+        "previous_month": len(previous_ids),
+        "union": len(new_ids | current_ids | previous_ids),
+    }
+
+
 def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], timestamp: str) -> list[dict[str, Any]]:
     rows = []
     for project in projects:
@@ -374,8 +403,10 @@ def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[lis
         date_cols = [columns.index("date_from"), columns.index("date_to"), columns.index("last_refreshed")]
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"repeatCell": {"range": {"sheetId": target["sheetId"], "startRowIndex": 1, "endRowIndex": len(candidate), "startColumnIndex": c, "endColumnIndex": c + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE_TIME" if c == date_cols[-1] else "DATE", "pattern": "yyyy-mm-dd hh:mm:ss" if c == date_cols[-1] else "yyyy-mm-dd"}}}, "fields": "userEnteredFormat.numberFormat"}} for c in date_cols]})
         actual = read_sheet(token, sid, len(candidate) + 10, columns=columns)
-        if summary(actual) != after or actual[:1] != candidate[:1]:
-            raise RuntimeError("readback summary mismatch")
+        normalized_actual = [_pad(row, columns) for row in actual]
+        normalized_expected = [_pad(row, columns) for row in candidate]
+        if summary(actual) != after or normalized_actual != normalized_expected:
+            raise RuntimeError("projects_current full readback mismatch")
     except Exception:
         restore_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{len(previous_copy)}"
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(restore_rng, safe='!:')}:clear", token, {}, method="POST")

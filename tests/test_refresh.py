@@ -1,7 +1,7 @@
 from datetime import date
 import pytest
 
-from src.refresh import BASE_COLUMNS, COLUMNS, PROJECT_TYPE_COLUMNS, materialize, merge_previous, select_scope, sheet_rows, sheets_serial, summary
+from src.refresh import BASE_COLUMNS, COLUMNS, PROJECT_TYPE_COLUMNS, materialize, merge_previous, regular_scope_counts, select_scope, sheet_rows, sheets_serial, summary
 from src.production import load_acquisition_checkpoint, serialize_acquisition_checkpoint
 
 
@@ -14,6 +14,21 @@ def test_selector_current_previous_and_new():
     ]
     selected = select_scope(catalogue, previous, today=date(2026, 9, 4))
     assert [row["project_id"] for row in selected] == ["1", "2", "3"]
+
+
+def test_regular_selector_counts_new_current_previous_union_and_deduplicates():
+    previous = [COLUMNS, ["1", "Legacy_0826"] + [""] * 31, ["2", "Current_0926"] + [""] * 31]
+    catalogue = [
+        {"project_id": "1", "project_name": "changed name"},
+        {"project_id": "2", "project_name": "Current_0926"},
+        {"project_id": "3", "project_name": "New_0926"},
+        {"project_id": "4", "project_name": "New_0826"},
+        {"project_id": "5", "project_name": "Historical_0726"},
+    ]
+    counts = regular_scope_counts(catalogue, previous, today=date(2026, 9, 30))
+    selected = select_scope(catalogue, previous, today=date(2026, 9, 30))
+    assert counts == {"new": 3, "current_month": 2, "previous_month": 2, "union": 5}
+    assert [item["project_id"] for item in selected] == ["1", "2", "3", "4", "5"]
 
 
 def test_plan_zero_is_real_zero():

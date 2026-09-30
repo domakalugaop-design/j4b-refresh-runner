@@ -40,9 +40,11 @@ from .refresh import (
     now,
     publish,
     publish_project_type_refresh,
+    publish_project_type_state,
     read_sheet,
     read_project_type_state_rows,
     select_scope,
+    regular_scope_counts,
     sheet_rows,
     api_get,
     summary,
@@ -503,6 +505,78 @@ def _rollback_workflow_tab(token: str, sid: str, backup: dict[str, Any]) -> None
     validate_readback(actual, previous)
 
 
+def _rollback_full_refresh(
+    token: str,
+    sid: str,
+    *,
+    columns: list[str],
+    previous: list[list[Any]],
+    previous_raw: list[list[Any]],
+    previous_state_rows: list[list[Any]],
+    workflow_backup: dict[str, Any] | None,
+    payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]] | None,
+    layout_plan: dict[str, Any],
+) -> None:
+    """Best-effort restore every target snapshot; report any unverifiable tab."""
+    errors: list[str] = []
+    if payment_publication is not None:
+        old_payment, _candidate, sheet_ids, _grid_rows = payment_publication
+        try:
+            live = {tab: _read_payment_tab(token, sid, tab) for tab in old_payment}
+            if live != old_payment:
+                current_meta = api(
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,gridProperties(rowCount))",
+                    token,
+                )
+                current_grid_rows = {
+                    item["properties"]["title"]: item["properties"].get("gridProperties", {}).get("rowCount")
+                    for item in current_meta.get("sheets", [])
+                    if item.get("properties", {}).get("title") in sheet_ids
+                }
+                if set(current_grid_rows) != set(sheet_ids) or any(not isinstance(n, int) for n in current_grid_rows.values()):
+                    raise RuntimeError("payment rollback grid metadata unavailable")
+                publish_payment_pair(
+                    sheet_ids=sheet_ids,
+                    previous=live,
+                    candidate=old_payment,
+                    write_batch=lambda requests: _exact_google_batch(token, sid, requests),
+                    read_tab=lambda tab: _read_payment_tab(token, sid, tab),
+                    grid_row_counts=current_grid_rows,
+                )
+            if {tab: _read_payment_tab(token, sid, tab) for tab in old_payment} != old_payment:
+                raise RuntimeError("payment tabs rollback readback mismatch")
+        except Exception as exc:
+            errors.append(f"payment tabs: {type(exc).__name__}")
+    try:
+        live_current = read_sheet(token, sid, columns=columns)
+        if live_current != previous:
+            publish(token, sid, previous, live_current, columns=columns)
+    except Exception as exc:
+        errors.append(f"projects_current: {type(exc).__name__}")
+    try:
+        live_state_rows = read_project_type_state_rows(token, sid)
+        if previous_state_rows and live_state_rows != previous_state_rows:
+            publish_project_type_state(
+                token, sid, validate_state_rows(previous_state_rows), live_state_rows
+            )
+        if previous_state_rows and read_project_type_state_rows(token, sid) != previous_state_rows:
+            raise RuntimeError("project_types rollback readback mismatch")
+    except Exception as exc:
+        errors.append(f"project_types: {type(exc).__name__}")
+    if workflow_backup is not None:
+        try:
+            _rollback_workflow_tab(token, sid, workflow_backup)
+        except Exception as exc:
+            errors.append(f"workflow tab: {type(exc).__name__}")
+    if layout_plan.get("planned"):
+        try:
+            _rollback_project_type_layout(token, sid, layout_plan, previous_raw)
+        except Exception as exc:
+            errors.append(f"schema: {type(exc).__name__}")
+    if errors:
+        raise RuntimeError("full refresh rollback incomplete: " + "; ".join(errors))
+
+
 def _require_production_gate() -> str:
     if os.environ.get("RUN_MODE", "").strip().lower() != "production":
         raise RuntimeError("production entrypoint requires RUN_MODE=production")
@@ -527,6 +601,33 @@ def _production_target() -> str:
 
 def _stage(name: str) -> None:
     print(name, flush=True)
+
+
+def _require_complete_operational_acquisition(projects: list[dict[str, Any]]) -> None:
+    failed = [p for p in projects if p.get("acquisition_state") in {"FAILED", "SEMANTIC_FAILURE"}]
+    if failed:
+        failure_ids = ",".join(str(p.get("project_id", "")) for p in failed)
+        raise RuntimeError(
+            f"operational acquisition acceptance failed: {len(failed)} selected projects incomplete: {failure_ids}"
+        )
+
+
+def _payment_report(publication: Any, selected: list[dict[str, Any]]) -> dict[str, int | bool]:
+    if publication is None:
+        return {"enabled": False, "projects_refreshed": 0, "assignment_rows_refreshed": 0,
+                "unmatched_visit_mappings_refreshed": 0, "visit_final_rows": 0, "project_final_rows": 0}
+    _previous, candidate, _sheet_ids, _grid_rows = publication
+    selected_ids = {str(row["project_id"]) for row in selected}
+    project_rows = candidate[PAYMENT_PROJECT_TAB][1:]
+    selected_project_rows = [row for row in project_rows if row and str(row[0]) in selected_ids]
+    return {
+        "enabled": True,
+        "projects_refreshed": len(selected),
+        "assignment_rows_refreshed": sum(int(row[5] or 0) for row in selected_project_rows),
+        "unmatched_visit_mappings_refreshed": sum(int(row[13] or 0) for row in selected_project_rows),
+        "visit_final_rows": len(candidate[PAYMENT_VISIT_TAB]) - 1,
+        "project_final_rows": len(project_rows),
+    }
 
 
 CHECKPOINT_FORBIDDEN_KEYS = {
@@ -584,6 +685,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     columns = primary_columns(PROJECT_TYPE_SCHEMA) if workflow_enabled else PROJECT_TYPE_SCHEMA
     universe = checkpoint["universe"]
     selected = checkpoint["selected"]
+    scope_counts = checkpoint.get("scope_counts")
     projects = checkpoint["projects"]
     visits = checkpoint["visits"]
     previous_raw = checkpoint["previous_raw"]
@@ -596,6 +698,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         raise RuntimeError("checkpoint baseline schema does not match destination width")
     previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
     plan = _plan_project_type_layout(meta, columns, source_columns=source_columns)
+    _require_complete_operational_acquisition(projects)
     _stage("MATERIALIZATION_START")
     timestamp = now()
     rows = materialize(projects, visits, timestamp)
@@ -605,6 +708,21 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     apply_canonical_project_names(merged, universe)
     applicable = project_type_applicable_ids(universe)
     materialize_project_types(merged, state, applicable)
+    payment_publication = None
+    payment_portal_requests = 0
+    if _payment_refresh_enabled():
+        session = PortalSession()
+        try:
+            _stage("PORTAL_PAYMENT_SESSION_START")
+            session.login()
+            _stage("PORTAL_PAYMENT_SESSION_PASS")
+            payment_publication = _prepare_regular_payment_publication(
+                token, sid, meta, session, selected, projects
+            )
+            payment_portal_requests = session.requests
+        finally:
+            session.close()
+        _stage("PAYMENT_ACQUISITION_AND_CANDIDATE_VALIDATION_PASS")
     candidate = sheet_rows(merged, columns=columns)
     candidate_summary = summary(candidate)
     if candidate_summary["duplicates"] or candidate_summary["unique"] < summary(previous)["unique"]:
@@ -623,21 +741,39 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         _publish_workflow_tab(token, sid, merged, backup)
         _stage("WORKFLOW_PUBLICATION_PASS")
         publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+        if payment_publication is not None:
+            old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
+            _stage("PAYMENT_PUBLICATION_START | tabs=2")
+            payment_result = publish_payment_pair(
+                sheet_ids=payment_sheet_ids,
+                previous=old_payment,
+                candidate=new_payment,
+                write_batch=lambda requests: _exact_google_batch(token, sid, requests),
+                read_tab=lambda tab: _read_payment_tab(token, sid, tab),
+                grid_row_counts=payment_grid_rows,
+            )
+            _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
         _stage("PUBLISH_PASS")
     except Exception:
-        try:
-            _rollback_workflow_tab(token, sid, backup)
-        finally:
-            if plan.get("planned"):
-                _rollback_project_type_layout(token, sid, plan, previous_raw)
+        _rollback_full_refresh(
+            token, sid, columns=columns, previous=previous, previous_raw=previous_raw,
+            previous_state_rows=previous_state_rows, workflow_backup=backup,
+            payment_publication=payment_publication, layout_plan=plan,
+        )
         raise
     _stage("READBACK_PASS")
     _stage("TYPE_VALIDATION=EXTERNAL_POSTCHECK_REQUIRED")
     return {
         "RUN_ID": checkpoint.get("run_id"), "FINAL_STATUS": "SUCCESS",
-        "SELECTED_COUNT": len(selected), "SUCCESS_COUNT": sum(p.get("acquisition_state") not in {"FAILED", "SEMANTIC_FAILURE"} for p in projects),
+        "SELECTED_COUNT": len(selected), "REGULAR_SELECTOR": scope_counts,
+        "SUCCESS_COUNT": sum(p.get("acquisition_state") not in {"FAILED", "SEMANTIC_FAILURE"} for p in projects),
         "SEMANTIC_FAILURE_COUNT": sum(p.get("acquisition_state") == "SEMANTIC_FAILURE" for p in projects),
-        "PORTAL_HTTP_REQUEST_COUNT": 0, "FINAL_ROWS": candidate_summary["rows"],
+        "PORTAL_HTTP_REQUEST_COUNT": payment_portal_requests,
+        "CORE_PROJECTS": len(universe), "CORE_FINAL_ROWS": candidate_summary["rows"],
+        "WORKFLOW_PROJECTS_REFRESHED": len(selected), "WORKFLOW_FINAL_ROWS": len(third_tab_rows(merged)) - 1,
+        "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
+        "SERVICE_INFORMATION_REFRESH_TIMESTAMP": now(),
+        "FINAL_ROWS": candidate_summary["rows"],
         "FINAL_UNIQUE_IDS": candidate_summary["unique"], "FINAL_DUPLICATES": candidate_summary["duplicates"],
     }
 
@@ -733,6 +869,8 @@ def run() -> dict[str, Any]:
             )
 
         backfill_scope = os.environ.get("BACKFILL_SCOPE", "").strip()
+        moscow_today = (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+        scope_counts: dict[str, int] | None = None
         if workflow_enabled and backfill_scope == "2026":
             if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
                 raise RuntimeError("2026 backfill refuses full-universe acquisition fallback")
@@ -741,9 +879,14 @@ def run() -> dict[str, Any]:
                 raise RuntimeError(f"2026 backfill scope count outside expected order of magnitude: {len(selected)}")
             _stage(f"BACKFILL_SCOPE_GUARD_PASS | scope=2026_ONLY | projects={len(selected)} | pre2026=0")
         else:
-            selected = universe if workflow_enabled and os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true" else select_scope(universe, previous)
-            if workflow_enabled and len(selected) != len(universe):
-                raise RuntimeError("workflow publication requires WORKFLOW_ANALYTICS_FULL_ACQUISITION=true")
+            if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
+                selected = sorted((dict(item) for item in universe), key=lambda row: int(row["project_id"]))
+                scope_counts = {"new": len({str(x["project_id"]) for x in universe} - {str(r[0]) for r in previous[1:] if r and r[0] not in (None, "")}), "current_month": 0, "previous_month": 0, "union": len(selected)}
+            else:
+                scope_counts = regular_scope_counts(universe, previous, moscow_today)
+                selected = select_scope(universe, previous, today=moscow_today)
+                if len(selected) != scope_counts["union"]:
+                    raise RuntimeError("regular selector summary disagrees with deduplicated selection")
         _stage(f"SCOPE_SELECTION_PASS | selected={len(selected)}")
         reader = Reader(session, max(3 * len(selected), 3))
         projects: list[dict[str, Any]] = []
@@ -772,8 +915,10 @@ def run() -> dict[str, Any]:
                     flush=True,
                 )
 
+        _require_complete_operational_acquisition(projects)
+
         payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]] | None = None
-        if payment_enabled:
+        if payment_enabled and os.environ.get("ACQUISITION_ONLY", "false").strip().lower() != "true":
             _stage("PAYMENT_STAGE_START | mode=REGULAR | cross_run_checkpoint=NO")
             payment_publication = _prepare_regular_payment_publication(
                 token, sid, destination_meta, session, selected, projects
@@ -785,6 +930,8 @@ def run() -> dict[str, Any]:
             "version": 1,
             "run_id": run_id,
             "scope": "2026" if workflow_enabled and os.environ.get("BACKFILL_SCOPE", "").strip() == "2026" else "normal",
+            "scope_date_moscow": moscow_today.isoformat(),
+            "scope_counts": scope_counts,
             "universe": universe,
             "selected": selected,
             "projects": projects,
@@ -855,6 +1002,7 @@ def run() -> dict[str, Any]:
                 "BOOTSTRAP_VALID": bool(bootstrap_rows or layout_plan["state_exists"]),
                 "WORKFLOW_PUBLICATION": workflow_enabled,
                 "PAYMENT_PUBLICATION": bool(payment_publication),
+                "REGULAR_SELECTOR": scope_counts,
             }
 
         # Authorization is deliberately late: all acquisition, candidate validation,
@@ -886,13 +1034,13 @@ def run() -> dict[str, Any]:
                     _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
                 _stage("PUBLISH_PASS")
             except Exception:
-                if workflow_enabled and workflow_backup is not None:
-                    try:
-                        _rollback_workflow_tab(token, sid, workflow_backup)
-                    except Exception as rollback_exc:
-                        raise RuntimeError("workflow publication rollback failed") from rollback_exc
-                if layout_plan.get("planned"):
-                    _rollback_project_type_layout(token, sid, layout_plan, previous_raw)
+                _rollback_full_refresh(
+                    token, sid, columns=columns, previous=previous, previous_raw=previous_raw,
+                    previous_state_rows=previous_state_rows,
+                    workflow_backup=workflow_backup if workflow_enabled else None,
+                    payment_publication=payment_publication,
+                    layout_plan=layout_plan,
+                )
                 raise
         else:
             if run_mode == "production":
@@ -924,9 +1072,16 @@ def run() -> dict[str, Any]:
             "RUN_ID": run_id,
             "STARTED_AT": started_at,
             "FINISHED_AT": finished_at,
+            "SERVICE_INFORMATION_REFRESH_TIMESTAMP": finished_at,
             "WALL_SECONDS": round(wall, 3),
             "UNIVERSE_COUNT": len(universe),
             "SELECTED_COUNT": len(selected),
+            "REGULAR_SELECTOR": scope_counts,
+            "CORE_PROJECTS": len(universe),
+            "CORE_FINAL_ROWS": candidate_summary["rows"],
+            "WORKFLOW_PROJECTS_REFRESHED": len(selected) if workflow_enabled else 0,
+            "WORKFLOW_FINAL_ROWS": len(third_tab_rows(merged)) - 1 if workflow_enabled else 0,
+            "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
             "SUCCESS_COUNT": len(projects) - failed - semantic_failed,
             "FAILED_COUNT": failed,
             "SEMANTIC_FAILURE_COUNT": semantic_failed,
