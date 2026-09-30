@@ -43,13 +43,36 @@ class PaymentMaterializationTests(unittest.TestCase):
     def test_assignment_materialization_preserves_raw_decimal_and_context_without_pii(self):
         result = materialize([payment(1)], [workflow(1, 101, 50)])
         row = result["assignment_rows"][0]
-        self.assertEqual(row["project_id"], "900")
+        self.assertEqual(row["project_id"], 900)
+        self.assertEqual(row["visit_id"], 101)
         self.assertEqual(row["manager"], "Synthetic manager")
         self.assertEqual(row["portal_paid_amount_raw"], "250")
         self.assertEqual(row["portal_paid_amount"], Decimal("250"))
         self.assertEqual(row["payment_join_status"], "MATCHED")
         self.assertEqual(set(row).intersection({"ФИО ТП", "Логин", "Адрес", "phone", "email"}), set())
         self.assertTrue(set(ASSIGNMENT_COLUMNS).issubset(row))
+
+    def test_payment_ids_are_numeric_and_business_text_stays_text(self):
+        result = materialize_payment_data(
+            "7890", {"project_name": "5920", "client": "123"},
+            [payment(1)], [workflow(1, 101, 50, project_id="7890")],
+        )
+        payload = build_publication_payloads(result)
+        visit = payload["Выплаты по визитам"][1]
+        project = payload["Выплаты по проектам"][1]
+        self.assertEqual((visit[0], visit[4], project[0]), (7890, 101, 7890))
+        self.assertIsInstance(visit[1], str)
+        self.assertIsInstance(visit[2], str)
+        self.assertIsNone(visit[3])
+        self.assertIn('[7890,', serialize_sheet_payload([visit]))
+
+    def test_malformed_or_non_integral_technical_ids_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "project_id"):
+            materialize_payment_data("78x", {}, [payment(1)], [workflow(1, 101, 50)])
+        with self.assertRaisesRegex(ValueError, "visit_id"):
+            materialize_payment_data("900", {}, [payment(1)], [workflow(1, "101.5", 50)])
+        with self.assertRaisesRegex(ValueError, "project_id"):
+            materialize_payment_data(900.5, {}, [payment(1)], [workflow(1, 101, 50)])
 
     def test_saved_workflow_metadata_envelopes_are_unwrapped(self):
         result = materialize_payment_data(

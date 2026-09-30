@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from .technical_ids import integer_id
+
 
 PROJECT_TYPE_COLUMNS = ["project_type_code", "project_type_name"]
 STATE_COLUMNS = ["project_id", "project_type_code", "project_type_name"]
@@ -93,7 +95,8 @@ def validate_state_rows(rows: list[list[Any]]) -> dict[str, tuple[str, str]]:
         if not row or row[0] in (None, ""):
             continue
         padded = list(row) + [""] * (len(STATE_COLUMNS) - len(row))
-        project_id, code, name = (str(padded[i]) if padded[i] is not None else "" for i in range(3))
+        project_id = str(integer_id(padded[0], "project_id"))
+        code, name = (str(padded[i]) if padded[i] is not None else "" for i in (1, 2))
         if project_id in state:
             raise ValueError(f"duplicate project_types project_id: {project_id}")
         if not code or code not in PROJECT_TYPE_DICTIONARY:
@@ -118,9 +121,9 @@ def merge_assignment(
     return updated, True, False
 
 
-def serialize_state(state: dict[str, tuple[str, str]]) -> list[list[str]]:
+def serialize_state(state: dict[str, tuple[str, str]]) -> list[list[Any]]:
     return [STATE_COLUMNS] + [
-        [project_id, code, name]
+        [integer_id(project_id, "project_id"), code, name]
         for project_id, (code, name) in sorted(state.items(), key=lambda item: int(item[0]))
     ]
 

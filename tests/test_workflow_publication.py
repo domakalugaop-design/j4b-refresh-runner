@@ -46,7 +46,7 @@ def test_primary_fields_are_additive_and_existing_order_is_preserved():
 
 def test_third_tab_is_one_row_per_project_and_deterministically_sorted():
     rows = third_tab_rows([materialized("10", project_visit_count=2), materialized("2")])
-    assert [row[0] for row in rows[1:]] == ["2", "10"]
+    assert [row[0] for row in rows[1:]] == [2, 10]
     assert len(rows) == 3
 
 
@@ -63,6 +63,12 @@ def test_missing_project_dimensions_are_written_as_explicit_blanks_for_exact_rea
 def test_duplicate_project_ids_are_rejected():
     with pytest.raises(ValueError, match="duplicate project_id"):
         third_tab_rows([materialized("1"), materialized("1")])
+
+
+def test_workflow_project_id_is_number_and_bad_or_fractional_ids_are_rejected():
+    assert third_tab_rows([materialized("7890")])[1][0] == 7890
+    with pytest.raises(ValueError, match="project_id"):
+        third_tab_rows([materialized("7.5")])
 
 
 def test_absent_and_existing_tab_plans_are_idempotent():

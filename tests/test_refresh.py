@@ -78,6 +78,19 @@ def test_sheet_rows_emit_full_width():
     values = sheet_rows([row])
     assert len(values[0]) == 33
     assert len(values[1]) == 33
+    assert values[1][0] == 1 and type(values[1][0]) is int
+    assert values[1][1] == ""  # textual dimensions remain text
+
+
+def test_sheet_row_builder_normalizes_digit_string_ids_and_rejects_bad_ids():
+    row = {name: None for name in COLUMNS}
+    row.update({"project_id": "7890", "project_name": "5920", "client": "123"})
+    output = sheet_rows([row])[1]
+    assert output[0] == 7890 and type(output[0]) is int
+    assert output[1] == "5920" and output[20] == "123"
+    row["project_id"] = "78x"
+    with pytest.raises(ValueError, match="project_id"):
+        sheet_rows([row])
 
 
 def test_project_type_schema_appends_only_two_columns_after_original_contract():

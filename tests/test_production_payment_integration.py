@@ -88,7 +88,7 @@ def test_regular_payment_preparation_replaces_only_selected_project_rows():
     assert candidate[production.PAYMENT_VISIT_TAB][0] == list(VISIT_PUBLICATION_COLUMNS)
     assert candidate[production.PAYMENT_PROJECT_TAB][0] == list(PROJECT_PUBLICATION_COLUMNS)
     assert all(str(row[0]) == "1" for rows in candidate.values() for row in rows[1:])
-    assert candidate[production.PAYMENT_PROJECT_TAB][1][0] == "1"
+    assert candidate[production.PAYMENT_PROJECT_TAB][1][0] == 1
     assert candidate[production.PAYMENT_PROJECT_TAB][1][7] == Decimal("5")
 
 

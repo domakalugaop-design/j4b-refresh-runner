@@ -57,13 +57,13 @@ def _apply_payment_requests(live, requests, sheet_ids, grid_counts=None):
 
 
 def test_zero_row_is_success_and_removes_stale_rows_from_both_layers():
-    old = {"visits": [["project_id", "visit_id"], ["10", "v1"], ["11", "v2"]],
+    old = {"visits": [["project_id", "visit_id"], ["10", "101"], ["11", "102"]],
            "projects": [["project_id", "amount"], ["10", Decimal("4")], ["11", Decimal("5")]]}
     incoming = {"visits": [["project_id", "visit_id"]],
                 "projects": [["project_id", "amount"], ["10", Decimal("0")]]}
     merged = replace_by_project(old, incoming, ["10"])
-    assert merged["visits"] == [["project_id", "visit_id"], ["11", "v2"]]
-    assert merged["projects"] == [["project_id", "amount"], ["11", Decimal("5")], ["10", Decimal("0")]]
+    assert merged["visits"] == [["project_id", "visit_id"], [11, 102]]
+    assert merged["projects"] == [["project_id", "amount"], [11, Decimal("5")], [10, Decimal("0")]]
 
 
 def test_checkpoint_resume_skips_accepted_results_and_retries_failures(tmp_path):
@@ -123,9 +123,9 @@ def test_exact_2026_scope_batch_boundaries_are_deterministic():
 
 
 def test_pair_publication_chunks_each_payment_tab_and_only_targets_those_tabs():
-    previous = {"visits": [["project_id", "visit_id"], ["1", "old"]],
+    previous = {"visits": [["project_id", "visit_id"], ["1", "201"]],
                 "projects": [["project_id", "amount"], ["1", Decimal("2")]]}
-    candidate = {"visits": [["project_id", "visit_id"], ["1", "new"]],
+    candidate = {"visits": [["project_id", "visit_id"], ["1", "202"]],
                  "projects": [["project_id", "amount"], ["1", Decimal("3")]]}
     live = {key: [row[:] for row in value] for key, value in previous.items()}
     writes = []
@@ -166,9 +166,9 @@ def test_atomic_pair_write_failure_leaves_both_previous_tabs(fail_at):
 
 @pytest.mark.parametrize("mismatch_tab", ["visits", "projects"])
 def test_readback_mismatch_rolls_back_both_payment_tabs(mismatch_tab):
-    previous = {"visits": [["project_id", "visit_id"], ["1", "old"]],
+    previous = {"visits": [["project_id", "visit_id"], ["1", "201"]],
                 "projects": [["project_id", "amount"], ["1", 2]]}
-    candidate = {"visits": [["project_id", "visit_id"], ["1", "new"]],
+    candidate = {"visits": [["project_id", "visit_id"], ["1", "202"]],
                  "projects": [["project_id", "amount"], ["1", 3]]}
     live = {key: [row[:] for row in value] for key, value in previous.items()}
     writes = 0

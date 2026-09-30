@@ -84,20 +84,23 @@ def test_duplicate_state_ids_and_invalid_codes_are_rejected():
         validate_state_rows([STATE_COLUMNS, ["9", "0001", "Обычный"], ["9", "0002", "Классика_ТП"]])
     with pytest.raises(ValueError, match="invalid persisted"):
         validate_state_rows([STATE_COLUMNS, ["9", "0", ""]])
+    with pytest.raises(ValueError, match="project_id"):
+        validate_state_rows([STATE_COLUMNS, ["9.5", "0001", "Обычный"]])
 
 
-def test_state_serialization_keeps_code_and_id_text():
-    assert serialize_state({"9": ("0001", "Обычный")}) == [STATE_COLUMNS, ["9", "0001", "Обычный"]]
+def test_state_serialization_uses_numeric_project_id_and_text_code():
+    assert serialize_state({"9": ("0001", "Обычный")}) == [STATE_COLUMNS, [9, "0001", "Обычный"]]
+    assert type(serialize_state({"9": ("0001", "Обычный")})[1][0]) is int
 
 
 def test_project_type_state_shrink_clears_obsolete_tail():
     previous_rows = [
         STATE_COLUMNS,
-        ["1", "0001", "Обычный"],
-        ["2", "0002", "Классика_ТП"],
-        ["3", "0005", "Качественные исследования"],
+        [1, "0001", "Обычный"],
+        [2, "0002", "Классика_ТП"],
+        [3, "0005", "Качественные исследования"],
     ]
-    candidate_rows = [STATE_COLUMNS, ["1", "0001", "Обычный"]]
+    candidate_rows = [STATE_COLUMNS, [1, "0001", "Обычный"]]
     with patch("src.refresh._write_project_type_state_rows") as write_rows, patch(
         "src.refresh._clear_project_type_state_tail"
     ) as clear_tail, patch("src.refresh.read_project_type_state_rows", return_value=candidate_rows):

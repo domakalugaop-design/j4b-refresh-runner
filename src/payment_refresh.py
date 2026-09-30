@@ -21,6 +21,7 @@ from typing import Any, Iterable, Mapping
 from urllib.error import HTTPError, URLError
 
 from .payment_materialization import serialize_sheet_payload
+from .technical_ids import normalize_id_columns
 
 PAYMENT_STATES = {
     "PENDING", "SUCCESS_WITH_ROWS", "SUCCESS_ZERO_ROWS",
@@ -224,7 +225,8 @@ def replace_by_project(previous: Mapping[str, list[list[Any]]], incoming: Mappin
         if any(not row or str(row[0]) not in selected for row in new_rows):
             raise ValueError("incoming payment row is outside selected scope")
         kept = [row for row in old_rows if not row or str(row[0]) not in selected]
-        merged[tab] = [list(old[0]), *kept, *[list(row) for row in new_rows]]
+        merged_rows = normalize_id_columns(list(old[0]), [*kept, *new_rows])
+        merged[tab] = [list(old[0]), *merged_rows]
     return merged
 
 

@@ -19,6 +19,7 @@ from .acquisition import COMPLETED_CODES, Reader, acquire_project, discover_univ
 from .portal_transport import PortalSession
 from .project_types import STATE_COLUMNS, serialize_state, validate_state_rows
 from .workflow_analytics import project_workflow_metrics
+from .technical_ids import integer_id
 
 SHEET_NAME = os.environ.get("GOOGLE_WORKSHEET", "projects_current")
 BASE_COLUMNS = ["project_id","project_name","period","plan","plan_value","plan_status","created","completed","unassigned","execution_pct","plan_missing_with_activity","has_period_marker","project_start","project_end","elapsed_pct","lag","risk_status","risk_reason","validation_state","last_refreshed","client","primary_manager","coordinators","date_from","date_to","scope","manager_payment","wave","assigned","questionnaire_filled","rejected"]
@@ -179,7 +180,7 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
         codes = [text(v.get("raw_status")) for v in pv]
         row = {k: None for k in COLUMNS}
         row.update({
-            "project_id": pid,
+            "project_id": integer_id(pid, "project_id"),
             "project_name": text(project.get("project_name")),
             "plan": plan,
             "plan_value": plan,
@@ -230,6 +231,10 @@ def sheet_rows(rows: list[dict[str, Any]], columns: list[str] | None = None) -> 
     out = [columns]
     for row in rows:
         line = [row.get(c) if row.get(c) is not None else "" for c in columns]
+        if "project_id" in columns:
+            index = columns.index("project_id")
+            if line[index] not in (None, ""):
+                line[index] = integer_id(line[index], "project_id")
         for name in ("date_from", "date_to", "last_refreshed"):
             line[columns.index(name)] = sheets_serial(line[columns.index(name)])
         out.append(line)

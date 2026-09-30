@@ -20,7 +20,7 @@ def test_initial_checkpoint_reconstructs_zero_row_project_without_network(tmp_pa
     payload = materialize_complete_checkpoint(restored, expected_total=1)
     assert payload["Выплаты по визитам"] == [list(VISIT_PUBLICATION_COLUMNS)]
     assert payload["Выплаты по проектам"][0] == list(PROJECT_PUBLICATION_COLUMNS)
-    assert payload["Выплаты по проектам"][1][0:4] == ["10", "Project_2026", "Client", None]
+    assert payload["Выплаты по проектам"][1][0:4] == [10, "Project_2026", "Client", None]
     assert payload["Выплаты по проектам"][1][5] == 0
 
 

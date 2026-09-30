@@ -13,6 +13,7 @@ from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
 from .payment_detail_xlsx import NORMALIZED_FIELDS, join_payment_assignments, normalize_assignment
+from .technical_ids import integer_id
 
 ASSIGNMENT_COLUMNS = (
     "project_id", "project_name", "client", "manager", "visit_id", "my_id",
@@ -75,7 +76,7 @@ def _context(project_id: str | int, project_metadata: Mapping[str, Any]) -> dict
         return value if isinstance(value, str) else None
 
     return {
-        "project_id": str(project_id),
+        "project_id": integer_id(project_id, "project_id"),
         "project_name": metadata_text("project_name"),
         "client": metadata_text("client"),
         # The workflow snapshot names this already-qualified dimension primary_manager.
@@ -138,6 +139,9 @@ def materialize_payment_data(
         row["workflow_state_codes"] = _state_codes_json(row["workflow_state_codes_list"])
         row["payment_join_status"] = row.pop("join_status")
         row["payment_numeric_status"] = _amount_status(row)
+        row["project_id"] = context["project_id"]
+        if row.get("visit_id") not in (None, ""):
+            row["visit_id"] = integer_id(row["visit_id"], "visit_id")
         row["money_diagnostics"] = json.dumps(row["money_diagnostics"], sort_keys=True, separators=(",", ":"))
         assignments.append(row)
 
@@ -164,7 +168,7 @@ def materialize_payment_data(
         state_values = {code for row in rows for code in row["workflow_state_codes_list"]}
         visit_rows.append({
             **context,
-            "visit_id": visit_id,
+            "visit_id": integer_id(visit_id, "visit_id"),
             "payment_assignment_count": len(rows),
             "visit_reward": visit_reward,
             "visit_reward_conflict": conflict,
@@ -361,13 +365,13 @@ def build_publication_payloads(materialized: Mapping[str, Any]) -> dict[str, lis
     _validate_column_types(
         VISIT_PUBLICATION_COLUMNS,
         visit_rows,
-        (str, (str, type(None)), (str, type(None)), (str, type(None)), str,
+        (int, (str, type(None)), (str, type(None)), (str, type(None)), int,
          int, (Decimal, type(None)), (Decimal, type(None)), int, int, str, str),
     )
     _validate_column_types(
         PROJECT_PUBLICATION_COLUMNS,
         project_rows,
-        (str, (str, type(None)), (str, type(None)), (str, type(None)),
+        (int, (str, type(None)), (str, type(None)), (str, type(None)),
          int, int, (Decimal, type(None)), (Decimal, type(None)), int, int,
          int, int, int, int, str),
     )

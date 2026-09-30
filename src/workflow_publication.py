@@ -15,6 +15,7 @@ import tempfile
 from typing import Any, Iterable
 
 from .workflow_analytics import WORKFLOW_COUNTER_FIELDS, WORKFLOW_STATES, validate_workflow_metrics
+from .technical_ids import integer_id
 
 THIRD_TAB_NAME = "Статусы проектов"
 PRIMARY_ANALYTICS_COLUMNS = list(WORKFLOW_COUNTER_FIELDS) + [
@@ -63,7 +64,7 @@ def third_tab_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
         project_name = row.get("project_name")
         client = row.get("client")
         manager = row.get("primary_manager", row.get("manager"))
-        line: list[Any] = [row.get("project_id", ""), project_name if project_name is not None else "",
+        line: list[Any] = [integer_id(row.get("project_id"), "project_id"), project_name if project_name is not None else "",
                            client if client is not None else "", manager if manager is not None else "",
                            row.get("project_visit_count", 0)]
         line += [row.get(f"workflow_state_{code}_visits", 0) for code in WORKFLOW_STATES]
