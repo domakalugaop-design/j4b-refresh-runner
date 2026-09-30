@@ -345,7 +345,7 @@ def test_full_production_dry_run_uses_candidate_path_and_never_mutates(tmp_path,
 
     class FakeReader:
         count = post_count = 0
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
     for key, value in {

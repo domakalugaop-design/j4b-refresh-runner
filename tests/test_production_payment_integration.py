@@ -33,6 +33,21 @@ def test_incomplete_unified_operational_acquisition_fails_before_publication():
     ])
 
 
+def test_unresolved_retryable_failure_blocks_materialization_publication_gate():
+    with pytest.raises(RuntimeError, match="selected=2 records=2 acquired=1"):
+        production._require_complete_operational_acquisition([
+            {"project_id": "1", "acquisition_state": "ACQUIRED"},
+            {"project_id": "2", "acquisition_state": "FAILED", "retryable_failure": True},
+        ], selected_count=2)
+
+
+def test_missing_selected_record_blocks_complete_acquisition_gate():
+    with pytest.raises(RuntimeError, match="selected=2 records=1 acquired=1"):
+        production._require_complete_operational_acquisition([
+            {"project_id": "1", "acquisition_state": "ACQUIRED"},
+        ], selected_count=2)
+
+
 def test_full_refresh_rollback_restores_core_after_a_later_stage_failure():
     before = [list(production.PROJECT_TYPE_SCHEMA), ["1", "Old"] + [""] * (len(production.PROJECT_TYPE_SCHEMA) - 2)]
     changed = [list(production.PROJECT_TYPE_SCHEMA), ["1", "New"] + [""] * (len(production.PROJECT_TYPE_SCHEMA) - 2)]

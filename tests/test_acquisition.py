@@ -1,4 +1,4 @@
-from src.acquisition import Reader, acquire_project
+from src.acquisition import Reader, acquire_project, recover_retryable_failed_projects
 from src.refresh import BASE_COLUMNS, merge_previous, materialize
 
 
@@ -11,9 +11,14 @@ class FakeSession:
         self.responses = iter(responses)
         self.base_url = "https://lk.j4b.ru"
         self.last_effective_url = None
+        self.last_retry_after = None
+        self.calls = []
 
     def request(self, path, method, data=None, accept=None):
+        self.calls.append((path, method, data))
         item = next(self.responses)
+        if isinstance(item, BaseException):
+            raise item
         if len(item) == 4:
             status, content_type, body, self.last_effective_url = item
             return status, content_type, body
@@ -142,9 +147,128 @@ def test_missing_name_does_not_allow_malformed_project_or_edit_page():
 def test_transport_failure_remains_failed_with_identity_fallback_enabled():
     name = "Project_Q3_0926"
     session = FakeSession([
-        response("", status=503),
+        response("", status=503), response("", status=503),
+        response("", status=503), response("", status=503),
         response(complete_edit(name=name)),
         response("<!doctype html><html><body>actions</body></html>"),
     ])
-    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": name}, 0)
+    record, _ = acquire_project(_reader(session), {"project_id": "42", "project_name": name}, 0)
     assert record["acquisition_state"] == "FAILED"
+    assert record["retryable_failure"] is True
+    assert record["acquisition_request_failures"][0]["failure_class"] == "HTTP_503"
+
+
+def _reader(session):
+    return Reader(session, 40, sleep=lambda _seconds: None, jitter=lambda _low, _high: 0)
+
+
+def test_transient_timeout_retries_then_succeeds():
+    session = FakeSession([TimeoutError("sensitive timeout detail"), response("ok")])
+    result = _reader(session).get("/proj/42", project_id="42", stage="project")
+    assert result["state"] == "VALUE_PRESENT"
+    assert result["attempts"] == 2
+    assert session.calls and len(session.calls) == 2
+
+
+def test_connection_reset_retries_then_succeeds():
+    session = FakeSession([ConnectionResetError("private peer detail"), response("ok")])
+    result = _reader(session).get("/proj/42/edit", project_id="42", stage="project_edit")
+    assert result["state"] == "VALUE_PRESENT"
+    assert result["attempts"] == 2
+
+
+def test_retryable_5xx_retries_then_succeeds_without_logging_body(capsys):
+    session = FakeSession([response("untrusted body", status=503), response("ok")])
+    session.last_retry_after = "3"
+    delays = []
+    reader = Reader(session, 10, sleep=delays.append, jitter=lambda _low, _high: 0)
+    result = reader.get("/proj/42", project_id="42", stage="project")
+    assert result["state"] == "VALUE_PRESENT"
+    assert result["attempts"] == 2
+    assert delays == [3.0]
+    assert "untrusted body" not in capsys.readouterr().out
+
+
+def test_429_honors_retry_after_header():
+    session = FakeSession([response("", status=429), response("ok")])
+    session.last_retry_after = "2"
+    delays = []
+    reader = Reader(session, 10, sleep=delays.append, jitter=lambda _low, _high: 0)
+    result = reader.get("/proj/42", project_id="42", stage="project")
+    assert result["state"] == "VALUE_PRESENT"
+    assert delays == [2.0]
+
+
+def test_retryable_transport_failure_exhausts_bounded_budget():
+    session = FakeSession([TimeoutError("private")] * 4)
+    result = _reader(session).get("/proj/42", project_id="42", stage="project")
+    assert result["state"] == "REQUEST_FAILED"
+    assert result["failure"]["failure_class"] == "TIMEOUT"
+    assert result["failure"]["retryable"] == "YES"
+    assert result["attempts"] == 4
+    assert len(session.calls) == 4
+
+
+def test_non_retryable_4xx_does_not_retry():
+    session = FakeSession([response("private body", status=403), response("should not be consumed")])
+    result = _reader(session).get("/proj/42", project_id="42", stage="project")
+    assert result["state"] == "REQUEST_FAILED"
+    assert result["failure"]["failure_class"] == "HTTP_403"
+    assert result["failure"]["retryable"] == "NO"
+    assert len(session.calls) == 1
+
+
+def test_semantic_failure_does_not_retry_requests():
+    session = FakeSession([
+        response("<!doctype html><html><body>Expected_Project_0926/visit/1</body></html>"),
+        response("<!doctype html><html><body>incomplete edit</body></html>"),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(_reader(session), {"project_id": "42", "project_name": "Expected_Project_0926"}, 0)
+    assert record["acquisition_state"] == "SEMANTIC_FAILURE"
+    assert len(session.calls) == 3
+
+
+def test_failed_only_recovery_does_not_reacquire_successful_projects():
+    name = "Project_Q3_0926"
+    session = FakeSession([
+        response(f"<!doctype html><html><body>{name}/visit/2</body></html>"),
+        response(complete_edit(name=name)),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    selected = [
+        {"project_id": "1", "project_name": name},
+        {"project_id": "2", "project_name": name},
+        {"project_id": "3", "project_name": name},
+    ]
+    already_acquired = {"project_id": "1", "acquisition_state": "ACQUIRED"}
+    retryable_failure = {
+        "project_id": "2", "acquisition_state": "FAILED", "retryable_failure": True,
+        "acquisition_failure_reasons": ["project:TIMEOUT"], "acquisition_request_failures": [],
+    }
+    semantic_failure = {
+        "project_id": "3", "acquisition_state": "SEMANTIC_FAILURE", "retryable_failure": False,
+    }
+    projects, _visits, retried = recover_retryable_failed_projects(
+        _reader(session), selected, [already_acquired, retryable_failure, semantic_failure], [], 0
+    )
+    assert retried == ["2"]
+    assert projects[0] is already_acquired
+    assert projects[1]["acquisition_state"] == "ACQUIRED"
+    assert projects[2] is semantic_failure
+    assert all(not (call[0] == "/proj/1" or call[0] == "/proj/1/edit") for call in session.calls)
+
+
+def test_request_failure_telemetry_is_safe_and_project_scoped(capsys):
+    session = FakeSession([TimeoutError("DO_NOT_LOG_TOKEN=secret-cookie-password")] * 4)
+    reader = _reader(session)
+    result = reader.get("/proj/42", project_id="42", stage="project")
+    output = capsys.readouterr().out
+    assert result["failure"]["failure_class"] == "TIMEOUT"
+    assert '"project_id": "42"' in output
+    assert '"request_stage": "project"' in output
+    assert '"attempt": 4' in output
+    assert '"retryable": "YES"' in output
+    assert '"failure_class": "TIMEOUT"' in output
+    assert "DO_NOT_LOG_TOKEN" not in output
+    assert "secret-cookie-password" not in output

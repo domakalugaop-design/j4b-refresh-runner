@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import json
 import html
+import random
+import socket
+import ssl
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit
 
 from .parsers import parse_action_table, parse_edit, parse_visit_table, plain_text
+from .portal_transport import PortalTransportError
 from .workflow_analytics import WORKFLOW_STATE_CODES
 
 ACTION_STATE_CODES = tuple(str(code) for code in WORKFLOW_STATE_CODES)
 COMPLETED_CODES = {"37", "40", "50"}
+MAX_REQUEST_RETRIES = 3
+RETRY_BACKOFF_SECONDS = (0.25, 1.0, 2.0)
+MAX_RETRY_AFTER_SECONDS = 30.0
 
 
 def field(value: Any, state: str, route: str) -> dict[str, Any]:
@@ -24,15 +33,29 @@ def _text(entry: Any) -> Any:
 
 
 class Reader:
-    def __init__(self, session: Any, cap: int):
+    def __init__(
+        self,
+        session: Any,
+        cap: int,
+        *,
+        max_retries: int = MAX_REQUEST_RETRIES,
+        expected_projects: int | None = None,
+        sleep: Any = time.sleep,
+        jitter: Any = random.uniform,
+    ):
         self.session = session
         self.cap = cap
+        self.max_retries = max(0, int(max_retries))
+        self.expected_projects = expected_projects
+        self.sleep = sleep
+        self.jitter = jitter
         self.count = 0
         self.post_count = 0
         self.failures = 0
         self.project_completed = 0
         self.project_failures = 0
         self.project_semantic_failures = 0
+        self.failure_telemetry: list[dict[str, Any]] = []
         self.started_monotonic = time.monotonic()
 
     def _reserve(self) -> None:
@@ -40,32 +63,126 @@ class Reader:
             raise RuntimeError("request cap reached")
         self.count += 1
 
-    def get(self, path: str) -> dict[str, Any]:
-        self._reserve()
-        try:
-            status, content_type, body = self.session.request(path, "GET", accept="text/html, application/json")
-            state = "VALUE_PRESENT" if body else "SOURCE_RETURNED_EMPTY_BODY"
-            return {
-                "state": state,
-                "http_status": status,
-                "content_type": content_type,
-                "body": body,
-                "effective_url": getattr(self.session, "last_effective_url", None),
-            }
-        except Exception:
-            self.failures += 1
-            return {"state": "REQUEST_FAILED", "http_status": None, "content_type": None, "body": b""}
+    @staticmethod
+    def _exception_class(exc: Exception) -> tuple[str, bool]:
+        if isinstance(exc, PortalTransportError):
+            return exc.failure_class, exc.retryable
+        if isinstance(exc, (TimeoutError, socket.timeout)):
+            return "TIMEOUT", True
+        if isinstance(exc, socket.gaierror):
+            return "DNS_ERROR", exc.errno == getattr(socket, "EAI_AGAIN", object())
+        if isinstance(exc, ssl.SSLError):
+            return "TLS_ERROR", False
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return "CONNECTION_RESET", True
+        if isinstance(exc, ConnectionError):
+            return "CONNECT_ERROR", True
+        return "TRANSPORT_ERROR", False
 
-    def post(self, path: str, data: dict[str, str]) -> dict[str, Any]:
-        self._reserve()
-        self.post_count += 1
+    @staticmethod
+    def _http_retryable(status: int) -> bool:
+        return status in {408, 425, 429, 500, 502, 503, 504}
+
+    def _retry_after_seconds(self) -> float | None:
+        raw = getattr(self.session, "last_retry_after", None)
+        if not raw:
+            return None
         try:
-            status, content_type, body = self.session.request(path, "POST", data, accept="text/html, application/json")
-            state = "VALUE_PRESENT" if body else "SOURCE_RETURNED_EMPTY_BODY"
-            return {"state": state, "http_status": status, "content_type": content_type, "body": body}
-        except Exception:
-            self.failures += 1
-            return {"state": "REQUEST_FAILED", "http_status": None, "content_type": None, "body": b""}
+            return max(0.0, min(float(raw), MAX_RETRY_AFTER_SECONDS))
+        except (TypeError, ValueError):
+            try:
+                parsed = parsedate_to_datetime(str(raw))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+                return max(0.0, min(seconds, MAX_RETRY_AFTER_SECONDS))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    def _emit_failure(
+        self, *, project_id: str, stage: str, attempt: int, failure_class: str,
+        http_status: int | None, retryable: bool,
+    ) -> dict[str, Any]:
+        event = {
+            "project_id": project_id,
+            "request_stage": stage,
+            "attempt": attempt,
+            "failure_class": failure_class,
+            "http_status": http_status,
+            "retryable": "YES" if retryable else "NO",
+        }
+        self.failure_telemetry.append(event)
+        print("PORTAL_ACQUISITION_REQUEST_FAILURE " + json.dumps(event, sort_keys=True), flush=True)
+        return event
+
+    def _request(
+        self, path: str, method: str, data: dict[str, str] | None, *,
+        project_id: str, stage: str,
+    ) -> dict[str, Any]:
+        last_failure: dict[str, Any] | None = None
+        for attempt in range(1, self.max_retries + 2):
+            self._reserve()
+            if method == "POST":
+                self.post_count += 1
+            try:
+                status, content_type, body = self.session.request(
+                    path, method, data, accept="text/html, application/json"
+                )
+            except Exception as exc:
+                failure_class, retryable = self._exception_class(exc)
+                event = self._emit_failure(
+                    project_id=project_id, stage=stage, attempt=attempt,
+                    failure_class=failure_class, http_status=None, retryable=retryable,
+                )
+                last_failure = event
+                self.failures += 1
+                if not retryable or attempt > self.max_retries:
+                    break
+                self._wait_before_retry(attempt, None)
+                continue
+
+            if status == 200 and body:
+                return {
+                    "state": "VALUE_PRESENT", "http_status": status,
+                    "content_type": content_type, "body": body,
+                    "effective_url": getattr(self.session, "last_effective_url", None),
+                    "attempts": attempt, "failure": None,
+                }
+
+            failure_class = f"HTTP_{status}" if status else "HTTP_STATUS_MISSING"
+            retryable = bool(status and self._http_retryable(int(status)))
+            if status == 200 and not body:
+                failure_class, retryable = "EMPTY_BODY", False
+            event = self._emit_failure(
+                project_id=project_id, stage=stage, attempt=attempt,
+                failure_class=failure_class, http_status=status or None, retryable=retryable,
+            )
+            last_failure = event
+            if not retryable or attempt > self.max_retries:
+                break
+            self._wait_before_retry(attempt, self._retry_after_seconds() if retryable else None)
+
+        return {
+            "state": "REQUEST_FAILED", "http_status": last_failure.get("http_status") if last_failure else None,
+            "content_type": None, "body": b"", "attempts": attempt,
+            "failure": last_failure or {
+                "project_id": project_id, "request_stage": stage, "attempt": attempt,
+                "failure_class": "REQUEST_FAILED", "http_status": None, "retryable": "NO",
+            },
+        }
+
+    def _wait_before_retry(self, attempt: int, retry_after: float | None) -> None:
+        base = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+        delay = retry_after if retry_after is not None else base + self.jitter(0.0, min(0.25, base / 4))
+        self.sleep(max(0.0, min(delay, MAX_RETRY_AFTER_SECONDS)))
+
+    def get(self, path: str, *, project_id: str = "unknown", stage: str = "project_get") -> dict[str, Any]:
+        return self._request(path, "GET", None, project_id=project_id, stage=stage)
+
+    def post(
+        self, path: str, data: dict[str, str], *, project_id: str = "unknown", stage: str = "action_query"
+    ) -> dict[str, Any]:
+        return self._request(path, "POST", data, project_id=project_id, stage=stage)
 
     def project_done(self, acquisition_state: str) -> None:
         self.project_completed += 1
@@ -73,7 +190,7 @@ class Reader:
             self.project_failures += 1
         elif acquisition_state == "SEMANTIC_FAILURE":
             self.project_semantic_failures += 1
-        total = max(self.cap // 3, 1)
+        total = max(self.expected_projects if self.expected_projects is not None else self.cap // 3, 1)
         if self.project_completed % 10 != 0 and self.project_completed != total:
             return
         elapsed = max(time.monotonic() - self.started_monotonic, 0.001)
@@ -120,16 +237,6 @@ def action_memberships(markup: str, project_id: str) -> list[dict[str, Any]]:
     return memberships
 
 
-def _response_failure(name: str, response: dict[str, Any]) -> str | None:
-    if response.get("state") == "REQUEST_FAILED":
-        return f"{name}:REQUEST_FAILED"
-    if response.get("http_status") != 200:
-        return f"{name}:HTTP_{response.get('http_status')}"
-    if not response.get("body"):
-        return f"{name}:EMPTY_BODY"
-    return None
-
-
 def _semantic_failures(
     project_id: str,
     project: dict[str, Any],
@@ -140,11 +247,7 @@ def _semantic_failures(
     portal_base_url: str,
 ) -> list[str]:
     """Fail closed when a 200 response does not satisfy the qualified page contract."""
-    failures = [
-        reason
-        for name, response in (("project", project), ("edit", edit), ("action", action))
-        if (reason := _response_failure(name, response)) is not None
-    ]
+    failures: list[str] = []
     project_html = project.get("body", b"").decode("utf-8", "replace")
     edit_html = edit.get("body", b"").decode("utf-8", "replace")
     action_html = action.get("body", b"").decode("utf-8", "replace")
@@ -206,11 +309,13 @@ def _semantic_failures(
     return failures
 
 
-def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def acquire_project(
+    reader: Reader, spec: dict[str, Any], delay: float, *, track_progress: bool = True
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     project_id = str(spec["project_id"])
-    project = reader.get(f"/proj/{project_id}")
+    project = reader.get(f"/proj/{project_id}", project_id=project_id, stage="project")
     time.sleep(delay)
-    edit = reader.get(f"/proj/{project_id}/edit")
+    edit = reader.get(f"/proj/{project_id}/edit", project_id=project_id, stage="project_edit")
     time.sleep(delay)
     action_data = {
         "proj": json.dumps([project_id]),
@@ -223,7 +328,7 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
         "city": "",
     }
     action_data.update({f"state[{code}]": "on" for code in ACTION_STATE_CODES})
-    action = reader.post("/action", action_data)
+    action = reader.post("/action", action_data, project_id=project_id, stage="action_query")
 
     project_html = project["body"].decode("utf-8", "replace") if project["body"] else ""
     edit_html = edit["body"].decode("utf-8", "replace") if edit["body"] else ""
@@ -233,13 +338,15 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
     visit_ids = [row["visit_id"] for row in parse_visit_table(project_html)] if project_html else []
     actions = action_index(action_html, project_id) if action_html else {}
     memberships = action_memberships(action_html, project_id) if action_html else []
-    failed = any(
-        item["state"] == "REQUEST_FAILED" or item.get("http_status") != 200 or not item.get("body")
+    request_failures = [
+        dict(item["failure"])
         for item in (project, edit, action)
-    )
+        if item.get("failure") is not None
+    ]
+    failed = bool(request_failures)
     portal_base_url = getattr(reader.session, "base_url", "https://lk.j4b.ru").rstrip("/")
     canonical_name = _text(spec.get("project_name"))
-    semantic_failures = _semantic_failures(
+    semantic_failures = [] if failed else _semantic_failures(
         project_id, project, edit, action, edit_fields, canonical_name, portal_base_url
     )
     acquisition_state = "FAILED" if failed else "SEMANTIC_FAILURE" if semantic_failures else "ACQUIRED"
@@ -265,7 +372,12 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
         "manager_payment": edit_fields.get("manager_payment", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "wave": edit_fields.get("wave", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "acquisition_state": acquisition_state,
-        "acquisition_failure_reasons": semantic_failures,
+        "acquisition_failure_reasons": [
+            f"{failure['request_stage']}:{failure['failure_class']}" for failure in request_failures
+        ] + semantic_failures,
+        "acquisition_request_failures": request_failures,
+        "retryable_failure": bool(request_failures)
+        and all(failure.get("retryable") == "YES" for failure in request_failures),
         "workflow_memberships": memberships,
     }
 
@@ -279,8 +391,55 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
             "raw_status": field(raw, "VALUE_PRESENT" if raw else "UNKNOWN", f"/action?project={project_id}"),
             "assignment_state": field(action_row.get("assignment_state", "UNKNOWN"), "VALUE_PRESENT" if visit_id in actions else "UNKNOWN", f"/action?project={project_id}"),
         })
-    reader.project_done(acquisition_state)
+    if track_progress:
+        reader.project_done(acquisition_state)
     return record, visits
+
+
+def recover_retryable_failed_projects(
+    reader: Reader,
+    selected: list[dict[str, Any]],
+    projects: list[dict[str, Any]],
+    visits: list[dict[str, Any]],
+    delay: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Reacquire only retryable failed project IDs; successful projects are never revisited."""
+    specs_by_id = {str(item["project_id"]): item for item in selected}
+    candidates = [
+        str(project.get("project_id"))
+        for project in projects
+        if project.get("acquisition_state") == "FAILED" and project.get("retryable_failure") is True
+    ]
+    if not candidates:
+        return projects, visits, []
+    print(f"ACQUISITION_FAILED_ONLY_RECOVERY_START | projects={len(candidates)}", flush=True)
+    projects_by_id = {str(project["project_id"]): project for project in projects}
+    visits_by_project: dict[str, list[dict[str, Any]]] = {}
+    for visit in visits:
+        visits_by_project.setdefault(str(visit["project_id"]), []).append(visit)
+    for project_id in candidates:
+        retry_record, retry_visits = acquire_project(
+            reader, specs_by_id[project_id], delay, track_progress=False
+        )
+        projects_by_id[project_id] = retry_record
+        visits_by_project[project_id] = retry_visits
+        print(
+            "ACQUISITION_FAILED_ONLY_RECOVERY_RESULT | "
+            + json.dumps({
+                "project_id": project_id,
+                "acquisition_state": retry_record.get("acquisition_state"),
+                "retryable_failure": retry_record.get("retryable_failure", False),
+                "failure_outcomes": retry_record.get("acquisition_failure_reasons", []),
+            }, sort_keys=True),
+            flush=True,
+        )
+    recovered_projects = [projects_by_id[str(item["project_id"])] for item in selected]
+    recovered_visits = [
+        visit
+        for item in selected
+        for visit in visits_by_project.get(str(item["project_id"]), [])
+    ]
+    return recovered_projects, recovered_visits, candidates
 
 
 def discover_universe(session: Any, attempts: int = 3) -> list[dict[str, Any]]:

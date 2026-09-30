@@ -14,7 +14,13 @@ from decimal import Decimal
 from typing import Any
 from urllib.error import HTTPError
 
-from .acquisition import Reader, acquire_project, discover_universe
+from .acquisition import (
+    MAX_REQUEST_RETRIES,
+    Reader,
+    acquire_project,
+    discover_universe,
+    recover_retryable_failed_projects,
+)
 from .payment_detail_xlsx import acquire_project_payment_assignments
 from .payment_materialization import (
     PROJECT_PUBLICATION_COLUMNS,
@@ -931,11 +937,15 @@ def _assert_prepublication_baseline_unchanged(
         raise RuntimeError("prepublication project_types baseline changed during acquisition")
 
 
-def _require_complete_operational_acquisition(projects: list[dict[str, Any]]) -> None:
-    failed = [p for p in projects if p.get("acquisition_state") in {"FAILED", "SEMANTIC_FAILURE"}]
-    if failed:
+def _require_complete_operational_acquisition(
+    projects: list[dict[str, Any]], selected_count: int | None = None
+) -> None:
+    expected = len(projects) if selected_count is None else selected_count
+    acquired = sum(p.get("acquisition_state") == "ACQUIRED" for p in projects)
+    if len(projects) != expected or acquired != expected:
         raise RuntimeError(
-            f"operational acquisition acceptance failed: {len(failed)} selected projects incomplete"
+            "operational acquisition acceptance failed: "
+            f"selected={expected} records={len(projects)} acquired={acquired}"
         )
 
 
@@ -1259,7 +1269,12 @@ def run() -> dict[str, Any]:
                 if len(selected) != scope_counts["union"]:
                     raise RuntimeError("regular selector summary disagrees with deduplicated selection")
         _stage(f"SCOPE_SELECTION_PASS | selected={len(selected)}")
-        reader = Reader(session, max(3 * len(selected), 3))
+        # Budget for one full retry sequence plus one failed-project-only recovery pass.
+        reader = Reader(
+            session,
+            max(3 * (MAX_REQUEST_RETRIES + 1) * 2 * len(selected), 3),
+            expected_projects=len(selected),
+        )
         projects: list[dict[str, Any]] = []
         visits: list[dict[str, Any]] = []
         acquisition_started = time.monotonic()
@@ -1286,7 +1301,54 @@ def run() -> dict[str, Any]:
                     flush=True,
                 )
 
-        _require_complete_operational_acquisition(projects)
+        projects, visits, recovery_ids = recover_retryable_failed_projects(
+            reader,
+            selected,
+            projects,
+            visits,
+            float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")),
+        )
+        acquired_count = sum(p.get("acquisition_state") == "ACQUIRED" for p in projects)
+        request_failed = [p for p in projects if p.get("acquisition_state") == "FAILED"]
+        transport_failure_classes = {
+            "TIMEOUT", "DNS_ERROR", "CONNECT_ERROR", "CONNECTION_RESET", "CONNECTION_CLOSED",
+            "CONNECTION_SEND_ERROR", "HTTP_408", "HTTP_425", "HTTP_429",
+            "HTTP_500", "HTTP_502", "HTTP_503", "HTTP_504",
+        }
+        transport_failed = [
+            p for p in request_failed
+            if any(
+                failure.get("failure_class") in transport_failure_classes
+                for failure in p.get("acquisition_request_failures", [])
+            )
+        ]
+        semantic_failed = [p for p in projects if p.get("acquisition_state") == "SEMANTIC_FAILURE"]
+        unresolved = [p for p in projects if p.get("acquisition_state") != "ACQUIRED"]
+        print(
+            "ACQUISITION_FINAL_SUMMARY "
+            + json.dumps({
+                "selected_projects": len(selected),
+                "acquired_projects": acquired_count,
+                "transport_failures": len(transport_failed),
+                "request_failed_projects": len(request_failed),
+                "semantic_failures": len(semantic_failed),
+                "failed_project_ids": [str(p["project_id"]) for p in unresolved],
+                "failed_project_outcomes": [
+                    {
+                        "project_id": str(p["project_id"]),
+                        "failure_class": p.get("acquisition_failure_reasons", []),
+                        "request_failures": p.get("acquisition_request_failures", []),
+                        "retryable": p.get("retryable_failure", False),
+                    }
+                    for p in unresolved
+                ],
+                "failed_only_recovery_project_ids": recovery_ids,
+                "request_failure_attempts": len(getattr(reader, "failure_telemetry", [])),
+                "portal_http_requests": reader.count,
+            }, sort_keys=True),
+            flush=True,
+        )
+        _require_complete_operational_acquisition(projects, selected_count=len(selected))
 
         payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]] | None = None
         if payment_enabled and os.environ.get("ACQUISITION_ONLY", "false").strip().lower() != "true":

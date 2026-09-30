@@ -17,7 +17,7 @@ from typing import Any, Mapping
 from urllib.error import URLError
 
 from . import production
-from .acquisition import Reader, acquire_project, discover_universe
+from .acquisition import MAX_REQUEST_RETRIES, Reader, acquire_project, discover_universe
 from .google_service_account import google_token
 from .payment_detail_xlsx import PaymentTransportError, PaymentWorkbookError, acquire_project_payment_assignments
 from .payment_materialization import (
@@ -335,7 +335,11 @@ def run_initial_2026(*, checkpoint_path: Path = CHECKPOINT_PATH, batch_size: int
         print(f"INITIAL_2026_SCOPE={len(selected_ids)} ALREADY_ACCEPTED={already}", flush=True)
         selected_by_id = {str(row["project_id"]): row for row in selected}
         retry_ids = pending_project_ids(checkpoint)
-        reader = Reader(session, max(3 * len(retry_ids), 3))
+        reader = Reader(
+            session,
+            max(3 * (MAX_REQUEST_RETRIES + 1) * len(retry_ids), 3),
+            expected_projects=len(retry_ids),
+        )
         for batch in (retry_ids[index:index + batch_size] for index in range(0, len(retry_ids), batch_size)):
             for pid in batch:
                 spec = selected_by_id[pid]

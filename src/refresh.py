@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 
-from .acquisition import COMPLETED_CODES, Reader, acquire_project, discover_universe
+from .acquisition import MAX_REQUEST_RETRIES, COMPLETED_CODES, Reader, acquire_project, discover_universe
 from .portal_transport import PortalSession
 from .project_types import STATE_COLUMNS, serialize_state, validate_state_rows
 from .workflow_analytics import project_workflow_metrics
@@ -443,13 +443,23 @@ def run() -> dict[str, Any]:
     try:
         universe = discover_universe(session)
         selected = select_scope(universe, previous)
-        reader = Reader(session, max(3 * len(selected), 3))
+        reader = Reader(
+            session,
+            max(3 * (MAX_REQUEST_RETRIES + 1) * len(selected), 3),
+            expected_projects=len(selected),
+        )
         projects: list[dict[str, Any]] = []
         visits: list[dict[str, Any]] = []
         for spec in selected:
             project, project_visits = acquire_project(reader, spec, float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")))
             projects.append(project)
             visits.extend(project_visits)
+        acquired = sum(project.get("acquisition_state") == "ACQUIRED" for project in projects)
+        if len(projects) != len(selected) or acquired != len(selected):
+            raise RuntimeError(
+                "operational acquisition acceptance failed: "
+                f"selected={len(selected)} records={len(projects)} acquired={acquired}"
+            )
         timestamp = now()
         rows = materialize(projects, visits, timestamp)
         merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp)
