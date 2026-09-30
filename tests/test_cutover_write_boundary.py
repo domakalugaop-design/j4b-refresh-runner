@@ -173,6 +173,29 @@ def test_workflow_rollback_normalizes_short_backup_rows(monkeypatch):
     assert writes and writes[-1]["data"][0]["values"] == [["id", "name"], ["8110", ""]]
 
 
+def test_persistent_backup_upload_marker_is_a_hard_gate(tmp_path, monkeypatch):
+    backup_dir = tmp_path / "backup"
+    backup_dir.mkdir(mode=0o700)
+    marker = backup_dir / "upload.ok"
+    monkeypatch.setenv("RUN_MODE", "production")
+    monkeypatch.setenv("J4B_PERSISTENT_BACKUP_DIR", str(backup_dir))
+    monkeypatch.setenv("J4B_PERSISTENT_BACKUP_UPLOAD_MARKER", str(marker))
+    with pytest.raises(RuntimeError, match="marker"):
+        production._require_persistent_backup_upload()
+    marker.write_text("PASS\n", encoding="utf-8")
+    marker.chmod(0o600)
+    production._require_persistent_backup_upload()
+
+
+def test_main_workflow_uploads_backup_before_replay_publication():
+    workflow = Path(__file__).parents[1] / ".github/workflows/manual-production-dispatch.yml"
+    text = workflow.read_text(encoding="utf-8")
+    assert "PREPUBLICATION_BACKUP_ONLY" in text
+    assert "actions/upload-artifact@v4" in text
+    assert text.index("Upload private pre-publication backup artifact") < text.index("Run production refresh from checkpoint")
+    assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" in text
+
+
 def test_prepublication_baseline_guard_fails_closed_on_external_change():
     previous = [["project_id"], ["8110"]]
     with patch("src.production.read_sheet", return_value=[["project_id"], ["9000"]]), \

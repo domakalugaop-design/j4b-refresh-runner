@@ -817,6 +817,74 @@ def load_private_prepublication_backup(path: str | os.PathLike[str], expected_sh
     return payload
 
 
+def _persistent_backup_dir() -> str:
+    configured = os.environ.get("J4B_PERSISTENT_BACKUP_DIR", "").strip()
+    if not configured:
+        raise RuntimeError("persistent prepublication backup path is not configured")
+    return os.path.abspath(os.path.expanduser(configured))
+
+
+def _require_persistent_backup_upload() -> None:
+    """Require the workflow's successful artifact-upload marker before writes."""
+    backup_dir = _persistent_backup_dir()
+    marker = os.environ.get("J4B_PERSISTENT_BACKUP_UPLOAD_MARKER", "").strip()
+    if not marker:
+        raise RuntimeError("persistent prepublication backup upload marker is not configured")
+    marker_path = os.path.abspath(os.path.expanduser(marker))
+    if not marker_path.startswith(backup_dir + os.sep):
+        raise RuntimeError("persistent prepublication backup upload marker is outside backup path")
+    if not os.path.isfile(marker_path) or os.stat(marker_path).st_mode & 0o077:
+        raise RuntimeError("persistent prepublication backup upload marker is missing or unsafe")
+    if open(marker_path, "r", encoding="utf-8").read().strip() != "PASS":
+        raise RuntimeError("persistent prepublication backup upload marker is invalid")
+
+
+def create_persistent_prepublication_backup() -> dict[str, Any]:
+    """Read target tabs and persist the rollback baseline before publication."""
+    sid = _production_target()
+    token = google_token()
+    meta = _destination_preflight(token, sid)
+    header_url = urllib.parse.quote("projects_current!1:1", safe="!:")
+    header = api_get(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{header_url}?valueRenderOption=UNFORMATTED_VALUE",
+        token,
+    ).get("values", [[]])[0]
+    if not header:
+        raise RuntimeError("projects_current populated header is unavailable")
+    previous_raw = read_sheet(token, sid, columns=[str(i) for i in range(len(header))])
+    previous_state_rows = read_project_type_state_rows(token, sid)
+    workflow_backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, meta) if _workflow_enabled() else None
+    payment_tabs = {PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB}
+    payment_previous = {tab: _read_payment_tab(token, sid, tab) for tab in payment_tabs} if _payment_refresh_enabled() else {}
+    payment_publication = None
+    if payment_previous:
+        sheet_ids = {
+            props.get("title"): props.get("sheetId")
+            for sheet in meta.get("sheets", [])
+            for props in [sheet.get("properties", {})]
+            if props.get("title") in payment_tabs
+        }
+        grid_rows = {
+            props.get("title"): props.get("gridProperties", {}).get("rowCount")
+            for sheet in meta.get("sheets", [])
+            for props in [sheet.get("properties", {})]
+            if props.get("title") in payment_tabs
+        }
+        payment_publication = (payment_previous, {}, sheet_ids, grid_rows)
+    target_tabs = {"projects_current", "project_types"}
+    if workflow_backup is not None:
+        target_tabs.add(THIRD_TAB_NAME)
+    if payment_publication is not None:
+        target_tabs.update(payment_tabs)
+    non_target = _fingerprint_non_target_tabs(token, sid, target_tabs)
+    saved = _persist_prepublication_backup(
+        sid, os.environ.get("GITHUB_RUN_ID", "preflight"), previous_raw,
+        previous_state_rows, workflow_backup, payment_publication, non_target,
+    )
+    _stage(f"PERSISTENT_PREPUBLICATION_BACKUP_PASS | bytes={saved['bytes']} | sha256={saved['sha256']}")
+    return saved
+
+
 def _fingerprint_non_target_tabs(token: str, sid: str, target_tabs: set[str]) -> dict[str, str]:
     """Hash values and structural metadata for every non-target worksheet."""
     meta = api(
@@ -950,6 +1018,20 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     previous_raw = checkpoint["previous_raw"]
     previous_state_rows = checkpoint["previous_state_rows"]
     state = {str(pid): tuple(value) for pid, value in checkpoint["state"].items()}
+    if os.environ.get("MATERIALIZATION_PREFLIGHT", "false").strip().lower() == "true":
+        _require_complete_operational_acquisition(projects)
+        rows = materialize(projects, visits, now())
+        merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, now(), columns=columns)
+        if workflow_enabled:
+            validate_materialized_rows(merged)
+        apply_canonical_project_names(merged, universe)
+        materialize_project_types(merged, state, project_type_applicable_ids(universe))
+        candidate = sheet_rows(merged, columns=columns)
+        candidate_summary = summary(candidate)
+        if candidate_summary["duplicates"] or candidate_summary["unique"] < summary(previous)["unique"]:
+            raise RuntimeError("candidate validation failed")
+        _stage(f"MATERIALIZATION_PREFLIGHT_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
+        return {"FINAL_STATUS": "MATERIALIZATION_PREFLIGHT_PASS", "CANDIDATE_ROWS": candidate_summary["rows"]}
     meta = _destination_preflight(token, sid)
     physical = next(s.get("properties", {}) for s in meta["sheets"] if s.get("properties", {}).get("title") == "projects_current")
     source_columns = list(previous_raw[0]) if previous_raw else []
@@ -989,6 +1071,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
     _stage("CANDIDATE_VALIDATION_PASS")
     _require_production_gate()
+    _require_persistent_backup_upload()
     backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, meta) if workflow_enabled else None
     _assert_prepublication_baseline_unchanged(token, sid, previous_raw, previous_state_rows)
     target_tabs = {"projects_current", "project_types"}
@@ -1060,6 +1143,8 @@ def run() -> dict[str, Any]:
     dry_run = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
     if run_mode != "production":
         raise RuntimeError("RUN_MODE must be production")
+    if os.environ.get("PREPUBLICATION_BACKUP_ONLY", "false").strip().lower() == "true":
+        return create_persistent_prepublication_backup()
     if os.environ.get("REPLAY_ACQUISITION_CHECKPOINT", "false").strip().lower() == "true":
         return run_from_acquisition_checkpoint()
     sid = _production_target()
@@ -1294,6 +1379,7 @@ def run() -> dict[str, Any]:
         # bootstrap validation, and diff planning above are read-only.
         if project_type_enabled:
             _require_production_gate()
+            _require_persistent_backup_upload()
             if workflow_enabled:
                 workflow_backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, destination_meta)
             _assert_prepublication_baseline_unchanged(token, sid, previous_raw, previous_state_rows)
