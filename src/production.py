@@ -98,7 +98,7 @@ def _prepare_regular_payment_publication(
     session: PortalSession,
     selected: list[dict[str, Any]],
     acquired_projects: list[dict[str, Any]],
-) -> tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int]]:
+) -> tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]]:
     """Acquire complete selected scope and prepare both replacement payloads before writes."""
     sheet_ids = {
         props.get("title"): props.get("sheetId")
@@ -108,6 +108,14 @@ def _prepare_regular_payment_publication(
     }
     if set(sheet_ids) != {PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB} or any(not isinstance(x, int) for x in sheet_ids.values()):
         raise RuntimeError("payment tabs are missing from destination metadata")
+    grid_row_counts = {
+        props.get("title"): props.get("gridProperties", {}).get("rowCount")
+        for sheet in meta.get("sheets", [])
+        for props in [sheet.get("properties", {})]
+        if props.get("title") in sheet_ids
+    }
+    if set(grid_row_counts) != set(sheet_ids) or any(not isinstance(x, int) or x <= 0 for x in grid_row_counts.values()):
+        raise RuntimeError("payment tab grid row count metadata is unavailable")
     expected_headers = {
         PAYMENT_VISIT_TAB: list(VISIT_PUBLICATION_COLUMNS),
         PAYMENT_PROJECT_TAB: list(PROJECT_PUBLICATION_COLUMNS),
@@ -148,7 +156,7 @@ def _prepare_regular_payment_publication(
         PAYMENT_PROJECT_TAB: [expected_headers[PAYMENT_PROJECT_TAB], *project_rows],
     }
     candidate = replace_by_project(previous, incoming, selected_ids)
-    return previous, candidate, sheet_ids
+    return previous, candidate, sheet_ids, grid_row_counts
 
 
 def _destination_preflight(token: str, sid: str, expected_title: str = PRODUCTION_TITLE) -> dict[str, Any]:
@@ -764,7 +772,7 @@ def run() -> dict[str, Any]:
                     flush=True,
                 )
 
-        payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int]] | None = None
+        payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]] | None = None
         if payment_enabled:
             _stage("PAYMENT_STAGE_START | mode=REGULAR | cross_run_checkpoint=NO")
             payment_publication = _prepare_regular_payment_publication(
@@ -865,7 +873,7 @@ def run() -> dict[str, Any]:
                     _stage("WORKFLOW_PUBLICATION_PASS")
                 publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
                 if payment_publication is not None:
-                    old_payment, new_payment, payment_sheet_ids = payment_publication
+                    old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
                     _stage("PAYMENT_PUBLICATION_START | tabs=2")
                     payment_result = publish_payment_pair(
                         sheet_ids=payment_sheet_ids,
@@ -873,6 +881,7 @@ def run() -> dict[str, Any]:
                         candidate=new_payment,
                         write_batch=lambda requests: _exact_google_batch(token, sid, requests),
                         read_tab=lambda tab: _read_payment_tab(token, sid, tab),
+                        grid_row_counts=payment_grid_rows,
                     )
                     _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
                 _stage("PUBLISH_PASS")
@@ -890,7 +899,7 @@ def run() -> dict[str, Any]:
                 _require_production_gate()
             publish(token, sid, candidate, previous, columns=columns)
             if payment_publication is not None:
-                old_payment, new_payment, payment_sheet_ids = payment_publication
+                old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
                 _stage("PAYMENT_PUBLICATION_START | tabs=2")
                 payment_result = publish_payment_pair(
                     sheet_ids=payment_sheet_ids,
@@ -898,6 +907,7 @@ def run() -> dict[str, Any]:
                     candidate=new_payment,
                     write_batch=lambda requests: _exact_google_batch(token, sid, requests),
                     read_tab=lambda tab: _read_payment_tab(token, sid, tab),
+                    grid_row_counts=payment_grid_rows,
                 )
                 _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
         _stage("READBACK_PASS")

@@ -91,7 +91,7 @@ def test_postpublication_fingerprint_error_restores_both_payment_tabs():
 
     with patch("src.payment_initial._capture_payment_tabs", return_value=({
         "Выплаты по визитам": 10, "Выплаты по проектам": 11,
-    }, previous)), \
+    }, previous, {"Выплаты по визитам": 1, "Выплаты по проектам": 1})), \
          patch("src.payment_initial._private_atomic_json", return_value={"bytes": 1, "sha256": "local"}), \
          patch("src.payment_initial._fingerprint_nonpayment_tabs", side_effect=[before, RuntimeError("readback unavailable")]), \
          patch("src.payment_initial.publish_payment_pair", side_effect=publish):

@@ -20,9 +20,15 @@ from src.payment_refresh import (
 )
 
 
-def _apply_payment_requests(live, requests, sheet_ids):
+def _apply_payment_requests(live, requests, sheet_ids, grid_counts=None):
     tab_by_id = {value: key for key, value in sheet_ids.items()}
     for request in requests:
+        if "appendDimension" in request:
+            dimension = request["appendDimension"]
+            tab = tab_by_id[dimension["sheetId"]]
+            if grid_counts is not None and dimension["dimension"] == "ROWS":
+                grid_counts[tab] += dimension["length"]
+            continue
         update = request["updateCells"]
         cell_range = update["range"]
         tab = tab_by_id[cell_range["sheetId"]]
@@ -272,6 +278,25 @@ def test_chunked_publication_larger_and_smaller_than_old_sheet_clears_stale_tail
     assert result["status"] == "PASS"
     from src.payment_refresh import _normalized_readback
     assert all(_normalized_readback(live[tab]) == _normalized_readback(candidate[tab]) for tab in sheet_ids)
+
+
+def test_first_chunk_atomically_expands_only_target_payment_tab_grid():
+    previous = {"visits": [["id"], ["old"]], "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id"], ["new1"], ["new2"], ["new3"]],
+                 "projects": [["id"], ["new"]]}
+    sheet_ids = {"visits": 10, "projects": 20}
+    grid_counts = {"visits": 2, "projects": 2}
+    live = {key: [row[:] for row in rows] for key, rows in previous.items()}
+
+    def writer(requests):
+        _apply_payment_requests(live, requests, sheet_ids, grid_counts)
+
+    result = publish_payment_pair(sheet_ids=sheet_ids, previous=previous, candidate=candidate,
+                                  write_batch=writer, read_tab=lambda tab: live[tab],
+                                  grid_row_counts=grid_counts)
+    assert result["status"] == "PASS"
+    assert grid_counts == {"visits": 4, "projects": 2}
+    assert live == candidate
 
 
 def test_timeout_before_apply_verifies_range_then_retries():

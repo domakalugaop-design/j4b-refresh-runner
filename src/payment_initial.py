@@ -175,7 +175,7 @@ def _fingerprint_nonpayment_tabs(token: str, sid: str) -> dict[str, str]:
     return result
 
 
-def _capture_payment_tabs(token: str, sid: str, meta: dict[str, Any]) -> tuple[dict[str, int], dict[str, list[list[Any]]]]:
+def _capture_payment_tabs(token: str, sid: str, meta: dict[str, Any]) -> tuple[dict[str, int], dict[str, list[list[Any]]], dict[str, int]]:
     original_ids = {
         sheet["properties"]["title"]: sheet["properties"]["sheetId"]
         for sheet in meta.get("sheets", [])
@@ -184,7 +184,7 @@ def _capture_payment_tabs(token: str, sid: str, meta: dict[str, Any]) -> tuple[d
     if set(original_ids) != set(PAYMENT_TABS):
         raise RuntimeError("expected payment tabs are missing")
     fresh = production.api(
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=properties.title,sheets.properties(title,sheetId)",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=properties.title,sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))",
         token,
     )
     fresh_ids = {
@@ -194,6 +194,13 @@ def _capture_payment_tabs(token: str, sid: str, meta: dict[str, Any]) -> tuple[d
     }
     if fresh.get("properties", {}).get("title") != production.PRODUCTION_TITLE or fresh_ids != original_ids:
         raise RuntimeError("payment workbook/title/tab identity changed during INITIAL_2026 run")
+    grid_row_counts = {
+        sheet.get("properties", {}).get("title"): sheet.get("properties", {}).get("gridProperties", {}).get("rowCount")
+        for sheet in fresh.get("sheets", [])
+        if sheet.get("properties", {}).get("title") in PAYMENT_TABS
+    }
+    if set(grid_row_counts) != set(PAYMENT_TABS) or any(not isinstance(rows, int) or rows <= 0 for rows in grid_row_counts.values()):
+        raise RuntimeError("payment tab grid row count metadata is unavailable")
     previous = {title: production._read_payment_tab(token, sid, title) for title in PAYMENT_TABS}
     expected = {
         production.PAYMENT_VISIT_TAB: list(VISIT_PUBLICATION_COLUMNS),
@@ -201,7 +208,7 @@ def _capture_payment_tabs(token: str, sid: str, meta: dict[str, Any]) -> tuple[d
     }
     if any(not previous[title] or previous[title][0] != expected[title] for title in PAYMENT_TABS):
         raise RuntimeError("current payment tab header/schema mismatch")
-    return fresh_ids, previous
+    return fresh_ids, previous, grid_row_counts
 
 
 def _validate_complete_candidate(candidate: Mapping[str, list[list[Any]]], scope: list[str],
@@ -231,7 +238,7 @@ def _validate_complete_candidate(candidate: Mapping[str, list[list[Any]]], scope
 
 
 def _publish_complete_snapshot(token: str, sid: str, meta: dict[str, Any], incoming: dict[str, list[list[Any]]]) -> dict[str, Any]:
-    sheet_ids, previous = _capture_payment_tabs(token, sid, meta)
+    sheet_ids, previous, grid_row_counts = _capture_payment_tabs(token, sid, meta)
     selected_ids = [row[0] for row in incoming[production.PAYMENT_PROJECT_TAB][1:]]
     # Replace all applicable project IDs, including successful zero-row projects.
     selected_scope = set(incoming.get("_scope", []))
@@ -256,6 +263,7 @@ def _publish_complete_snapshot(token: str, sid: str, meta: dict[str, Any], incom
         "spreadsheet_id": sid,
         "tabs": previous,
         "sheet_ids": sheet_ids,
+        "grid_row_counts": grid_row_counts,
     })
     if backup["bytes"] <= 0:
         raise RuntimeError("payment tab backup is empty")
@@ -266,6 +274,7 @@ def _publish_complete_snapshot(token: str, sid: str, meta: dict[str, Any], incom
         candidate=candidate,
         write_batch=lambda requests: production._exact_google_batch(token, sid, requests),
         read_tab=lambda title: production._read_payment_tab(token, sid, title),
+        grid_row_counts=grid_row_counts,
     )
     try:
         after = _fingerprint_nonpayment_tabs(token, sid)

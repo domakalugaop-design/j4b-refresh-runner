@@ -387,6 +387,7 @@ def publish_payment_pair(
     read_tab: Any,
     max_request_bytes: int = PAYMENT_WRITE_CHUNK_MAX_BYTES,
     max_attempts: int = PAYMENT_WRITE_MAX_ATTEMPTS,
+    grid_row_counts: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     """Publish payment tabs in bounded chunks, verify, and restore on mismatch.
 
@@ -409,6 +410,7 @@ def publish_payment_pair(
 
     chunks_written = 0
     ambiguous_write_response = False
+    current_grid_rows = dict(grid_row_counts or {})
 
     def write_chunked(batch_requests: list[dict[str, Any]]) -> None:
         nonlocal chunks_written, ambiguous_write_response
@@ -430,18 +432,25 @@ def publish_payment_pair(
             tab = tabs_by_sheet_id.get(cell_range.get("sheetId"), next(iter(sheet_ids)))
             start = int(cell_range["startRowIndex"])
             end = int(cell_range["endRowIndex"])
+            sheet_id = cell_range["sheetId"]
             label = _payment_tab_label(tab)
             chunk_number = completed.get(tab, 0) + 1
             completed[tab] = chunk_number
             for attempt in range(1, max_attempts + 1):
+                append_count = max(0, end - int(current_grid_rows.get(tab, end)))
+                batch = ([{"appendDimension": {
+                    "sheetId": sheet_id, "dimension": "ROWS", "length": append_count,
+                }}] if append_count else []) + [chunk]
                 try:
-                    write_batch([chunk])
+                    write_batch(batch)
                 except Exception as write_error:
                     try:
                         current = read_tab(tab)
                     except Exception as verify_error:
                         raise RuntimeError("ambiguous payment chunk write; range readback failed") from verify_error
                     if _chunk_values_match(current, chunk):
+                        if append_count:
+                            current_grid_rows[tab] = int(current_grid_rows.get(tab, 0)) + append_count
                         ambiguous_write_response = True
                         print(f"PAYMENT_{label}_WRITE_CHUNK={chunk_number}/{totals[tab]} ROWS={start + 1}-{end} STATUS=PASS AMBIGUOUS_RESPONSE=CONFIRMED", flush=True)
                         chunks_written += 1
@@ -451,6 +460,8 @@ def publish_payment_pair(
                     print(f"PAYMENT_{label}_WRITE_CHUNK={chunk_number}/{totals[tab]} ROWS={start + 1}-{end} STATUS=RETRY ATTEMPT={attempt + 1}", flush=True)
                     time.sleep(min(1.0 * (2 ** (attempt - 1)), 4.0))
                     continue
+                if append_count:
+                    current_grid_rows[tab] = int(current_grid_rows.get(tab, 0)) + append_count
                 print(f"PAYMENT_{label}_WRITE_CHUNK={chunk_number}/{totals[tab]} ROWS={start + 1}-{end} STATUS=PASS", flush=True)
                 chunks_written += 1
                 break

@@ -45,16 +45,19 @@ def test_regular_payment_preparation_replaces_only_selected_project_rows():
         "primary_manager": {"value": "Manager"},
         "workflow_memberships": [{"project_id": "1", "action_id": "42", "visit_id": "7", "workflow_state_code": 50}],
     }]
-    metadata = {"sheets": [{"properties": {"title": production.PAYMENT_VISIT_TAB, "sheetId": 20}},
-                            {"properties": {"title": production.PAYMENT_PROJECT_TAB, "sheetId": 21}}]}
+    metadata = {"sheets": [{"properties": {"title": production.PAYMENT_VISIT_TAB, "sheetId": 20,
+                                              "gridProperties": {"rowCount": 10}}},
+                            {"properties": {"title": production.PAYMENT_PROJECT_TAB, "sheetId": 21,
+                                             "gridProperties": {"rowCount": 10}}}]}
     fake_payment = [{"my_id": "42", "visit_reward_raw": "10", "transport_expense_raw": None,
                      "expense_compensation_raw": None, "bonus_penalty_raw": None, "portal_paid_amount_raw": "5"}]
     with patch.object(production, "_read_payment_tab", side_effect=lambda _token, _sid, tab: old[tab]), \
          patch.object(production, "acquire_project_payment_assignments", return_value=(fake_payment, 200)):
-        _previous, candidate, sheet_ids = production._prepare_regular_payment_publication(
+        _previous, candidate, sheet_ids, grid_rows = production._prepare_regular_payment_publication(
             "token", "sheet", metadata, object(), selected, projects
         )
     assert sheet_ids == {production.PAYMENT_VISIT_TAB: 20, production.PAYMENT_PROJECT_TAB: 21}
+    assert grid_rows == {production.PAYMENT_VISIT_TAB: 10, production.PAYMENT_PROJECT_TAB: 10}
     assert candidate[production.PAYMENT_VISIT_TAB][0] == list(VISIT_PUBLICATION_COLUMNS)
     assert candidate[production.PAYMENT_PROJECT_TAB][0] == list(PROJECT_PUBLICATION_COLUMNS)
     assert all(str(row[0]) == "1" for rows in candidate.values() for row in rows[1:])
@@ -66,8 +69,8 @@ def test_regular_payment_incomplete_operational_acquisition_blocks_before_export
     selected = [{"project_id": "1", "project_name": "New_0926"}]
     projects = [{"project_id": "1", "acquisition_state": "SEMANTIC_FAILURE"}]
     metadata = {"sheets": [
-        {"properties": {"title": production.PAYMENT_VISIT_TAB, "sheetId": 20}},
-        {"properties": {"title": production.PAYMENT_PROJECT_TAB, "sheetId": 21}},
+        {"properties": {"title": production.PAYMENT_VISIT_TAB, "sheetId": 20, "gridProperties": {"rowCount": 10}}},
+        {"properties": {"title": production.PAYMENT_PROJECT_TAB, "sheetId": 21, "gridProperties": {"rowCount": 10}}},
     ]}
     with patch.object(production, "_read_payment_tab", side_effect=AssertionError("must not read old tabs")), \
          patch.object(production, "acquire_project_payment_assignments", side_effect=AssertionError("must not export")):
