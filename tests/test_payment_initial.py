@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 
 from src.google_service_account import _service_account_info
-from src.payment_initial import _keychain_credential, materialize_complete_checkpoint
+from src.payment_initial import _keychain_credential, _publish_complete_snapshot, materialize_complete_checkpoint
 from src.payment_materialization import PROJECT_PUBLICATION_COLUMNS, VISIT_PUBLICATION_COLUMNS
 from src.payment_refresh import load_checkpoint, new_checkpoint, record_result, save_checkpoint
 
@@ -68,3 +68,37 @@ def test_keychain_error_does_not_include_captured_credential():
         with pytest.raises(RuntimeError) as error:
             _keychain_credential("password")
     assert "SECRET" not in str(error.value)
+
+
+def test_postpublication_fingerprint_error_restores_both_payment_tabs():
+    visit_header = list(VISIT_PUBLICATION_COLUMNS)
+    project_header = list(PROJECT_PUBLICATION_COLUMNS)
+    previous = {
+        "Выплаты по визитам": [visit_header],
+        "Выплаты по проектам": [project_header],
+    }
+    incoming = {
+        "Выплаты по визитам": [visit_header],
+        "Выплаты по проектам": [project_header, ["1"] + [None] * (len(project_header) - 1)],
+        "_scope": ["1"],
+    }
+    before = {"projects_current": "unchanged-before", "project_types": "unchanged-before"}
+    publish_calls = []
+
+    def publish(**kwargs):
+        publish_calls.append(kwargs)
+        return {"status": "PASS", "requests": 2}
+
+    with patch("src.payment_initial._capture_payment_tabs", return_value=({
+        "Выплаты по визитам": 10, "Выплаты по проектам": 11,
+    }, previous)), \
+         patch("src.payment_initial._private_atomic_json", return_value={"bytes": 1, "sha256": "local"}), \
+         patch("src.payment_initial._fingerprint_nonpayment_tabs", side_effect=[before, RuntimeError("readback unavailable")]), \
+         patch("src.payment_initial.publish_payment_pair", side_effect=publish):
+        with pytest.raises(RuntimeError, match="fingerprint verification failed; payment rollback=PASS"):
+            _publish_complete_snapshot("token-not-used", "sheet-not-used", {"sheets": []}, incoming)
+
+    assert len(publish_calls) == 2
+    assert publish_calls[0]["previous"] == previous
+    assert publish_calls[1]["previous"] == publish_calls[0]["candidate"]
+    assert publish_calls[1]["candidate"] == previous

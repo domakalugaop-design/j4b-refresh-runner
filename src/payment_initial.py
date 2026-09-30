@@ -267,7 +267,22 @@ def _publish_complete_snapshot(token: str, sid: str, meta: dict[str, Any], incom
         write_batch=lambda requests: production._exact_google_batch(token, sid, requests),
         read_tab=lambda title: production._read_payment_tab(token, sid, title),
     )
-    after = _fingerprint_nonpayment_tabs(token, sid)
+    try:
+        after = _fingerprint_nonpayment_tabs(token, sid)
+    except Exception as fingerprint_error:
+        # A publication with an unverifiable protected-tab state is not a
+        # successful transaction. Restore both owned payment tabs from the
+        # pre-write snapshot and verify through the same atomic/readback path.
+        restored = publish_payment_pair(
+            sheet_ids=sheet_ids,
+            previous=candidate,
+            candidate=previous,
+            write_batch=lambda requests: production._exact_google_batch(token, sid, requests),
+            read_tab=lambda title: production._read_payment_tab(token, sid, title),
+        )
+        raise RuntimeError(
+            f"non-payment fingerprint verification failed; payment rollback={restored['status']}"
+        ) from fingerprint_error
     if before != after:
         # Non-payment mutation is outside contract. Restore the two owned tabs.
         restored = publish_payment_pair(
