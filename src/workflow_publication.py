@@ -53,7 +53,15 @@ def third_tab_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
     validate_materialized_rows(rows)
     output = [THIRD_TAB_COLUMNS]
     for row in sorted(rows, key=lambda item: (int(str(item["project_id"])) if str(item["project_id"]).isdigit() else str(item["project_id"]))):
-        line: list[Any] = [row.get("project_id", ""), row.get("project_name", ""), row.get("client", ""), row.get("primary_manager", row.get("manager", "")), row.get("project_visit_count", 0)]
+        # Values API reads absent text as an empty cell. Serialize absent
+        # project dimensions as that same explicit blank so readback remains
+        # exact without broadening the comparison contract.
+        project_name = row.get("project_name")
+        client = row.get("client")
+        manager = row.get("primary_manager", row.get("manager"))
+        line: list[Any] = [row.get("project_id", ""), project_name if project_name is not None else "",
+                           client if client is not None else "", manager if manager is not None else "",
+                           row.get("project_visit_count", 0)]
         line += [row.get(f"workflow_state_{code}_visits", 0) for code in WORKFLOW_STATES]
         line += [row.get("assigned_visits", 0), row.get("executed_visits_customer", 0), row.get("finished_visits", 0)]
         line += [row.get("workflow_covered_visits", 0), row.get("workflow_unclassified_visits", 0), row.get("workflow_multi_match_visits", 0)]
@@ -108,4 +116,3 @@ def validate_readback(actual: list[list[Any]], expected: list[list[Any]]) -> dic
     if len(ids) != len(set(ids)):
         raise ValueError("publication readback contains duplicate project_id")
     return {"status": "PASS", "rows": len(ids), "columns": len(actual[0])}
-

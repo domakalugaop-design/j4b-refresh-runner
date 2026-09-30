@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
+import tempfile
 import time
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from urllib.error import HTTPError
 
@@ -603,12 +606,140 @@ def _stage(name: str) -> None:
     print(name, flush=True)
 
 
+def _encode_private_backup(value: Any) -> Any:
+    """JSON-safe, type-preserving encoding for private prepublication backups."""
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError("non-finite Decimal in private refresh backup")
+        return {"__decimal__": format(value, "f")}
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("non-finite float in private refresh backup")
+        return value
+    if isinstance(value, dict):
+        return {str(key): _encode_private_backup(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encode_private_backup(item) for item in value]
+    if value is None or isinstance(value, (str, int, bool)):
+        return value
+    raise TypeError(f"unsupported private refresh backup value: {type(value).__name__}")
+
+
+def _persist_prepublication_backup(
+    sid: str,
+    run_id: str,
+    previous_raw: list[list[Any]],
+    previous_state_rows: list[list[Any]],
+    workflow_backup: dict[str, Any] | None,
+    payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]] | None,
+    non_target_fingerprints: dict[str, str],
+) -> dict[str, Any]:
+    """Persist all target-tab baselines outside Git before the first Sheet write."""
+    sheets: dict[str, list[list[Any]]] = {
+        "projects_current": previous_raw,
+        "project_types": previous_state_rows,
+    }
+    metadata: dict[str, Any] = {}
+    if workflow_backup is not None:
+        backup_payload = workflow_backup.get("payload", {})
+        sheets.update(backup_payload.get("sheets", {}))
+        metadata.update(backup_payload.get("metadata", {}))
+    metadata["non_target_fingerprints"] = non_target_fingerprints
+    if payment_publication is not None:
+        payment_previous = payment_publication[0]
+        sheets.update(payment_previous)
+    payload = {"version": 1, "run_id": run_id, "spreadsheet_id": sid,
+               "created_at": now(), "sheets": sheets, "metadata": metadata}
+
+    forbidden = ("password", "token", "secret", "authorization", "cookie", "session", "api_key")
+    def reject_secret_keys(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if any(part in str(key).casefold() for part in forbidden):
+                    raise ValueError("secret-like field rejected from private refresh backup")
+                reject_secret_keys(child)
+        elif isinstance(value, list):
+            for child in value:
+                reject_secret_keys(child)
+    reject_secret_keys(payload)
+
+    target_dir = tempfile.mkdtemp(prefix="j4b-production-private-backup-")
+    os.chmod(target_dir, 0o700)
+    target = os.path.join(target_dir, f"{run_id}.json")
+    encoded = json.dumps(_encode_private_backup(payload), ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    descriptor = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(target, 0o600)
+    with open(target, "rb") as handle:
+        restored = handle.read()
+    if restored != encoded:
+        raise RuntimeError("private prepublication backup integrity mismatch")
+    required = {"projects_current", "project_types"}
+    if workflow_backup is not None:
+        required.add(THIRD_TAB_NAME)
+    if payment_publication is not None:
+        required.update({PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB})
+    if not required.issubset(sheets):
+        raise RuntimeError("private prepublication backup is missing a target tab")
+    return {"path": target, "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(),
+            "tabs": sorted(required)}
+
+
+def _fingerprint_non_target_tabs(token: str, sid: str, target_tabs: set[str]) -> dict[str, str]:
+    """Hash values and structural metadata for every non-target worksheet."""
+    meta = api(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,index,hidden,gridProperties(rowCount,columnCount,frozenRowCount))",
+        token,
+    )
+    sheets = [item.get("properties", {}) for item in meta.get("sheets", [])]
+    fingerprints: dict[str, str] = {}
+    for props in sheets:
+        title = props.get("title")
+        if not isinstance(title, str) or title in target_tabs:
+            continue
+        width = props.get("gridProperties", {}).get("columnCount")
+        if not isinstance(width, int) or width < 1:
+            raise RuntimeError("non-target worksheet column metadata unavailable")
+        escaped_title = title.replace("'", "''")
+        encoded = urllib.parse.quote(f"'{escaped_title}'!A:{col(width - 1)}", safe="!:'")
+        values = api_get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE",
+            token,
+        ).get("values", [])
+        canonical = json.dumps({"properties": props, "values": values}, ensure_ascii=False,
+                               sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        fingerprints[title] = hashlib.sha256(canonical).hexdigest()
+    return fingerprints
+
+
+def _fingerprint_summary(fingerprints: dict[str, str]) -> str:
+    canonical = json.dumps(fingerprints, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _assert_prepublication_baseline_unchanged(
+    token: str,
+    sid: str,
+    previous_raw: list[list[Any]],
+    previous_state_rows: list[list[Any]],
+) -> None:
+    """Fail closed if core or Project Type state changed during acquisition."""
+    source_columns = list(previous_raw[0]) if previous_raw else []
+    if not source_columns or read_sheet(token, sid, columns=source_columns) != previous_raw:
+        raise RuntimeError("prepublication projects_current baseline changed during acquisition")
+    if read_project_type_state_rows(token, sid) != previous_state_rows:
+        raise RuntimeError("prepublication project_types baseline changed during acquisition")
+
+
 def _require_complete_operational_acquisition(projects: list[dict[str, Any]]) -> None:
     failed = [p for p in projects if p.get("acquisition_state") in {"FAILED", "SEMANTIC_FAILURE"}]
     if failed:
-        failure_ids = ",".join(str(p.get("project_id", "")) for p in failed)
         raise RuntimeError(
-            f"operational acquisition acceptance failed: {len(failed)} selected projects incomplete: {failure_ids}"
+            f"operational acquisition acceptance failed: {len(failed)} selected projects incomplete"
         )
 
 
@@ -704,7 +835,6 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     rows = materialize(projects, visits, timestamp)
     merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp, columns=columns)
     validate_materialized_rows(merged)
-    backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, meta)
     apply_canonical_project_names(merged, universe)
     applicable = project_type_applicable_ids(universe)
     materialize_project_types(merged, state, applicable)
@@ -731,6 +861,19 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
     _stage("CANDIDATE_VALIDATION_PASS")
     _require_production_gate()
+    backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, meta) if workflow_enabled else None
+    _assert_prepublication_baseline_unchanged(token, sid, previous_raw, previous_state_rows)
+    target_tabs = {"projects_current", "project_types"}
+    if workflow_enabled:
+        target_tabs.add(THIRD_TAB_NAME)
+    if payment_publication is not None:
+        target_tabs.update({PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB})
+    non_target_before = _fingerprint_non_target_tabs(token, sid, target_tabs)
+    private_backup = _persist_prepublication_backup(
+        sid, str(checkpoint.get("run_id") or "replay"), previous_raw, previous_state_rows,
+        backup, payment_publication, non_target_before,
+    )
+    _stage(f"PRIVATE_PREPUBLICATION_BACKUP_PASS | bytes={private_backup['bytes']} | sha256={private_backup['sha256']}")
     _stage("WRITE_AUTHORIZATION_PASS")
     try:
         _stage("MIGRATION_START")
@@ -753,6 +896,10 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
                 grid_row_counts=payment_grid_rows,
             )
             _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
+        non_target_after = _fingerprint_non_target_tabs(token, sid, target_tabs)
+        if non_target_after != non_target_before:
+            raise RuntimeError("non-target worksheet fingerprint changed during unified refresh")
+        _stage(f"NON_TARGET_TABS_FINGERPRINT_PASS | tabs={len(non_target_after)} | sha256={_fingerprint_summary(non_target_after)}")
         _stage("PUBLISH_PASS")
     except Exception:
         _rollback_full_refresh(
@@ -772,6 +919,8 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         "CORE_PROJECTS": len(universe), "CORE_FINAL_ROWS": candidate_summary["rows"],
         "WORKFLOW_PROJECTS_REFRESHED": len(selected), "WORKFLOW_FINAL_ROWS": len(third_tab_rows(merged)) - 1,
         "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
+        "PREPUBLICATION_BACKUP": private_backup,
+        "NON_TARGET_TABS_UNCHANGED": len(non_target_before),
         "SERVICE_INFORMATION_REFRESH_TIMESTAMP": now(),
         "FINAL_ROWS": candidate_summary["rows"],
         "FINAL_UNIQUE_IDS": candidate_summary["unique"], "FINAL_DUPLICATES": candidate_summary["duplicates"],
@@ -963,7 +1112,6 @@ def run() -> dict[str, Any]:
         workflow_backup: dict[str, Any] | None = None
         if workflow_enabled:
             validate_materialized_rows(merged)
-            workflow_backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, destination_meta)
         if project_type_enabled:
             apply_canonical_project_names(merged, universe)
             applicable_ids = project_type_applicable_ids(universe)
@@ -1009,6 +1157,20 @@ def run() -> dict[str, Any]:
         # bootstrap validation, and diff planning above are read-only.
         if project_type_enabled:
             _require_production_gate()
+            if workflow_enabled:
+                workflow_backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, destination_meta)
+            _assert_prepublication_baseline_unchanged(token, sid, previous_raw, previous_state_rows)
+            target_tabs = {"projects_current", "project_types"}
+            if workflow_enabled:
+                target_tabs.add(THIRD_TAB_NAME)
+            if payment_publication is not None:
+                target_tabs.update({PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB})
+            non_target_before = _fingerprint_non_target_tabs(token, sid, target_tabs)
+            private_backup = _persist_prepublication_backup(
+                sid, run_id, previous_raw, previous_state_rows, workflow_backup, payment_publication,
+                non_target_before,
+            )
+            _stage(f"PRIVATE_PREPUBLICATION_BACKUP_PASS | bytes={private_backup['bytes']} | sha256={private_backup['sha256']}")
             _stage("WRITE_AUTHORIZATION_PASS")
             _stage("MIGRATION_START")
             try:
@@ -1032,6 +1194,10 @@ def run() -> dict[str, Any]:
                         grid_row_counts=payment_grid_rows,
                     )
                     _stage(f"PAYMENT_PUBLICATION_{payment_result['status']} | tabs=2 | readback=PASS")
+                non_target_after = _fingerprint_non_target_tabs(token, sid, target_tabs)
+                if non_target_after != non_target_before:
+                    raise RuntimeError("non-target worksheet fingerprint changed during unified refresh")
+                _stage(f"NON_TARGET_TABS_FINGERPRINT_PASS | tabs={len(non_target_after)} | sha256={_fingerprint_summary(non_target_after)}")
                 _stage("PUBLISH_PASS")
             except Exception:
                 _rollback_full_refresh(
@@ -1082,6 +1248,8 @@ def run() -> dict[str, Any]:
             "WORKFLOW_PROJECTS_REFRESHED": len(selected) if workflow_enabled else 0,
             "WORKFLOW_FINAL_ROWS": len(third_tab_rows(merged)) - 1 if workflow_enabled else 0,
             "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
+            "PREPUBLICATION_BACKUP": private_backup if project_type_enabled else None,
+            "NON_TARGET_TABS_UNCHANGED": len(non_target_before) if project_type_enabled else None,
             "SUCCESS_COUNT": len(projects) - failed - semantic_failed,
             "FAILED_COUNT": failed,
             "SEMANTIC_FAILURE_COUNT": semantic_failed,
@@ -1119,9 +1287,6 @@ def run() -> dict[str, Any]:
             "TYPE_DETAIL_GET_ADDITIONAL": type_telemetry.detail_get_additional if type_telemetry else 0,
             "PROJECT_TYPE_REQUEST_FAILURES": type_telemetry.request_failures if type_telemetry else 0,
             "PROJECT_TYPES_STATE_ROWS": max(len(state), 0) if project_type_enabled else 0,
-            "PROJECT_TYPE_PENDING_BEFORE_IDS": sorted(type_telemetry.pending_ids, key=int) if type_telemetry else [],
-            "PROJECT_TYPE_PENDING_AFTER_IDS": sorted(applicable_ids - set(state), key=int) if project_type_enabled else [],
-            "PROJECT_TYPE_APPLICABLE_IDS": sorted(applicable_ids, key=int) if project_type_enabled else [],
             "PAYMENT_REFRESH_ENABLED": payment_enabled,
             "PAYMENT_PUBLICATION": bool(payment_publication),
             "FINAL_MASTER_UNIQUE_IDS": candidate_summary["unique"],
@@ -1139,19 +1304,12 @@ def main() -> int:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True), flush=True)
         return 0
     except HTTPError as exc:
-        try:
-            response_body = exc.read().decode("utf-8", errors="replace")[:4000]
-        except Exception:
-            response_body = "<unavailable>"
         print(
             json.dumps(
                 {
                     "FINAL_STATUS": "FAILED",
                     "ERROR_TYPE": type(exc).__name__,
-                    "ERROR_MESSAGE": str(exc),
                     "HTTP_STATUS": exc.code,
-                    "HTTP_REASON": exc.reason,
-                    "HTTP_RESPONSE_BODY": response_body,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -1162,7 +1320,7 @@ def main() -> int:
     except Exception as exc:
         print(
             json.dumps(
-                {"FINAL_STATUS": "FAILED", "ERROR_TYPE": type(exc).__name__, "ERROR_MESSAGE": str(exc)},
+                {"FINAL_STATUS": "FAILED", "ERROR_TYPE": type(exc).__name__},
                 ensure_ascii=False,
                 sort_keys=True,
             ),

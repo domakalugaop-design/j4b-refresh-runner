@@ -43,6 +43,16 @@ def test_third_tab_is_one_row_per_project_and_deterministically_sorted():
     assert len(rows) == 3
 
 
+def test_missing_project_dimensions_are_written_as_explicit_blanks_for_exact_readback():
+    rendered = third_tab_rows([materialized("1", project_name=None, client=None, primary_manager=None)])
+    assert rendered[1][1:4] == ["", "", ""]
+    assert validate_readback(rendered, rendered)["status"] == "PASS"
+    mismatched = [list(rendered[0]), list(rendered[1])]
+    mismatched[1][2] = None
+    with pytest.raises(ValueError, match="readback mismatch"):
+        validate_readback(mismatched, rendered)
+
+
 def test_duplicate_project_ids_are_rejected():
     with pytest.raises(ValueError, match="duplicate project_id"):
         third_tab_rows([materialized("1"), materialized("1")])

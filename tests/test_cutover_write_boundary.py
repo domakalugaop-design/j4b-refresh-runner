@@ -101,6 +101,53 @@ def test_dry_run_api_guard_blocks_google_sheets_mutation(monkeypatch):
     urlopen.assert_not_called()
 
 
+def test_prepublication_backup_is_private_integrity_checked_and_covers_all_target_tabs(tmp_path):
+    from decimal import Decimal
+
+    backup_dir = tmp_path / "private"
+    def make_backup_dir(prefix):
+        backup_dir.mkdir(mode=0o700)
+        return str(backup_dir)
+
+    workflow = {
+        "payload": {
+            "sheets": {
+                "Статусы проектов": [["project_id"], ["8110"]],
+                "projects_current": [["project_id"], ["8110"]],
+                "project_types": [STATE_COLUMNS, ["8110", "0005", PROJECT_TYPE_DICTIONARY["0005"]]],
+            },
+            "metadata": {"projects_current_width": 1},
+        }
+    }
+    payments = {
+        production.PAYMENT_VISIT_TAB: [["project_id", "amount"], ["8110", Decimal("1.25")]],
+        production.PAYMENT_PROJECT_TAB: [["project_id", "amount"], ["8110", Decimal("1.25")]],
+    }
+    with patch("src.production.tempfile.mkdtemp", side_effect=make_backup_dir):
+        saved = production._persist_prepublication_backup(
+            "spreadsheet", "run-1", [["project_id"], ["8110"]],
+            workflow["payload"]["sheets"]["project_types"],
+            workflow, (payments, {}, {}, {}), {},
+        )
+    backup_path = Path(saved["path"])
+    assert saved["tabs"] == sorted({"projects_current", "project_types", "Статусы проектов",
+                                   production.PAYMENT_VISIT_TAB, production.PAYMENT_PROJECT_TAB})
+    assert backup_dir.stat().st_mode & 0o777 == 0o700
+    assert backup_path.stat().st_mode & 0o777 == 0o600
+    content = backup_path.read_bytes()
+    assert hashlib.sha256(content).hexdigest() == saved["sha256"]
+    payload = json.loads(content)
+    assert payload["sheets"][production.PAYMENT_VISIT_TAB][1][1] == {"__decimal__": "1.25"}
+
+
+def test_prepublication_baseline_guard_fails_closed_on_external_change():
+    previous = [["project_id"], ["8110"]]
+    with patch("src.production.read_sheet", return_value=[["project_id"], ["9000"]]), \
+         patch("src.production.read_project_type_state_rows", return_value=[]):
+        with pytest.raises(RuntimeError, match="projects_current baseline changed"):
+            production._assert_prepublication_baseline_unchanged("token", "sheet", previous, [])
+
+
 def test_dry_run_api_guard_allows_google_sheets_reads(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "true")
     with patch("src.refresh.urllib.request.urlopen") as urlopen:

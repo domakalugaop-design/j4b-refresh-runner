@@ -31,6 +31,19 @@ def test_regular_selector_counts_new_current_previous_union_and_deduplicates():
     assert [item["project_id"] for item in selected] == ["1", "2", "3", "4", "5"]
 
 
+def test_regular_selector_checks_all_period_markers_and_deduplicates_union():
+    previous = [COLUMNS, ["1", "Old_0726_then_0926"] + [""] * 31,
+                ["2", "Contains_0926_and_0826"] + [""] * 31]
+    catalogue = [
+        {"project_id": "1", "project_name": "Old_0726_then_0926"},
+        {"project_id": "2", "project_name": "Contains_0926_and_0826"},
+    ]
+    counts = regular_scope_counts(catalogue, previous, today=date(2026, 9, 30))
+    selected = select_scope(catalogue, previous, today=date(2026, 9, 30))
+    assert counts == {"new": 0, "current_month": 2, "previous_month": 1, "union": 2}
+    assert [row["project_id"] for row in selected] == ["1", "2"]
+
+
 def test_plan_zero_is_real_zero():
     projects = [{"project_id": "1", "planned_visit_count": {"value": 0}, "acquisition_state": "ACQUIRED"}]
     row = materialize(projects, [], "2026-09-04T10:00:00+00:00")[0]

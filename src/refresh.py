@@ -26,6 +26,7 @@ PROJECT_TYPE_COLUMNS = BASE_COLUMNS + ["project_type_code", "project_type_name"]
 # The normal runner contract is the production schema. BASE_COLUMNS remains
 # explicit for validating and upgrading legacy 31-column baselines.
 COLUMNS = PROJECT_TYPE_COLUMNS
+PERIOD_MARKER_RE = re.compile(r"(?:^|[^0-9])(0[1-9]|1[0-2])(\d{2})(?!\d)")
 UNMAPPED_PRESERVE_COLUMNS = [
     "period", "unassigned", "has_period_marker", "project_start", "project_end", "elapsed_pct", "lag",
     "project_type_code", "project_type_name",
@@ -134,8 +135,8 @@ def select_scope(catalogue: list[dict[str, Any]], current_rows: list[list[Any]],
         pid = str(item["project_id"])
         old = baseline.get(pid)
         name = str(old[1] if old and len(old) > 1 else item.get("project_name") or "")
-        marker = re.search(r"(?:^|[^0-9])(0[1-9]|1[0-2])(\d{2})(?!\d)", name)
-        active = bool(marker and marker.group(1) + marker.group(2) in {cur, prev})
+        markers = {match.group(1) + match.group(2) for match in PERIOD_MARKER_RE.finditer(name)}
+        active = bool(markers & {cur, prev})
         if pid in new_ids or active:
             selected[pid] = dict(item)
     return sorted(selected.values(), key=lambda row: int(row["project_id"]))
@@ -156,11 +157,10 @@ def regular_scope_counts(catalogue: list[dict[str, Any]], current_rows: list[lis
         pid = str(item["project_id"])
         old = baseline.get(pid)
         name = str(old[1] if old and len(old) > 1 else item.get("project_name") or "")
-        marker = re.search(r"(?:^|[^0-9])(0[1-9]|1[0-2])(\d{2})(?!\d)", name)
-        value = marker.group(1) + marker.group(2) if marker else None
-        if value == current_marker:
+        markers = {match.group(1) + match.group(2) for match in PERIOD_MARKER_RE.finditer(name)}
+        if current_marker in markers:
             current_ids.add(pid)
-        elif value == previous_marker:
+        if previous_marker in markers:
             previous_ids.add(pid)
     return {
         "new": len(new_ids),
