@@ -85,7 +85,13 @@ class PaymentMaterializationTests(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["max_assignments_per_visit"], 3)
         self.assertEqual(result["diagnostics"]["negative_payment_rows"], 1)
         self.assertEqual(result["diagnostics"]["zero_payment_rows"], 1)
-        self.assertEqual(result["invariants"], {key: True for key in "ABCDEFGHI"})
+        self.assertEqual(
+            result["invariants"],
+            {key: True for key in (
+                "A", "B", "C", "D1_PROJECT_COMPLETENESS", "D2_VISIT_PROVENANCE",
+                "D2_RECONCILIATION", "E", "F", "G", "H", "I",
+            )},
+        )
 
     def test_conflicting_visit_rewards_are_flagged_not_arbitrarily_selected(self):
         result = materialize(
@@ -123,13 +129,51 @@ class PaymentMaterializationTests(unittest.TestCase):
         self.assertEqual(result["assignment_rows"][1]["payment_numeric_status"], "REVIEW")
         self.assertIsNone(result["project_payment_aggregate"][0]["total_portal_paid"])
 
-    def test_unmatched_assignment_is_retained_and_invariant_reports_gap(self):
-        result = materialize([payment(1)], [])
-        self.assertEqual(len(result["assignment_rows"]), 1)
-        self.assertEqual(result["assignment_rows"][0]["payment_join_status"], "PAYMENT_ONLY")
-        self.assertEqual(result["diagnostics"]["unmatched_assignments"], 1)
-        self.assertFalse(result["invariants"]["D"])
-        self.assertTrue(result["invariants"]["A"])
+    def test_unmapped_assignment_stays_in_project_aggregate_not_visit_aggregate(self):
+        result = materialize(
+            [payment(1, paid="250"), payment(2, paid="125")],
+            [workflow(1, 101, 50)],
+        )
+        project = result["project_payment_aggregate"][0]
+        self.assertEqual(len(result["assignment_rows"]), 2)
+        self.assertEqual(project["payment_assignment_count"], 2)
+        self.assertEqual(project["total_portal_paid"], Decimal("375"))
+        self.assertEqual(project["payment_rows_unmatched"], 1)
+        self.assertEqual(project["payment_data_status"], "INCOMPLETE")
+        self.assertEqual(len(result["visit_payment_aggregate"]), 1)
+        self.assertEqual(result["visit_payment_aggregate"][0]["payment_assignment_count"], 1)
+        self.assertEqual(result["diagnostics"]["visit_mapped_assignments"], 1)
+        self.assertEqual(result["diagnostics"]["unmatched_visit_mapping_assignments"], 1)
+        self.assertTrue(result["invariants"]["D1_PROJECT_COMPLETENESS"])
+        self.assertTrue(result["invariants"]["D2_VISIT_PROVENANCE"])
+        self.assertTrue(result["invariants"]["D2_RECONCILIATION"])
+
+    def test_zero_mapped_project_remains_a_project_row_without_synthetic_visit(self):
+        result = materialize([payment(1), payment(2)], [])
+        self.assertEqual(len(result["assignment_rows"]), 2)
+        self.assertEqual(result["visit_payment_aggregate"], [])
+        self.assertEqual(len(result["project_payment_aggregate"]), 1)
+        project = result["project_payment_aggregate"][0]
+        self.assertEqual(project["payment_assignment_count"], 2)
+        self.assertEqual(project["payment_rows_unmatched"], 2)
+        self.assertEqual(project["payment_data_status"], "INCOMPLETE")
+        self.assertEqual(result["diagnostics"]["visit_mapped_assignments"], 0)
+        self.assertEqual(result["diagnostics"]["unmatched_visit_mapping_assignments"], 2)
+        self.assertTrue(result["invariants"]["D1_PROJECT_COMPLETENESS"])
+        self.assertTrue(result["invariants"]["D2_VISIT_PROVENANCE"])
+        self.assertTrue(result["invariants"]["D2_RECONCILIATION"])
+
+    def test_matched_action_without_visit_id_is_unmapped_for_visit_provenance(self):
+        workflow_without_visit = {"project_id": "900", "action_id": "1", "visit_id": None,
+                                  "workflow_state_code": 50}
+        result = materialize([payment(1)], [workflow_without_visit])
+        self.assertEqual(result["assignment_rows"][0]["payment_join_status"], "MATCHED")
+        self.assertEqual(result["visit_payment_aggregate"], [])
+        project = result["project_payment_aggregate"][0]
+        self.assertEqual(project["payment_rows_unmatched"], 1)
+        self.assertEqual(project["payment_data_status"], "INCOMPLETE")
+        self.assertEqual(result["diagnostics"]["unmatched_visit_mapping_assignments"], 1)
+        self.assertTrue(result["invariants"]["D2_RECONCILIATION"])
 
     def test_duplicate_key_and_my_id_multi_visit_conflicts_fail_acceptance(self):
         duplicate = materialize([payment(1), payment(1)], [workflow(1, 101, 50)])

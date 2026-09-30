@@ -118,8 +118,11 @@ def materialize_payment_data(
     """Build assignment, visit, and project layers for one project.
 
     Source payment rows are preserved one-for-one, including duplicate or
-    unmatched keys. Duplicates/conflicts are diagnostics and fail invariants;
-    they are never silently dropped.
+    unmatched keys. Every assignment contributes to its project aggregate.
+    Only assignments with a qualified, nonblank visit mapping contribute to
+    visit aggregates; unmapped rows remain visible in project diagnostics and
+    make project data status INCOMPLETE. Their relationship to visits is
+    unknown, not erroneous or payment-only.
     """
     pid = str(project_id)
     payments = [dict(row) for row in payment_rows]
@@ -176,7 +179,11 @@ def materialize_payment_data(
 
     review_rows = sum(row["payment_numeric_status"] == "REVIEW" for row in assignments)
     incomplete_rows = sum(row["payment_numeric_status"] == "INCOMPLETE" for row in assignments)
-    unmatched_rows = sum(row["payment_join_status"] != "MATCHED" for row in assignments)
+    visit_mapped_rows = [
+        row for row in assignments
+        if row["payment_join_status"] == "MATCHED" and row.get("visit_id") not in (None, "")
+    ]
+    unmatched_rows = len(assignments) - len(visit_mapped_rows)
     paid_decimals = [row.get("portal_paid_amount") for row in assignments]
     valid_paid = [value for value in paid_decimals if isinstance(value, Decimal)]
     visit_rewards = [row["visit_reward"] for row in visit_rows if isinstance(row["visit_reward"], Decimal) and not row["visit_reward_conflict"]]
@@ -206,6 +213,8 @@ def materialize_payment_data(
         "assignment_rows": len(assignments),
         "matched_assignments": sum(row["payment_join_status"] == "MATCHED" for row in assignments),
         "unmatched_assignments": unmatched_rows,
+        "visit_mapped_assignments": len(visit_mapped_rows),
+        "unmatched_visit_mapping_assignments": unmatched_rows,
         "workflow_only_relevant": joined["workflow_only_count"],
         "unique_my_ids": len({row["my_id"] for row in assignments if row.get("my_id") not in (None, "")}),
         "unique_visits": len(visit_rows),
@@ -240,11 +249,20 @@ def evaluate_invariants(
     source_payment_row_count: int,
 ) -> dict[str, bool]:
     matched = sum(row.get("payment_join_status") == "MATCHED" for row in assignments)
-    unmatched = sum(row.get("payment_join_status") != "MATCHED" for row in assignments)
+    unmatched = len(assignments) - matched
+    visit_mapped_assignments = [
+        row for row in assignments
+        if row.get("payment_join_status") == "MATCHED" and row.get("visit_id") not in (None, "")
+    ]
+    unmatched_visit_mapping_count = len(assignments) - len(visit_mapped_assignments)
     keys = [(str(row.get("project_id") or ""), str(row.get("my_id") or "")) for row in assignments]
     unique = len(set(keys))
     project_count = sum(int(row.get("payment_assignment_count", 0)) for row in projects)
     visit_count = sum(int(row.get("payment_assignment_count", 0)) for row in visits)
+    visit_by_id = Counter(str(row.get("visit_id") or "") for row in visit_mapped_assignments)
+    materialized_visit_by_id = {
+        str(row.get("visit_id") or ""): int(row.get("payment_assignment_count", 0)) for row in visits
+    }
     paid_values = [row.get("portal_paid_amount") for row in assignments if isinstance(row.get("portal_paid_amount"), Decimal)]
     expected_paid = _sum_decimals(paid_values)
     actual_paid = _sum_decimals(row.get("total_portal_paid") for row in projects)
@@ -261,7 +279,18 @@ def evaluate_invariants(
         "A": len(assignments) == matched + unmatched and len(assignments) == source_payment_row_count,
         "B": unique == len(assignments) and all(row.get("my_id") not in (None, "") for row in assignments),
         "C": project_count == len(assignments),
-        "D": visit_count == len(assignments),
+        "D1_PROJECT_COMPLETENESS": project_count == len(assignments) == source_payment_row_count,
+        "D2_VISIT_PROVENANCE": (
+            visit_count == len(visit_mapped_assignments)
+            and all(row.get("visit_id") not in (None, "") for row in visits)
+            and len(materialized_visit_by_id) == len(visits)
+            and materialized_visit_by_id == dict(visit_by_id)
+        ),
+        "D2_RECONCILIATION": (
+            len(assignments) == len(visit_mapped_assignments) + unmatched_visit_mapping_count
+            and int(diagnostics.get("visit_mapped_assignments", len(visit_mapped_assignments))) == len(visit_mapped_assignments)
+            and int(diagnostics.get("unmatched_visit_mapping_assignments", unmatched_visit_mapping_count)) == unmatched_visit_mapping_count
+        ),
         "E": actual_paid == expected_paid,
         "F": actual_reward == expected_reward,
         "G": len(assignments) == source_payment_row_count and unique == len(assignments),
