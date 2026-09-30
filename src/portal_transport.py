@@ -30,6 +30,7 @@ class PortalSession:
         self.auth_post_count = 0
         self.cookie_path: Path | None = None
         self.base_url = (base_url or _required("PORTAL_BASE_URL")).rstrip("/")
+        self.last_effective_url: str | None = None
         self.login_value = login if login is not None else _required("PORTAL_LOGIN")
         self.password_value = password if password is not None else _required("PORTAL_PASSWORD")
         self.curl = shutil.which("curl")
@@ -102,7 +103,7 @@ class PortalSession:
                 "--dump-header",
                 headers.name,
                 "--write-out",
-                "%{http_code}",
+                "%{http_code}\n%{url_effective}",
             ]
             if follow_redirects:
                 args.append("--location")
@@ -118,8 +119,10 @@ class PortalSession:
             args.append(self.base_url + path)
             result = subprocess.run(args, capture_output=True, text=True)
             self.requests += 1
-            status_text = result.stdout.strip()
+            output_lines = result.stdout.splitlines()
+            status_text = output_lines[0].strip() if output_lines else ""
             status = int(status_text[-3:]) if status_text[-3:].isdigit() else 0
+            self.last_effective_url = output_lines[1].strip() if len(output_lines) > 1 else None
             header_text = Path(headers.name).read_text(encoding="iso-8859-1", errors="replace")
             content_type = next(
                 (

@@ -4,6 +4,7 @@ import json
 import html
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 from .parsers import parse_action_table, parse_edit, parse_visit_table, plain_text
 from .workflow_analytics import WORKFLOW_STATE_CODES
@@ -44,7 +45,13 @@ class Reader:
         try:
             status, content_type, body = self.session.request(path, "GET", accept="text/html, application/json")
             state = "VALUE_PRESENT" if body else "SOURCE_RETURNED_EMPTY_BODY"
-            return {"state": state, "http_status": status, "content_type": content_type, "body": body}
+            return {
+                "state": state,
+                "http_status": status,
+                "content_type": content_type,
+                "body": body,
+                "effective_url": getattr(self.session, "last_effective_url", None),
+            }
         except Exception:
             self.failures += 1
             return {"state": "REQUEST_FAILED", "http_status": None, "content_type": None, "body": b""}
@@ -124,11 +131,13 @@ def _response_failure(name: str, response: dict[str, Any]) -> str | None:
 
 
 def _semantic_failures(
+    project_id: str,
     project: dict[str, Any],
     edit: dict[str, Any],
     action: dict[str, Any],
     edit_fields: dict[str, Any],
     canonical_name: Any,
+    portal_base_url: str,
 ) -> list[str]:
     """Fail closed when a 200 response does not satisfy the qualified page contract."""
     failures = [
@@ -139,10 +148,27 @@ def _semantic_failures(
     project_html = project.get("body", b"").decode("utf-8", "replace")
     edit_html = edit.get("body", b"").decode("utf-8", "replace")
     action_html = action.get("body", b"").decode("utf-8", "replace")
+
+    # project_id is the entity key. Reject a successful redirect to another
+    # project (or origin) before considering the edit-form name fallback.
+    base = urlsplit(portal_base_url)
+    for name, response, expected_path in (
+        ("project", project, f"/proj/{project_id}"),
+        ("edit", edit, f"/proj/{project_id}/edit"),
+    ):
+        if response.get("http_status") == 200 and response.get("body"):
+            effective_url = response.get("effective_url")
+            actual = urlsplit(effective_url) if effective_url else None
+            if (
+                actual is None
+                or actual.scheme != base.scheme
+                or actual.netloc != base.netloc
+                or actual.path.rstrip("/") != expected_path.rstrip("/")
+            ):
+                failures.append(f"{name}:IDENTITY_MISMATCH")
+
     if canonical_name in (None, ""):
         failures.append("universe:PROJECT_NAME_MISSING")
-    elif canonical_name not in plain_text(project_html):
-        failures.append("project:CANONICAL_NAME_NOT_PRESENT")
 
     expected_edit_fields = (
         "project_name", "date_from", "date_to", "planned_visit_count", "client",
@@ -155,9 +181,23 @@ def _semantic_failures(
         if not isinstance(field_data, dict) or field_data.get("state") == "FIELD_NOT_EXPOSED":
             failures.append(f"edit:FIELD_NOT_EXPOSED:{name}")
     edit_name = edit_fields.get("project_name", {}).get("value") if edit_fields else None
+    canonical_name_matches_edit = (
+        canonical_name not in (None, "")
+        and edit_name not in (None, "")
+        and html.unescape(str(edit_name)).strip() == str(canonical_name).strip()
+    )
+    canonical_name_on_project = (
+        canonical_name not in (None, "") and canonical_name in plain_text(project_html)
+    )
+    if not canonical_name_on_project:
+        project_is_html = "<html" in project_html.lower() or "<!doctype" in project_html.lower()
+        if not project_is_html:
+            failures.append("project:NOT_HTML_DOCUMENT")
+        elif not canonical_name_matches_edit:
+            failures.append("project:CANONICAL_NAME_NOT_PRESENT")
     if not edit_name:
         failures.append("edit:PROJECT_NAME_EMPTY")
-    elif canonical_name not in (None, "") and html.unescape(str(edit_name)).strip() != str(canonical_name).strip():
+    elif canonical_name not in (None, "") and not canonical_name_matches_edit:
         failures.append("edit:CANONICAL_NAME_MISMATCH")
     if edit_html and ("<html" not in edit_html.lower() and "<!doctype" not in edit_html.lower()):
         failures.append("edit:NOT_HTML_DOCUMENT")
@@ -197,11 +237,23 @@ def acquire_project(reader: Reader, spec: dict[str, Any], delay: float) -> tuple
         item["state"] == "REQUEST_FAILED" or item.get("http_status") != 200 or not item.get("body")
         for item in (project, edit, action)
     )
-    semantic_failures = _semantic_failures(project, edit, action, edit_fields, _text(spec.get("project_name")))
+    portal_base_url = getattr(reader.session, "base_url", "https://lk.j4b.ru").rstrip("/")
+    canonical_name = _text(spec.get("project_name"))
+    semantic_failures = _semantic_failures(
+        project_id, project, edit, action, edit_fields, canonical_name, portal_base_url
+    )
     acquisition_state = "FAILED" if failed else "SEMANTIC_FAILURE" if semantic_failures else "ACQUIRED"
+    edit_name = edit_fields.get("project_name", {}).get("value")
+    if not semantic_failures and canonical_name and canonical_name in plain_text(project_html):
+        identity_source = "project_page"
+    elif not semantic_failures and canonical_name and edit_name:
+        identity_source = "project_edit_fallback"
+    else:
+        identity_source = None
 
     record = {
         "project_id": project_id,
+        "project_identity_source": identity_source,
         "project_name": edit_fields.get("project_name") or field(spec.get("project_name"), "VALUE_PRESENT" if spec.get("project_name") else "FIELD_PRESENT_EMPTY", f"/proj/{project_id}/edit"),
         "date_from": edit_fields.get("date_from") or field(spec.get("date_from"), "FIELD_NOT_EXPOSED", f"/proj/{project_id}/edit"),
         "date_to": edit_fields.get("date_to") or field(spec.get("date_to"), "FIELD_NOT_EXPOSED", f"/proj/{project_id}/edit"),

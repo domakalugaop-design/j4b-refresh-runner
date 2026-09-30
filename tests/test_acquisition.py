@@ -9,9 +9,17 @@ def response(body, status=200, content_type="text/html; charset=utf-8"):
 class FakeSession:
     def __init__(self, responses):
         self.responses = iter(responses)
+        self.base_url = "https://lk.j4b.ru"
+        self.last_effective_url = None
 
     def request(self, path, method, data=None, accept=None):
-        return next(self.responses)
+        item = next(self.responses)
+        if len(item) == 4:
+            status, content_type, body, self.last_effective_url = item
+            return status, content_type, body
+        status, content_type, body = item
+        self.last_effective_url = self.base_url + path
+        return status, content_type, body
 
 
 def complete_edit(name="Project_Q3_0926", plan="4"):
@@ -62,6 +70,81 @@ def test_complete_acquisition_is_accepted_and_applies_fresh_operational_values()
     ])
     record, _visits = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": name}, 0)
     assert record["acquisition_state"] == "ACQUIRED"
+    assert record["project_identity_source"] == "project_page"
     assert record["planned_visit_count"]["value"] == 6
     rows = materialize([record], [], "2026-09-22T00:00:00+00:00")
     assert rows[0]["plan"] == 6
+
+
+def test_missing_project_page_name_uses_matching_edit_form_as_scoped_fallback():
+    name = "Project_Q3_0926"
+    session = FakeSession([
+        response("<!doctype html><html><body><a href='/visit/1'>Visit</a></body></html>"),
+        response(complete_edit(name=name)),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": name}, 0)
+    assert record["acquisition_state"] == "ACQUIRED"
+    assert record["project_identity_source"] == "project_edit_fallback"
+    assert record["acquisition_failure_reasons"] == []
+    assert record["project_id"] == "42"
+    assert record["project_name"]["value"] == name
+
+
+def test_missing_project_page_name_with_conflicting_edit_name_fails():
+    session = FakeSession([
+        response("<!doctype html><html><body>project</body></html>"),
+        response(complete_edit(name="Different_Project_0926")),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": "Expected_Project_0926"}, 0)
+    assert record["acquisition_state"] == "SEMANTIC_FAILURE"
+    assert "project:CANONICAL_NAME_NOT_PRESENT" in record["acquisition_failure_reasons"]
+    assert "edit:CANONICAL_NAME_MISMATCH" in record["acquisition_failure_reasons"]
+
+
+def test_missing_project_and_edit_names_fail():
+    session = FakeSession([
+        response("<!doctype html><html><body>project</body></html>"),
+        response(complete_edit(name="")),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": "Expected_Project_0926"}, 0)
+    assert record["acquisition_state"] == "SEMANTIC_FAILURE"
+    assert "project:CANONICAL_NAME_NOT_PRESENT" in record["acquisition_failure_reasons"]
+    assert "edit:PROJECT_NAME_EMPTY" in record["acquisition_failure_reasons"]
+
+
+def test_project_redirect_to_different_id_fails_even_if_name_matches():
+    name = "Project_Q3_0926"
+    session = FakeSession([
+        (*response(f"<!doctype html><html><body>{name}/visit/1</body></html>"), "https://lk.j4b.ru/proj/99"),
+        response(complete_edit(name=name)),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": name}, 0)
+    assert record["acquisition_state"] == "SEMANTIC_FAILURE"
+    assert "project:IDENTITY_MISMATCH" in record["acquisition_failure_reasons"]
+
+
+def test_missing_name_does_not_allow_malformed_project_or_edit_page():
+    session = FakeSession([
+        response("plain response with no canonical name"),
+        response("plain malformed edit response"),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": "Expected_Project_0926"}, 0)
+    assert record["acquisition_state"] == "SEMANTIC_FAILURE"
+    assert "project:NOT_HTML_DOCUMENT" in record["acquisition_failure_reasons"]
+    assert "edit:NOT_HTML_DOCUMENT" in record["acquisition_failure_reasons"]
+
+
+def test_transport_failure_remains_failed_with_identity_fallback_enabled():
+    name = "Project_Q3_0926"
+    session = FakeSession([
+        response("", status=503),
+        response(complete_edit(name=name)),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": name}, 0)
+    assert record["acquisition_state"] == "FAILED"
