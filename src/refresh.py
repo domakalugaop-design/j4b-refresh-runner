@@ -399,21 +399,25 @@ def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[lis
     target = next((s["properties"] for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == SHEET_NAME), None)
     if not target:
         raise RuntimeError("target worksheet not found")
-    rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{len(candidate)}"
+    # A logical replacement must clear the whole previous logical range too;
+    # otherwise rows beyond a shorter candidate survive as stale tail data.
+    logical_height = max(len(candidate), len(previous), 1)
+    rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{logical_height}"
+    candidate_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{max(len(candidate), 1)}"
     encoded = urllib.parse.quote(rng, safe="!:")
     previous_copy = previous
     try:
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
-        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": rng, "majorDimension": "ROWS", "values": candidate}]})
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": candidate_rng, "majorDimension": "ROWS", "values": candidate}]})
         date_cols = [columns.index("date_from"), columns.index("date_to"), columns.index("last_refreshed")]
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"repeatCell": {"range": {"sheetId": target["sheetId"], "startRowIndex": 1, "endRowIndex": len(candidate), "startColumnIndex": c, "endColumnIndex": c + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE_TIME" if c == date_cols[-1] else "DATE", "pattern": "yyyy-mm-dd hh:mm:ss" if c == date_cols[-1] else "yyyy-mm-dd"}}}, "fields": "userEnteredFormat.numberFormat"}} for c in date_cols]})
-        actual = read_sheet(token, sid, len(candidate) + 10, columns=columns)
+        actual = read_sheet(token, sid, logical_height + 10, columns=columns)
         normalized_actual = [_pad(row, columns) for row in actual]
         normalized_expected = [_pad(row, columns) for row in candidate]
         if summary(actual) != after or normalized_actual != normalized_expected:
             raise RuntimeError("projects_current full readback mismatch")
     except Exception:
-        restore_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{len(previous_copy)}"
+        restore_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{max(len(previous_copy), 1)}"
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(restore_rng, safe='!:')}:clear", token, {}, method="POST")
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": restore_rng, "majorDimension": "ROWS", "values": previous_copy}]})
         raise

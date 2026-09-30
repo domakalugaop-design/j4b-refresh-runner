@@ -431,6 +431,22 @@ def test_sheet_readback_money_is_normalized_to_decimal_and_ids_to_string():
     assert rows[1][5] == 1 and rows[1][9] == 1
 
 
+def test_payment_id_readback_accepts_integer_and_string_without_numeric_coercion():
+    headers = ["project_id", "visit_id", "amount"]
+    expected = [headers, [123, "00123", Decimal("5")]]
+    actual = [headers, ["123", "00123", Decimal("5")]]
+    matches, _ = _payment_readback_comparison("Выплаты по визитам", expected, actual)
+    assert matches
+
+
+def test_payment_id_leading_zero_is_not_equated_to_integer():
+    headers = ["project_id", "visit_id"]
+    expected = [headers, [123, "00123"]]
+    actual = [headers, [123, 123]]
+    matches, _ = _payment_readback_comparison("Выплаты по визитам", expected, actual)
+    assert not matches
+
+
 def test_readback_diagnostics_preserve_existing_equality_for_numeric_types():
     assert diagnose_payment_readback("t", [["metric"], [3]], [["metric"], [3]])["matches_existing_contract"]
     assert diagnose_payment_readback("t", [["metric"], [3]], [["metric"], [3.0]])["matches_existing_contract"]

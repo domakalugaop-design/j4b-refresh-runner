@@ -292,6 +292,41 @@ def _normalized_readback(rows: list[list[Any]]) -> list[list[Any]]:
     return [row[:next((i + 1 for i in range(len(row) - 1, -1, -1) if row[i] not in (None, "")), 0)] for row in result]
 
 
+def _canonical_payment_id(value: Any) -> Any:
+    """Compare technical IDs by their decimal identity, never as measures.
+
+    Google may return an ID as an int/float while the publisher emits text.
+    Text IDs are preserved verbatim so a meaningful leading zero is not lost.
+    """
+    if value in (None, "") or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return value
+    if isinstance(value, Decimal):
+        if value.is_finite() and value == value.to_integral_value():
+            return str(value.quantize(Decimal("1")))
+        return value
+    return value
+
+
+def _canonicalize_payment_ids(tab: str, rows: list[list[Any]], headers: list[Any] | tuple[Any, ...]) -> list[list[Any]]:
+    id_fields = {
+        "Выплаты по визитам": {"project_id", "visit_id"},
+        "Выплаты по проектам": {"project_id"},
+    }.get(tab, set())
+    indices = {index for index, field in enumerate(headers) if field in id_fields}
+    result = [list(row) for row in rows]
+    for row in result[1:] if rows and rows[0] == list(headers) else result:
+        for index in indices:
+            if index < len(row):
+                row[index] = _canonical_payment_id(row[index])
+    return result
+
+
 def _payment_readback_comparison(
     tab: str,
     expected: list[list[Any]],
@@ -303,6 +338,8 @@ def _payment_readback_comparison(
     expected_normalized = _normalized_readback(expected)
     actual_normalized = _normalized_readback(actual)
     header_row = headers if headers is not None else (expected[0] if expected else ())
+    expected_normalized = _canonicalize_payment_ids(tab, expected_normalized, header_row)
+    actual_normalized = _canonicalize_payment_ids(tab, actual_normalized, header_row)
     allowed_fields = NULLABLE_PAYMENT_MONEY_FIELDS.get(tab, set())
     allowed_indices = {index for index, field in enumerate(header_row) if field in allowed_fields}
     equivalences = 0

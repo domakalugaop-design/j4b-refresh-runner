@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -562,13 +563,21 @@ def _rollback_workflow_tab_body(
         if any(s.get("properties", {}).get("title") == THIRD_TAB_NAME for s in verified.get("sheets", [])):
             raise RuntimeError("workflow rollback tab-removal readback mismatch")
         return
+    if not previous or not previous[0]:
+        raise RuntimeError("workflow rollback backup has no header")
+    width = len(previous[0])
+    normalized_previous: list[list[Any]] = []
+    for row in previous:
+        if len(row) > width:
+            raise RuntimeError("workflow rollback backup row exceeds header width")
+        normalized_previous.append(list(row) + [""] * (width - len(row)))
     encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
     api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
-    end_column = col(len(previous[0]) - 1)
-    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:{end_column}{len(previous)}", "majorDimension": "ROWS", "values": previous}]})
+    end_column = col(width - 1)
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:{end_column}{len(normalized_previous)}", "majorDimension": "ROWS", "values": normalized_previous}]})
     on_readback_start()
     actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
-    _validate_workflow_readback(actual, previous)
+    _validate_workflow_readback(actual, normalized_previous)
 
 
 def _rollback_full_refresh(
@@ -706,6 +715,16 @@ def _encode_private_backup(value: Any) -> Any:
     raise TypeError(f"unsupported private refresh backup value: {type(value).__name__}")
 
 
+def _decode_private_backup(value: Any) -> Any:
+    if isinstance(value, dict):
+        if set(value) == {"__decimal__"}:
+            return Decimal(value["__decimal__"])
+        return {key: _decode_private_backup(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_private_backup(item) for item in value]
+    return value
+
+
 def _persist_prepublication_backup(
     sid: str,
     run_id: str,
@@ -744,7 +763,17 @@ def _persist_prepublication_backup(
                 reject_secret_keys(child)
     reject_secret_keys(payload)
 
-    target_dir = tempfile.mkdtemp(prefix="j4b-production-private-backup-")
+    configured_dir = os.environ.get("J4B_PERSISTENT_BACKUP_DIR", "").strip()
+    if os.environ.get("RUN_MODE", "").strip().lower() == "production" and not configured_dir:
+        raise RuntimeError("persistent prepublication backup path is not configured")
+    if configured_dir:
+        target_dir = os.path.abspath(os.path.expanduser(configured_dir))
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        if os.environ.get("RUN_MODE", "").strip().lower() == "production" and (os.path.realpath(target_dir) == temp_root or os.path.realpath(target_dir).startswith(temp_root + os.sep)):
+            raise RuntimeError("persistent prepublication backup path must not be under temporary storage")
+        os.makedirs(target_dir, mode=0o700, exist_ok=True)
+    else:
+        target_dir = tempfile.mkdtemp(prefix="j4b-production-private-backup-")
     os.chmod(target_dir, 0o700)
     target = os.path.join(target_dir, f"{run_id}.json")
     encoded = json.dumps(_encode_private_backup(payload), ensure_ascii=False, sort_keys=True,
@@ -768,6 +797,24 @@ def _persist_prepublication_backup(
         raise RuntimeError("private prepublication backup is missing a target tab")
     return {"path": target, "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(),
             "tabs": sorted(required)}
+
+
+def load_private_prepublication_backup(path: str | os.PathLike[str], expected_sha256: str | None = None) -> dict[str, Any]:
+    """Load and integrity-check a private persistent pre-publication backup."""
+    target = os.path.abspath(os.path.expanduser(os.fspath(path)))
+    mode = os.stat(target).st_mode
+    if mode & 0o077:
+        raise ValueError("private prepublication backup permissions must be 0600")
+    encoded = open(target, "rb").read()
+    digest = hashlib.sha256(encoded).hexdigest()
+    if expected_sha256 and not hmac.compare_digest(digest, expected_sha256):
+        raise ValueError("private prepublication backup hash mismatch")
+    payload = _decode_private_backup(json.loads(encoded))
+    if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("sheets"), dict):
+        raise ValueError("invalid private prepublication backup")
+    if payload.get("spreadsheet_id") in (None, ""):
+        raise ValueError("private prepublication backup missing spreadsheet identity")
+    return payload
 
 
 def _fingerprint_non_target_tabs(token: str, sid: str, target_tabs: set[str]) -> dict[str, str]:

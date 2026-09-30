@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import stat
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -138,6 +139,38 @@ def test_prepublication_backup_is_private_integrity_checked_and_covers_all_targe
     assert hashlib.sha256(content).hexdigest() == saved["sha256"]
     payload = json.loads(content)
     assert payload["sheets"][production.PAYMENT_VISIT_TAB][1][1] == {"__decimal__": "1.25"}
+
+
+def test_persistent_prepublication_backup_round_trips_and_rejects_temporary_path(tmp_path, monkeypatch):
+    target_dir = tmp_path / "persistent"
+    monkeypatch.setenv("RUN_MODE", "test")
+    monkeypatch.setenv("J4B_PERSISTENT_BACKUP_DIR", str(target_dir))
+    saved = production._persist_prepublication_backup(
+        "spreadsheet", "run-2", [["project_id"], ["8110"]],
+        [STATE_COLUMNS, ["8110", "0005", PROJECT_TYPE_DICTIONARY["0005"]]],
+        None, None, {},
+    )
+    restored = production.load_private_prepublication_backup(saved["path"], saved["sha256"])
+    assert restored["spreadsheet_id"] == "spreadsheet"
+    assert restored["sheets"]["projects_current"][1] == ["8110"]
+    with pytest.raises(RuntimeError, match="must not be under temporary storage"):
+        monkeypatch.setenv("RUN_MODE", "production")
+        monkeypatch.setenv("J4B_PERSISTENT_BACKUP_DIR", tempfile.gettempdir())
+        production._persist_prepublication_backup("sheet", "run-3", [["h"]], [], None, None, {})
+
+
+def test_workflow_rollback_normalizes_short_backup_rows(monkeypatch):
+    backup = {"payload": {"sheets": {production.THIRD_TAB_NAME: [["id", "name"], ["8110"]]}}}
+    calls = []
+    def fake_api(url, token, body=None, method=None):
+        calls.append((url, body, method))
+        if "values/" in url and method is None:
+            return {"values": [["id", "name"], ["8110"]]}
+        return {}
+    monkeypatch.setattr(production, "api", fake_api)
+    production._rollback_workflow_tab_body("token", "sheet", backup, on_readback_start=lambda: None)
+    writes = [body for _url, body, _method in calls if isinstance(body, dict) and "data" in body]
+    assert writes and writes[-1]["data"][0]["values"] == [["id", "name"], ["8110", ""]]
 
 
 def test_prepublication_baseline_guard_fails_closed_on_external_change():
