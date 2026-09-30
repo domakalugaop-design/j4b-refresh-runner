@@ -13,7 +13,9 @@ The repository must not become a storage location for corporate data, credential
 Target execution model:
 
 ```text
-GitHub Actions scheduled job
+Cloudflare Cron Trigger
+        ↓
+Cloudflare production dispatcher → GitHub workflow_dispatch
         ↓
 read-only source acquisition
         ↓
@@ -25,6 +27,21 @@ post-publication validation
 ```
 
 The design principle is deliberately simple: **one runner, one process, one end-to-end job**. Do not reproduce Google Apps Script continuation-trigger orchestration unless a concrete runtime constraint makes it unavoidable.
+
+## Production scheduling
+
+Cloudflare Cron Triggers are the sole automatic scheduler for production. The
+Cloudflare dispatcher invokes this workflow through `workflow_dispatch`; this
+workflow intentionally has no `on.schedule` entries. The deployed Cloudflare
+triggers are `0 4 * * *` and `0 13 * * *` UTC, corresponding to 07:00 and
+16:00 Europe/Moscow (UTC+3). Do not add a GitHub Actions schedule here, because
+that would create a second scheduler. The dispatcher's active-run check and
+this workflow's concurrency group are defense-in-depth, not a substitute for
+having only one scheduler.
+
+An accepted workflow dispatch is not proof that the refresh completed or that
+published data passed readback; use the resulting Actions run and its
+publication/readback checks for completion evidence.
 
 ## Security boundary
 
