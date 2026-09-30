@@ -412,6 +412,21 @@ def publish_payment_pair(
     ambiguous_write_response = False
     current_grid_rows = dict(grid_row_counts or {})
 
+    def restore_grid_rows() -> None:
+        """Remove only row capacity added by this publication after data rollback."""
+        requests = []
+        for tab, baseline in (grid_row_counts or {}).items():
+            current = int(current_grid_rows.get(tab, baseline))
+            if current > baseline:
+                requests.append({"deleteDimension": {"range": {
+                    "sheetId": sheet_ids[tab], "dimension": "ROWS",
+                    "startIndex": baseline, "endIndex": current,
+                }}})
+        if requests:
+            write_batch(requests)
+            for tab, baseline in (grid_row_counts or {}).items():
+                current_grid_rows[tab] = min(int(current_grid_rows.get(tab, baseline)), baseline)
+
     def write_chunked(batch_requests: list[dict[str, Any]]) -> None:
         nonlocal chunks_written, ambiguous_write_response
         chunks = _payment_write_chunks(batch_requests, max_request_bytes)
@@ -477,6 +492,7 @@ def publish_payment_pair(
                 return {"status": "PASS", "ambiguous_write_response": True,
                         "requests": len(requests), "chunks_written": chunks_written}
             write_chunked(atomic_two_tab_update_requests(sheet_ids, current, saved, strict_headers=False))
+            restore_grid_rows()
             restored = read_pair()
             if not matches(restored, saved):
                 raise RuntimeError("payment rollback readback mismatch") from write_error
@@ -493,6 +509,7 @@ def publish_payment_pair(
             current = read_pair()
             if not matches(current, saved):
                 write_chunked(atomic_two_tab_update_requests(sheet_ids, current, saved, strict_headers=False))
+                restore_grid_rows()
                 restored = read_pair()
                 if not matches(restored, saved):
                     raise RuntimeError("payment rollback readback mismatch")
@@ -504,6 +521,7 @@ def publish_payment_pair(
                 "requests": len(requests), "chunks_written": chunks_written}
     try:
         write_chunked(atomic_two_tab_update_requests(sheet_ids, actual, saved, strict_headers=False))
+        restore_grid_rows()
         restored = read_pair()
         if not matches(restored, saved):
             raise RuntimeError("payment rollback readback mismatch")

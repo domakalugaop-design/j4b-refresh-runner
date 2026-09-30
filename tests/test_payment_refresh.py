@@ -29,6 +29,14 @@ def _apply_payment_requests(live, requests, sheet_ids, grid_counts=None):
             if grid_counts is not None and dimension["dimension"] == "ROWS":
                 grid_counts[tab] += dimension["length"]
             continue
+        if "deleteDimension" in request:
+            dimension = request["deleteDimension"]["range"]
+            tab = tab_by_id[dimension["sheetId"]]
+            if dimension["dimension"] == "ROWS":
+                del live[tab][dimension["startIndex"]:dimension["endIndex"]]
+                if grid_counts is not None:
+                    grid_counts[tab] -= dimension["endIndex"] - dimension["startIndex"]
+            continue
         update = request["updateCells"]
         cell_range = update["range"]
         tab = tab_by_id[cell_range["sheetId"]]
@@ -297,6 +305,33 @@ def test_first_chunk_atomically_expands_only_target_payment_tab_grid():
     assert result["status"] == "PASS"
     assert grid_counts == {"visits": 4, "projects": 2}
     assert live == candidate
+
+
+def test_readback_mismatch_rolls_back_grid_rows_added_for_publication():
+    previous = {"visits": [["id"], ["old"]], "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id"], ["new1"], ["new2"], ["new3"]],
+                 "projects": [["id"], ["new"]]}
+    sheet_ids = {"visits": 10, "projects": 20}
+    grid_counts = {"visits": 2, "projects": 2}
+    live = {key: [row[:] for row in rows] for key, rows in previous.items()}
+
+    def writer(requests):
+        _apply_payment_requests(live, requests, sheet_ids, grid_counts)
+
+    corrupted = False
+    def read_tab(tab):
+        nonlocal corrupted
+        if not corrupted and live["visits"] == candidate["visits"] and tab == "visits":
+            corrupted = True
+            return [["unexpected"]]
+        return live[tab]
+
+    with pytest.raises(RuntimeError, match="previous publication restored"):
+        publish_payment_pair(sheet_ids=sheet_ids, previous=previous, candidate=candidate,
+                              write_batch=writer, read_tab=read_tab,
+                              grid_row_counts={"visits": 2, "projects": 2})
+    assert live == previous
+    assert grid_counts == {"visits": 2, "projects": 2}
 
 
 def test_timeout_before_apply_verifies_range_then_retries():
