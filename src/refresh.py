@@ -417,7 +417,7 @@ def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[lis
         if summary(actual) != after or normalized_actual != normalized_expected:
             raise RuntimeError("projects_current full readback mismatch")
     except Exception:
-        restore_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{max(len(previous_copy), 1)}"
+        restore_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{max(logical_height, 1)}"
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(restore_rng, safe='!:')}:clear", token, {}, method="POST")
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": restore_rng, "majorDimension": "ROWS", "values": previous_copy}]})
         raise
