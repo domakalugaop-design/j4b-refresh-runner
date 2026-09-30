@@ -14,17 +14,6 @@ jobs:
   refresh:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    env:
-      RUN_MODE: production
-      ALLOW_PRODUCTION_WRITE: "true"
-      PRODUCTION_CONFIRMATION: J4B_PRODUCTION
-      PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
-      PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
-      PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
-      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-      GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
-      GOOGLE_WORKSHEET: projects_current
-      PORTAL_REQUEST_DELAY: "0.15"
 
     steps:
       - name: Checkout production cutover branch
@@ -47,6 +36,17 @@ jobs:
 
       - name: Validate required runtime secrets
         shell: bash
+        env:
+          RUN_MODE: production
+          ALLOW_PRODUCTION_WRITE: "true"
+          PRODUCTION_CONFIRMATION: J4B_PRODUCTION
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_WORKSHEET: projects_current
+          PORTAL_REQUEST_DELAY: "0.15"
         run: |
           python - <<'PY'
           import os
@@ -71,6 +71,16 @@ jobs:
 
       - name: Acquire regular selected scope and save private checkpoint
         env:
+          RUN_MODE: production
+          ALLOW_PRODUCTION_WRITE: "true"
+          PRODUCTION_CONFIRMATION: J4B_PRODUCTION
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_WORKSHEET: projects_current
+          PORTAL_REQUEST_DELAY: "0.15"
           ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
           ACQUISITION_ONLY: "true"
           ACQUISITION_CHECKPOINT_PATH: /tmp/j4b-acquisition-checkpoint.json
@@ -78,6 +88,16 @@ jobs:
 
       - name: Materialization preflight (no publication)
         env:
+          RUN_MODE: production
+          ALLOW_PRODUCTION_WRITE: "true"
+          PRODUCTION_CONFIRMATION: J4B_PRODUCTION
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_WORKSHEET: projects_current
+          PORTAL_REQUEST_DELAY: "0.15"
           ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
           REPLAY_ACQUISITION_CHECKPOINT: "true"
           MATERIALIZATION_PREFLIGHT: "true"
@@ -86,6 +106,16 @@ jobs:
 
       - name: Create persistent pre-publication backup
         env:
+          RUN_MODE: production
+          ALLOW_PRODUCTION_WRITE: "true"
+          PRODUCTION_CONFIRMATION: J4B_PRODUCTION
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_WORKSHEET: projects_current
+          PORTAL_REQUEST_DELAY: "0.15"
           ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
           PAYMENT_REFRESH_ENABLED: "true"
           PREPUBLICATION_BACKUP_ONLY: "true"
@@ -102,9 +132,6 @@ jobs:
 
       - name: Verify backup integrity before artifact upload
         env:
-          ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
-          PAYMENT_REFRESH_ENABLED: "true"
-          PREPUBLICATION_BACKUP_ONLY: "true"
           J4B_PERSISTENT_BACKUP_DIR: ${{ github.workspace }}/.j4b-prepublication-backup
         run: |
           python - <<'PY'
@@ -153,6 +180,16 @@ jobs:
 
       - name: Run production refresh from checkpoint
         env:
+          RUN_MODE: production
+          ALLOW_PRODUCTION_WRITE: "true"
+          PRODUCTION_CONFIRMATION: J4B_PRODUCTION
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_WORKSHEET: projects_current
+          PORTAL_REQUEST_DELAY: "0.15"
           ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
           PAYMENT_REFRESH_ENABLED: "true"
           REPLAY_ACQUISITION_CHECKPOINT: "true"
