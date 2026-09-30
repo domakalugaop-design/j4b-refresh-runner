@@ -29,6 +29,10 @@ PAYMENT_STATES = {
 SUCCESS_STATES = {"SUCCESS_WITH_ROWS", "SUCCESS_ZERO_ROWS"}
 PAYMENT_WRITE_CHUNK_MAX_BYTES = 1_500_000
 PAYMENT_WRITE_MAX_ATTEMPTS = 3
+NULLABLE_PAYMENT_MONEY_FIELDS = {
+    "Выплаты по визитам": {"Вознаграждение за визит", "Оплачено по данным портала"},
+    "Выплаты по проектам": {"Вознаграждение за визиты", "Оплачено по данным портала"},
+}
 
 
 def normalize_payment_sheet_values(tab: str, rows: list[list[Any]]) -> list[list[Any]]:
@@ -286,6 +290,32 @@ def _normalized_readback(rows: list[list[Any]]) -> list[list[Any]]:
     return [row[:next((i + 1 for i in range(len(row) - 1, -1, -1) if row[i] not in (None, "")), 0)] for row in result]
 
 
+def _payment_readback_comparison(
+    tab: str,
+    expected: list[list[Any]],
+    actual: list[list[Any]],
+    *,
+    headers: list[Any] | tuple[Any, ...] | None = None,
+) -> tuple[bool, int]:
+    """Compare exact rows with a narrow, directional nullable-money allowance."""
+    expected_normalized = _normalized_readback(expected)
+    actual_normalized = _normalized_readback(actual)
+    header_row = headers if headers is not None else (expected[0] if expected else ())
+    allowed_fields = NULLABLE_PAYMENT_MONEY_FIELDS.get(tab, set())
+    allowed_indices = {index for index, field in enumerate(header_row) if field in allowed_fields}
+    equivalences = 0
+    for row_index, expected_row in enumerate(expected_normalized):
+        if row_index >= len(actual_normalized):
+            continue
+        actual_row = actual_normalized[row_index]
+        for column_index in allowed_indices:
+            if (column_index < len(expected_row) and column_index < len(actual_row)
+                    and expected_row[column_index] is None and actual_row[column_index] == ""):
+                actual_row[column_index] = None
+                equivalences += 1
+    return expected_normalized == actual_normalized, equivalences
+
+
 def _column_letters(index: int) -> str:
     """Return spreadsheet column letters for a zero-based index."""
     value = index + 1
@@ -330,8 +360,8 @@ def _mismatch_class(expected: Any, actual: Any) -> str:
 def diagnose_payment_readback(tab: str, expected: list[list[Any]], actual: list[list[Any]]) -> dict[str, Any]:
     """Summarize all value/shape differences without logging cell contents.
 
-    Equality deliberately remains the existing _normalized_readback contract:
-    trailing blank cells/rows are ignored; numeric strings are not coerced.
+    Equality retains trailing-blank/numeric rules and permits only qualified
+    None-to-blank round-trips in nullable monetary schema fields.
     """
     expected_normalized = _normalized_readback(expected)
     actual_normalized = _normalized_readback(actual)
@@ -405,6 +435,7 @@ def diagnose_payment_readback(tab: str, expected: list[list[Any]], actual: list[
     if shifted_rows:
         mismatch_counts_by_class["ROW_SHIFT"] = len(shifted_rows)
 
+    qualified_match, null_blank_equivalences = _payment_readback_comparison(tab, expected, actual)
     return {
         "tab": tab,
         "expected_rows": expected_rows,
@@ -416,7 +447,8 @@ def diagnose_payment_readback(tab: str, expected: list[list[Any]], actual: list[
         "mismatch_counts_by_column": mismatch_counts_by_column,
         "mismatch_counts_by_class": mismatch_counts_by_class,
         "first_mismatch": mismatches[0] if mismatches else None,
-        "matches_existing_contract": expected_normalized == actual_normalized,
+        "matches_existing_contract": qualified_match,
+        "raw_null_vs_empty_equivalences": null_blank_equivalences,
     }
 
 
@@ -474,7 +506,8 @@ def _payment_write_chunks(requests: list[dict[str, Any]], max_bytes: int) -> lis
     return chunks
 
 
-def _chunk_values_match(actual: list[list[Any]], request: Mapping[str, Any]) -> bool:
+def _chunk_values_match(actual: list[list[Any]], request: Mapping[str, Any], *, tab: str,
+                        headers: list[Any] | tuple[Any, ...]) -> bool:
     update = request["updateCells"]
     cell_range = update["range"]
     start = int(cell_range["startRowIndex"])
@@ -499,7 +532,7 @@ def _chunk_values_match(actual: list[list[Any]], request: Mapping[str, Any]) -> 
     for index in range(start, end):
         row = actual[index] if index < len(actual) else []
         actual_rows.append(list(row[:width]) + [None] * max(0, width - len(row)))
-    return _normalized_readback(actual_rows) == _normalized_readback(expected_rows)
+    return _payment_readback_comparison(tab, expected_rows, actual_rows, headers=headers)[0]
 
 
 def _retryable_payment_write_error(error: Exception) -> bool:
@@ -541,7 +574,10 @@ def publish_payment_pair(
         return {tab: read_tab(tab) for tab in sheet_ids}
 
     def matches(actual: Mapping[str, list[list[Any]]], expected: Mapping[str, list[list[Any]]]) -> bool:
-        return all(_normalized_readback(actual[tab]) == _normalized_readback(expected[tab]) for tab in sheet_ids)
+        return all(_payment_readback_comparison(tab, expected[tab], actual[tab])[0] for tab in sheet_ids)
+
+    def equivalences(actual: Mapping[str, list[list[Any]]], expected: Mapping[str, list[list[Any]]]) -> dict[str, int]:
+        return {tab: _payment_readback_comparison(tab, expected[tab], actual[tab])[1] for tab in sheet_ids}
 
     chunks_written = 0
     ambiguous_write_response = False
@@ -598,7 +634,7 @@ def publish_payment_pair(
                         current = read_tab(tab)
                     except Exception as verify_error:
                         raise RuntimeError("ambiguous payment chunk write; range readback failed") from verify_error
-                    if _chunk_values_match(current, chunk):
+                    if _chunk_values_match(current, chunk, tab=tab, headers=candidate_copy[tab][0]):
                         if append_count:
                             current_grid_rows[tab] = int(current_grid_rows.get(tab, 0)) + append_count
                         ambiguous_write_response = True
@@ -625,7 +661,8 @@ def publish_payment_pair(
                 raise write_error
             if matches(current, candidate_copy):
                 return {"status": "PASS", "ambiguous_write_response": True,
-                        "requests": len(requests), "chunks_written": chunks_written}
+                        "requests": len(requests), "chunks_written": chunks_written,
+                        "raw_null_vs_empty_equivalences": equivalences(current, candidate_copy)}
             write_chunked(atomic_two_tab_update_requests(sheet_ids, current, saved, strict_headers=False))
             restore_grid_rows()
             restored = read_pair()
@@ -653,7 +690,8 @@ def publish_payment_pair(
         raise read_error
     if matches(actual, candidate_copy):
         return {"status": "PASS", "ambiguous_write_response": ambiguous_write_response,
-                "requests": len(requests), "chunks_written": chunks_written}
+                "requests": len(requests), "chunks_written": chunks_written,
+                "raw_null_vs_empty_equivalences": equivalences(actual, candidate_copy)}
     diagnostics = {
         tab: diagnose_payment_readback(tab, candidate_copy[tab], actual[tab])
         for tab in sheet_ids

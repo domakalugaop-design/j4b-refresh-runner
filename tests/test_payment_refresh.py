@@ -18,6 +18,7 @@ from src.payment_refresh import (
     publish_payment_pair,
     normalize_payment_sheet_values,
     diagnose_payment_readback,
+    _payment_readback_comparison,
 )
 
 
@@ -512,3 +513,59 @@ def test_readback_diagnostics_never_expose_cell_pii():
     assert result["first_mismatch"]["expected"]["type"] == "str"
     assert result["first_mismatch"]["expected"]["length"] == len(pii)
     assert len(result["first_mismatch"]["expected"]["sha256"]) == 64
+
+
+@pytest.mark.parametrize(("tab", "header", "other_header"), [
+    ("Выплаты по визитам", "Вознаграждение за визит", "Оплачено по данным портала"),
+    ("Выплаты по визитам", "Оплачено по данным портала", "Вознаграждение за визит"),
+    ("Выплаты по проектам", "Вознаграждение за визиты", "Оплачено по данным портала"),
+    ("Выплаты по проектам", "Оплачено по данным портала", "Вознаграждение за визиты"),
+])
+def test_qualified_nullable_money_none_to_blank_is_equal_by_schema_field_name(tab, header, other_header):
+    headers = ["identifier", header, "middle", other_header, "status"]
+    expected = [headers, ["x", None, "present", None, "OK"]]
+    actual = [headers, ["x", "", "present", "", "OK"]]
+    matches, equivalences = _payment_readback_comparison(tab, expected, actual)
+    assert matches and equivalences == 2
+    diagnostic = diagnose_payment_readback(tab, expected, actual)
+    assert diagnostic["matches_existing_contract"]
+    assert diagnostic["raw_null_vs_empty_equivalences"] == 2
+
+
+@pytest.mark.parametrize("actual_value", [0, "0"])
+def test_qualified_nullable_money_none_does_not_equal_zero_or_numeric_text(actual_value):
+    headers = ["project_id", "Оплачено по данным портала", "note"]
+    matches, equivalences = _payment_readback_comparison(
+        "Выплаты по визитам", [headers, ["x", None, "keep"]], [headers, ["x", actual_value, "keep"]]
+    )
+    assert not matches and equivalences == 0
+
+
+def test_nullable_money_rule_is_directional_and_does_not_normalize_text_columns():
+    headers = ["client", "Оплачено по данным портала", "note"]
+    expected_empty_text = [headers, [None, Decimal("4"), "keep"]]
+    actual_empty_text = [headers, ["", Decimal("4"), "keep"]]
+    assert not _payment_readback_comparison("Выплаты по визитам", expected_empty_text, actual_empty_text)[0]
+
+    expected_empty_string = [headers, ["x", "", "keep"]]
+    actual_null = [headers, ["x", None, "keep"]]
+    assert not _payment_readback_comparison("Выплаты по визитам", expected_empty_string, actual_null)[0]
+
+
+def test_payment_readback_preserves_numeric_and_real_amount_mismatch_semantics():
+    headers = ["project_id", "Вознаграждение за визиты", "note"]
+    assert _payment_readback_comparison("Выплаты по проектам", [headers, ["x", 1, "keep"]], [headers, ["x", 1, "keep"]])[0]
+    assert _payment_readback_comparison("Выплаты по проектам", [headers, ["x", 1, "keep"]], [headers, ["x", 1.0, "keep"]])[0]
+    assert not _payment_readback_comparison("Выплаты по проектам", [headers, ["x", 1, "keep"]], [headers, ["x", "1", "keep"]])[0]
+    amount_change = diagnose_payment_readback("Выплаты по проектам", [headers, ["x", Decimal("100"), "keep"]], [headers, ["x", Decimal("101"), "keep"]])
+    assert not amount_change["matches_existing_contract"]
+    assert amount_change["first_mismatch"]["class"] == "NUMERIC_VALUE"
+
+
+@pytest.mark.parametrize("expected,actual", [
+    ([["project_id", "amount"], ["x", 1]], [["project_id", "amount"]]),
+    ([["project_id", "amount"]], [["project_id", "amount"], ["x", 1]]),
+    ([["project_id", "amount"], ["x", 1], ["y", 2]], [["project_id", "amount"], ["y", 2], ["x", 1]]),
+])
+def test_qualified_payment_comparison_keeps_missing_extra_and_shifted_rows_as_mismatches(expected, actual):
+    assert not _payment_readback_comparison("Выплаты по проектам", expected, actual)[0]
