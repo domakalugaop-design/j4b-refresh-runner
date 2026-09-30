@@ -198,15 +198,45 @@ def test_main_workflow_uploads_backup_before_replay_publication():
     parsed = yaml.safe_load(workflow.read_text(encoding="utf-8"))
     job = parsed["jobs"]["refresh"]
     job_env = job.get("env", {})
-    assert "J4B_PERSISTENT_BACKUP_DIR" not in job_env
-    assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" not in job_env
+    production_only_env = {
+        "RUN_MODE", "ALLOW_PRODUCTION_WRITE", "PRODUCTION_CONFIRMATION",
+        "PORTAL_BASE_URL", "PORTAL_LOGIN", "PORTAL_PASSWORD",
+        "GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_SPREADSHEET_ID",
+        "GOOGLE_WORKSHEET", "PORTAL_REQUEST_DELAY",
+        "ENABLE_WORKFLOW_ANALYTICS_PUBLICATION", "PAYMENT_REFRESH_ENABLED",
+        "ACQUISITION_ONLY", "ACQUISITION_CHECKPOINT_PATH",
+        "REPLAY_ACQUISITION_CHECKPOINT", "MATERIALIZATION_PREFLIGHT",
+        "PREPUBLICATION_BACKUP_ONLY",
+        "J4B_PERSISTENT_BACKUP_DIR", "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER",
+    }
+    assert production_only_env.isdisjoint(job_env)
 
     steps = job["steps"]
     by_name = {step.get("name"): step for step in steps}
+    workflow_env_keys = {
+        key for step in steps for key in step.get("env", {})
+    }
+    assert workflow_env_keys <= production_only_env
     test_env = by_name["Unit and portability tests"].get("env", {})
-    assert "J4B_PERSISTENT_BACKUP_DIR" not in test_env
-    assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" not in test_env
-    assert "J4B_PERSISTENT_BACKUP_DIR" not in job_env
+    assert production_only_env.isdisjoint(test_env)
+    assert test_env == {}
+
+    base_production_env = production_only_env - {
+        "ENABLE_WORKFLOW_ANALYTICS_PUBLICATION", "PAYMENT_REFRESH_ENABLED",
+        "ACQUISITION_ONLY", "ACQUISITION_CHECKPOINT_PATH",
+        "REPLAY_ACQUISITION_CHECKPOINT", "MATERIALIZATION_PREFLIGHT",
+        "PREPUBLICATION_BACKUP_ONLY",
+        "J4B_PERSISTENT_BACKUP_DIR", "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER",
+    }
+    for step_name in (
+        "Validate required runtime secrets",
+        "Acquire regular selected scope and save private checkpoint",
+        "Materialization preflight (no publication)",
+        "Create persistent pre-publication backup",
+        "Run production refresh from checkpoint",
+    ):
+        env = by_name[step_name].get("env", {})
+        assert base_production_env <= set(env)
 
     for step_name in (
         "Create persistent pre-publication backup",
@@ -218,9 +248,61 @@ def test_main_workflow_uploads_backup_before_replay_publication():
     for step_name in ("Confirm persistent backup artifact upload", "Run production refresh from checkpoint"):
         assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" in by_name[step_name].get("env", {})
 
-    artifact_index = next(i for i, step in enumerate(steps) if step.get("name") == "Upload private pre-publication backup artifact")
-    replay_index = next(i for i, step in enumerate(steps) if step.get("name") == "Run production refresh from checkpoint")
-    assert artifact_index < replay_index
+    assert "J4B_PERSISTENT_BACKUP_DIR" not in by_name["Unit and portability tests"].get("env", {})
+    assert "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER" not in by_name["Unit and portability tests"].get("env", {})
+
+    names = [step.get("name") for step in steps]
+    checkout = next(step for step in steps if step.get("name") == "Checkout production cutover branch")
+    assert checkout["with"]["ref"] == "production-cutover"
+    assert names.index("Public repository safety check") < names.index("Unit and portability tests")
+    assert names.index("Unit and portability tests") < names.index("Validate required runtime secrets")
+    assert names.index("Validate required runtime secrets") < names.index(
+        "Acquire regular selected scope and save private checkpoint"
+    )
+    replay_index = names.index("Run production refresh from checkpoint")
+    for gate_name in (
+        "Create persistent pre-publication backup",
+        "Verify backup integrity before artifact upload",
+        "Upload private pre-publication backup artifact",
+        "Confirm persistent backup artifact upload",
+    ):
+        assert names.index(gate_name) < replay_index
+
+    assert "python -m pytest -q" in by_name["Unit and portability tests"]["run"]
+    assert "python scripts/public_repo_safety_check.py" in by_name["Public repository safety check"]["run"]
+
+
+def test_workflow_unit_environment_isolated_from_production_state(monkeypatch):
+    """The CI test step has no inherited production mode, credentials, or backup state."""
+    import yaml
+
+    workflow = Path(__file__).parents[1] / ".github/workflows/manual-production-dispatch.yml"
+    parsed = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    job = parsed["jobs"]["refresh"]
+    production_only_env = {
+        "RUN_MODE", "ALLOW_PRODUCTION_WRITE", "PRODUCTION_CONFIRMATION",
+        "PORTAL_BASE_URL", "PORTAL_LOGIN", "PORTAL_PASSWORD",
+        "GOOGLE_SERVICE_ACCOUNT_JSON", "GOOGLE_SPREADSHEET_ID",
+        "GOOGLE_WORKSHEET", "PORTAL_REQUEST_DELAY",
+        "ENABLE_WORKFLOW_ANALYTICS_PUBLICATION", "PAYMENT_REFRESH_ENABLED",
+        "ACQUISITION_ONLY", "ACQUISITION_CHECKPOINT_PATH",
+        "REPLAY_ACQUISITION_CHECKPOINT", "MATERIALIZATION_PREFLIGHT",
+        "PREPUBLICATION_BACKUP_ONLY",
+        "J4B_PERSISTENT_BACKUP_DIR", "J4B_PERSISTENT_BACKUP_UPLOAD_MARKER",
+    }
+    workflow_env_keys = {
+        key for step in job["steps"] for key in step.get("env", {})
+    }
+    assert workflow_env_keys <= production_only_env
+    assert production_only_env.isdisjoint(job.get("env", {}))
+    test_step = next(step for step in job["steps"] if step.get("name") == "Unit and portability tests")
+    assert production_only_env.isdisjoint(test_step.get("env", {}))
+    monkeypatch.delenv("RUN_MODE", raising=False)
+    monkeypatch.delenv("J4B_PERSISTENT_BACKUP_DIR", raising=False)
+    monkeypatch.delenv("J4B_PERSISTENT_BACKUP_UPLOAD_MARKER", raising=False)
+    assert os.environ.get("RUN_MODE") is None
+    assert os.environ.get("J4B_PERSISTENT_BACKUP_DIR") is None
+    assert os.environ.get("J4B_PERSISTENT_BACKUP_UPLOAD_MARKER") is None
 
 
 def test_prepublication_baseline_guard_fails_closed_on_external_change():
