@@ -1,8 +1,10 @@
 from decimal import Decimal
+from urllib.error import URLError
 
 import pytest
 
 from src.payment_refresh import (
+    PAYMENT_WRITE_CHUNK_MAX_BYTES,
     atomic_two_tab_update_requests,
     checkpoint_counts,
     deterministic_batches,
@@ -16,6 +18,26 @@ from src.payment_refresh import (
     publish_payment_pair,
     normalize_payment_sheet_values,
 )
+
+
+def _apply_payment_requests(live, requests, sheet_ids):
+    tab_by_id = {value: key for key, value in sheet_ids.items()}
+    for request in requests:
+        update = request["updateCells"]
+        cell_range = update["range"]
+        tab = tab_by_id[cell_range["sheetId"]]
+        rows = live[tab]
+        width = cell_range["endColumnIndex"]
+        end = cell_range["endRowIndex"]
+        while len(rows) < end:
+            rows.append([])
+        for offset, row in enumerate(update["rows"]):
+            cells = []
+            for cell in row.get("values", []):
+                entered = cell.get("userEnteredValue", {})
+                cells.append(entered.get("stringValue", entered.get("numberValue", entered.get("boolValue"))))
+            cells += [None] * max(0, width - len(cells))
+            rows[cell_range["startRowIndex"] + offset] = cells[:width]
 
 
 def test_zero_row_is_success_and_removes_stale_rows_from_both_layers():
@@ -84,24 +106,28 @@ def test_exact_2026_scope_batch_boundaries_are_deterministic():
     assert [item for batch in batches for item in batch] == ids
 
 
-def test_pair_publication_is_one_batch_and_only_targets_payment_tabs():
+def test_pair_publication_chunks_each_payment_tab_and_only_targets_those_tabs():
     previous = {"visits": [["project_id", "visit_id"], ["1", "old"]],
                 "projects": [["project_id", "amount"], ["1", Decimal("2")]]}
     candidate = {"visits": [["project_id", "visit_id"], ["1", "new"]],
                  "projects": [["project_id", "amount"], ["1", Decimal("3")]]}
     live = {key: [row[:] for row in value] for key, value in previous.items()}
     writes = []
+    sheet_ids = {"visits": 10, "projects": 20}
 
     def write_batch(requests):
         writes.append(requests)
-        assert {r["updateCells"]["range"]["sheetId"] for r in requests} == {10, 20}
-        live.update({key: [row[:] for row in value] for key, value in candidate.items()})
+        assert len(requests) == 1
+        assert {r["updateCells"]["range"]["sheetId"] for r in requests}.issubset({10, 20})
+        _apply_payment_requests(live, requests, sheet_ids)
 
-    result = publish_payment_pair(sheet_ids={"visits": 10, "projects": 20}, previous=previous,
+    result = publish_payment_pair(sheet_ids=sheet_ids, previous=previous,
                                   candidate=candidate, write_batch=write_batch,
                                   read_tab=lambda tab: live[tab])
     assert result["status"] == "PASS"
-    assert len(writes) == 1 and len(writes[0]) == 2
+    assert len(writes) == 2
+    assert result["chunks_written"] == 2
+    assert live == candidate
 
 
 @pytest.mark.parametrize("fail_at", ["first_tab_write", "second_tab_write"])
@@ -131,24 +157,27 @@ def test_readback_mismatch_rolls_back_both_payment_tabs(mismatch_tab):
     live = {key: [row[:] for row in value] for key, value in previous.items()}
     writes = 0
     readbacks = {"visits": 0, "projects": 0}
+    sheet_ids = {"visits": 1, "projects": 2}
 
-    def write_batch(_requests):
+    def write_batch(requests):
         nonlocal writes
         writes += 1
-        replacement = candidate if writes == 1 else previous
-        live.update({key: [row[:] for row in value] for key, value in replacement.items()})
+        _apply_payment_requests(live, requests, sheet_ids)
 
+    corrupt_once = True
     def read_tab(tab):
+        nonlocal corrupt_once
         readbacks[tab] += 1
-        if writes == 1 and readbacks[tab] == 1 and tab == mismatch_tab:
+        if corrupt_once and writes == 2 and tab == mismatch_tab:
+            corrupt_once = False
             return [["wrong schema"]]
         return live[tab]
 
     with pytest.raises(RuntimeError, match="previous publication restored"):
-        publish_payment_pair(sheet_ids={"visits": 1, "projects": 2}, previous=previous,
+        publish_payment_pair(sheet_ids=sheet_ids, previous=previous,
                              candidate=candidate, write_batch=write_batch, read_tab=read_tab)
     assert live == previous
-    assert writes == 2
+    assert writes == 4
 
 
 def test_rollback_failure_is_visible():
@@ -156,20 +185,25 @@ def test_rollback_failure_is_visible():
     candidate = {"visits": [["project_id"], ["2"]], "projects": [["project_id"], ["2"]]}
     writes = 0
     live = {key: [row[:] for row in value] for key, value in previous.items()}
+    sheet_ids = {"visits": 1, "projects": 2}
 
-    def write_batch(_requests):
+    def write_batch(requests):
         nonlocal writes
         writes += 1
-        if writes == 1:
-            live.update({key: [row[:] for row in value] for key, value in candidate.items()})
-        else:
+        if writes == 3:
             raise RuntimeError("injected rollback failure")
+        _apply_payment_requests(live, requests, sheet_ids)
 
+    corrupt_once = True
     def read_tab(tab):
-        return [["bad"]] if writes == 1 and tab == "visits" else live[tab]
+        nonlocal corrupt_once
+        if corrupt_once and writes == 2 and tab == "visits":
+            corrupt_once = False
+            return [["bad"]]
+        return live[tab]
 
-    with pytest.raises(RuntimeError, match="rollback failed"):
-        publish_payment_pair(sheet_ids={"visits": 1, "projects": 2}, previous=previous,
+    with pytest.raises(RuntimeError, match="payment readback mismatch and rollback failed"):
+        publish_payment_pair(sheet_ids=sheet_ids, previous=previous,
                              candidate=candidate, write_batch=write_batch, read_tab=read_tab)
 
 
@@ -179,24 +213,149 @@ def test_failed_readback_recovers_from_prewrite_backup():
     live = {key: [row[:] for row in value] for key, value in previous.items()}
     writes = 0
     failed_read = False
+    sheet_ids = {"visits": 1, "projects": 2}
 
-    def write_batch(_requests):
+    def write_batch(requests):
         nonlocal writes
         writes += 1
-        replacement = candidate if writes == 1 else previous
-        live.update({key: [row[:] for row in value] for key, value in replacement.items()})
+        _apply_payment_requests(live, requests, sheet_ids)
 
     def read_tab(tab):
         nonlocal failed_read
-        if writes == 1 and not failed_read:
+        if writes == 2 and not failed_read:
             failed_read = True
             raise RuntimeError("readback transport failure")
         return live[tab]
 
     with pytest.raises(RuntimeError, match="readback transport failure"):
-        publish_payment_pair(sheet_ids={"visits": 1, "projects": 2}, previous=previous,
+        publish_payment_pair(sheet_ids=sheet_ids, previous=previous,
                              candidate=candidate, write_batch=write_batch, read_tab=read_tab)
     assert live == previous
+
+
+def test_82530_row_visit_payload_is_chunked_under_serialized_size_limit():
+    from src.payment_refresh import _payment_write_chunks
+    from src.payment_materialization import serialize_sheet_payload
+
+    cell = {"userEnteredValue": {"stringValue": "x"}}
+    rows = [{"values": [cell] * 12}] * 82_530
+    request = {"updateCells": {
+        "range": {"sheetId": 10, "startRowIndex": 0, "endRowIndex": len(rows),
+                  "startColumnIndex": 0, "endColumnIndex": 12},
+        "rows": rows, "fields": "userEnteredValue",
+    }}
+    chunks = _payment_write_chunks([request], PAYMENT_WRITE_CHUNK_MAX_BYTES)
+    assert len(chunks) > 25
+    assert all(len(serialize_sheet_payload({"requests": [chunk]}).encode()) <= PAYMENT_WRITE_CHUNK_MAX_BYTES
+               for chunk in chunks)
+    assert sum(len(chunk["updateCells"]["rows"]) for chunk in chunks) == 82_530
+    assert chunks[0]["updateCells"]["range"]["startRowIndex"] == 0
+    assert chunks[-1]["updateCells"]["range"]["endRowIndex"] == 82_530
+    assert all(a["updateCells"]["range"]["endRowIndex"] == b["updateCells"]["range"]["startRowIndex"]
+               for a, b in zip(chunks, chunks[1:]))
+
+
+@pytest.mark.parametrize("target_count", [5, 1])
+def test_chunked_publication_larger_and_smaller_than_old_sheet_clears_stale_tail(target_count):
+    previous = {"visits": [["id", "amount"], ["old1", 1], ["old2", 2], ["old3", 3]],
+                "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id", "amount"], *[[str(i), i] for i in range(target_count)]],
+                 "projects": [["id"], ["new"]]}
+    sheet_ids = {"visits": 10, "projects": 20}
+    live = {key: [row[:] for row in rows] for key, rows in previous.items()}
+
+    def writer(requests):
+        _apply_payment_requests(live, requests, sheet_ids)
+
+    result = publish_payment_pair(sheet_ids=sheet_ids, previous=previous, candidate=candidate,
+                                  write_batch=writer, read_tab=lambda tab: live[tab], max_request_bytes=400)
+    assert result["status"] == "PASS"
+    from src.payment_refresh import _normalized_readback
+    assert all(_normalized_readback(live[tab]) == _normalized_readback(candidate[tab]) for tab in sheet_ids)
+
+
+def test_timeout_before_apply_verifies_range_then_retries():
+    previous = {"visits": [["id"], ["old"]], "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id"], ["new"]], "projects": [["id"], ["new"]]}
+    sheet_ids = {"visits": 1, "projects": 2}
+    live = {key: [row[:] for row in rows] for key, rows in previous.items()}
+    calls = 0
+
+    def writer(requests):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise URLError("timeout before apply")
+        _apply_payment_requests(live, requests, sheet_ids)
+
+    result = publish_payment_pair(sheet_ids=sheet_ids, previous=previous, candidate=candidate,
+                                  write_batch=writer, read_tab=lambda tab: live[tab])
+    assert result["status"] == "PASS"
+    assert calls == 3
+    assert live == candidate
+
+
+def test_timeout_after_apply_is_confirmed_without_replaying_ambiguous_chunk():
+    previous = {"visits": [["id"], ["old"]], "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id"], ["new"]], "projects": [["id"], ["new"]]}
+    sheet_ids = {"visits": 1, "projects": 2}
+    live = {key: [row[:] for row in rows] for key, rows in previous.items()}
+    calls = 0
+
+    def writer(requests):
+        nonlocal calls
+        calls += 1
+        _apply_payment_requests(live, requests, sheet_ids)
+        if calls == 1:
+            raise URLError("timeout after apply")
+
+    result = publish_payment_pair(sheet_ids=sheet_ids, previous=previous, candidate=candidate,
+                                  write_batch=writer, read_tab=lambda tab: live[tab])
+    assert result["status"] == "PASS"
+    assert result["ambiguous_write_response"] is True
+    assert calls == 2
+    assert live == candidate
+
+
+def test_retryable_chunk_failure_exhaustion_rolls_back_and_fails_closed():
+    previous = {"visits": [["id"], ["old"]], "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id"], ["new"]], "projects": [["id"], ["new"]]}
+    sheet_ids = {"visits": 1, "projects": 2}
+    live = {key: [row[:] for row in rows] for key, rows in previous.items()}
+    calls = 0
+
+    def writer(_requests):
+        nonlocal calls
+        calls += 1
+        raise URLError("persistent timeout before apply")
+
+    with pytest.raises(URLError, match="persistent timeout"):
+        publish_payment_pair(sheet_ids=sheet_ids, previous=previous, candidate=candidate,
+                             write_batch=writer, read_tab=lambda tab: live[tab], max_attempts=2)
+    assert calls == 2
+    assert live == previous
+
+
+@pytest.mark.parametrize("fail_call", [2, 4, 6])
+def test_middle_final_or_project_tab_chunk_failure_restores_both_tabs(fail_call):
+    previous = {"visits": [["id"], ["old1"], ["old2"]], "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id"], ["new1"], ["new2"], ["new3"]], "projects": [["id"], ["new"]]}
+    sheet_ids = {"visits": 1, "projects": 2}
+    live = {key: [row[:] for row in rows] for key, rows in previous.items()}
+    calls = 0
+
+    def writer(requests):
+        nonlocal calls
+        calls += 1
+        if calls == fail_call:
+            raise RuntimeError("injected chunk failure")
+        _apply_payment_requests(live, requests, sheet_ids)
+
+    with pytest.raises(RuntimeError, match="injected chunk failure"):
+        publish_payment_pair(sheet_ids=sheet_ids, previous=previous, candidate=candidate,
+                             write_batch=writer, read_tab=lambda tab: live[tab], max_request_bytes=250)
+    from src.payment_refresh import _normalized_readback
+    assert all(_normalized_readback(live[tab]) == _normalized_readback(previous[tab]) for tab in sheet_ids)
 
 
 def test_sheet_readback_money_is_normalized_to_decimal_and_ids_to_string():

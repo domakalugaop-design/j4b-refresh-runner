@@ -87,7 +87,7 @@ def _exact_google_batch(token: str, sid: str, requests: list[dict[str, Any]]) ->
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as response:
+    with urllib.request.urlopen(req, timeout=60) as response:
         return json.load(response)
 
 

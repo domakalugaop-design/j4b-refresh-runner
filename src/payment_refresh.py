@@ -13,15 +13,21 @@ import json
 import os
 import tempfile
 import copy
+import time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from urllib.error import HTTPError, URLError
+
+from .payment_materialization import serialize_sheet_payload
 
 PAYMENT_STATES = {
     "PENDING", "SUCCESS_WITH_ROWS", "SUCCESS_ZERO_ROWS",
     "FAILED_TRANSPORT", "FAILED_PARSE", "FAILED_SEMANTIC",
 }
 SUCCESS_STATES = {"SUCCESS_WITH_ROWS", "SUCCESS_ZERO_ROWS"}
+PAYMENT_WRITE_CHUNK_MAX_BYTES = 1_500_000
+PAYMENT_WRITE_MAX_ATTEMPTS = 3
 
 
 def normalize_payment_sheet_values(tab: str, rows: list[list[Any]]) -> list[list[Any]]:
@@ -279,6 +285,99 @@ def _normalized_readback(rows: list[list[Any]]) -> list[list[Any]]:
     return [row[:next((i + 1 for i in range(len(row) - 1, -1, -1) if row[i] not in (None, "")), 0)] for row in result]
 
 
+def _payment_write_chunks(requests: list[dict[str, Any]], max_bytes: int) -> list[dict[str, Any]]:
+    """Split updateCells requests into request bodies bounded by serialized bytes."""
+    if max_bytes <= 0:
+        raise ValueError("payment write chunk byte limit must be positive")
+    chunks: list[dict[str, Any]] = []
+    for request in requests:
+        update = request.get("updateCells")
+        if not isinstance(update, dict) or not isinstance(update.get("rows"), list):
+            if len(serialize_sheet_payload({"requests": [request]}).encode("utf-8")) > max_bytes:
+                raise ValueError("non-updateCells payment request exceeds chunk byte limit")
+            chunks.append(request)
+            continue
+        all_rows = update["rows"]
+        base_range = update.get("range", {})
+        if base_range.get("startColumnIndex", 0) != 0:
+            raise ValueError("payment chunk writer requires full-row ranges starting at column A")
+        base_start = int(base_range.get("startRowIndex", 0))
+        cursor = 0
+        while cursor < len(all_rows):
+            start = base_start + cursor
+            selected: list[dict[str, Any]] = []
+            encoded_rows_size = 0
+            while cursor + len(selected) < len(all_rows):
+                row = all_rows[cursor + len(selected)]
+                row_size = len(serialize_sheet_payload({"values": row.get("values", [])}).encode("utf-8"))
+                count = len(selected) + 1
+                chunk_request = {key: value for key, value in request.items() if key != "updateCells"}
+                chunk_request["updateCells"] = {
+                    **update,
+                    "range": {**base_range, "startRowIndex": start, "endRowIndex": start + count},
+                    "rows": [],
+                }
+                base_size = len(serialize_sheet_payload({"requests": [chunk_request]}).encode("utf-8")) - 2
+                estimated_size = base_size + encoded_rows_size + row_size + len(selected)
+                if estimated_size > max_bytes:
+                    if not selected:
+                        raise ValueError("single payment row exceeds chunk byte limit")
+                    break
+                selected.append(row)
+                encoded_rows_size += row_size
+            result = {key: value for key, value in request.items() if key != "updateCells"}
+            result["updateCells"] = {
+                **update,
+                "range": {**base_range, "startRowIndex": start, "endRowIndex": start + len(selected)},
+                "rows": selected,
+            }
+            actual_size = len(serialize_sheet_payload({"requests": [result]}).encode("utf-8"))
+            if actual_size > max_bytes:
+                raise AssertionError("payment chunk byte estimator exceeded configured limit")
+            chunks.append(result)
+            cursor += len(selected)
+    return chunks
+
+
+def _chunk_values_match(actual: list[list[Any]], request: Mapping[str, Any]) -> bool:
+    update = request["updateCells"]
+    cell_range = update["range"]
+    start = int(cell_range["startRowIndex"])
+    end = int(cell_range["endRowIndex"])
+    width = int(cell_range["endColumnIndex"])
+    expected_rows: list[list[Any]] = []
+    for row in update["rows"]:
+        values = []
+        for cell in row.get("values", []):
+            entered = cell.get("userEnteredValue", {})
+            if "numberValue" in entered:
+                value = entered["numberValue"]
+            elif "stringValue" in entered:
+                value = entered["stringValue"]
+            elif "boolValue" in entered:
+                value = entered["boolValue"]
+            else:
+                value = None
+            values.append(value)
+        expected_rows.append(values + [None] * max(0, width - len(values)))
+    actual_rows = []
+    for index in range(start, end):
+        row = actual[index] if index < len(actual) else []
+        actual_rows.append(list(row[:width]) + [None] * max(0, width - len(row)))
+    return _normalized_readback(actual_rows) == _normalized_readback(expected_rows)
+
+
+def _retryable_payment_write_error(error: Exception) -> bool:
+    if isinstance(error, HTTPError):
+        return error.code in {408, 429, 500, 502, 503, 504}
+    return isinstance(error, (URLError, TimeoutError, ConnectionError, OSError))
+
+
+def _payment_tab_label(tab: str) -> str:
+    normalized = tab.casefold()
+    return "VISIT" if "visit" in normalized or "визит" in normalized else "PROJECT"
+
+
 def publish_payment_pair(
     *,
     sheet_ids: Mapping[str, int],
@@ -286,13 +385,16 @@ def publish_payment_pair(
     candidate: Mapping[str, list[list[Any]]],
     write_batch: Any,
     read_tab: Any,
+    max_request_bytes: int = PAYMENT_WRITE_CHUNK_MAX_BYTES,
+    max_attempts: int = PAYMENT_WRITE_MAX_ATTEMPTS,
 ) -> dict[str, Any]:
-    """Publish both payment tabs in one atomic API batch, verify, and restore on mismatch.
+    """Publish payment tabs in bounded chunks, verify, and restore on mismatch.
 
-    ``write_batch`` must issue one Google ``spreadsheets.batchUpdate`` call with
-    the full request list. ``read_tab`` returns a tab's values as rows. These
-    injected boundaries keep failure/rollback behavior locally testable.
+    Physical writes span multiple API calls; they are accepted only after the
+    complete pair readback matches. Any failed chunk restores both tabs.
     """
+    if max_attempts <= 0:
+        raise ValueError("payment write max_attempts must be positive")
     if set(sheet_ids) != set(previous) or set(previous) != set(candidate):
         raise ValueError("payment publication tab set mismatch")
     saved = copy.deepcopy(dict(previous))
@@ -305,17 +407,65 @@ def publish_payment_pair(
     def matches(actual: Mapping[str, list[list[Any]]], expected: Mapping[str, list[list[Any]]]) -> bool:
         return all(_normalized_readback(actual[tab]) == _normalized_readback(expected[tab]) for tab in sheet_ids)
 
+    chunks_written = 0
+    ambiguous_write_response = False
+
+    def write_chunked(batch_requests: list[dict[str, Any]]) -> None:
+        nonlocal chunks_written, ambiguous_write_response
+        chunks = _payment_write_chunks(batch_requests, max_request_bytes)
+        tabs_by_sheet_id = {value: name for name, value in sheet_ids.items()}
+        totals: dict[str, int] = {}
+        for chunk in chunks:
+            update = chunk.get("updateCells")
+            tab = tabs_by_sheet_id.get(update["range"].get("sheetId"), next(iter(sheet_ids))) if update else next(iter(sheet_ids))
+            totals[tab] = totals.get(tab, 0) + 1
+        completed: dict[str, int] = {}
+        for chunk in chunks:
+            update = chunk.get("updateCells")
+            if not update:
+                write_batch([chunk])
+                chunks_written += 1
+                continue
+            cell_range = update["range"]
+            tab = tabs_by_sheet_id.get(cell_range.get("sheetId"), next(iter(sheet_ids)))
+            start = int(cell_range["startRowIndex"])
+            end = int(cell_range["endRowIndex"])
+            label = _payment_tab_label(tab)
+            chunk_number = completed.get(tab, 0) + 1
+            completed[tab] = chunk_number
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    write_batch([chunk])
+                except Exception as write_error:
+                    try:
+                        current = read_tab(tab)
+                    except Exception as verify_error:
+                        raise RuntimeError("ambiguous payment chunk write; range readback failed") from verify_error
+                    if _chunk_values_match(current, chunk):
+                        ambiguous_write_response = True
+                        print(f"PAYMENT_{label}_WRITE_CHUNK={chunk_number}/{totals[tab]} ROWS={start + 1}-{end} STATUS=PASS AMBIGUOUS_RESPONSE=CONFIRMED", flush=True)
+                        chunks_written += 1
+                        break
+                    if not _retryable_payment_write_error(write_error) or attempt >= max_attempts:
+                        raise
+                    print(f"PAYMENT_{label}_WRITE_CHUNK={chunk_number}/{totals[tab]} ROWS={start + 1}-{end} STATUS=RETRY ATTEMPT={attempt + 1}", flush=True)
+                    time.sleep(min(1.0 * (2 ** (attempt - 1)), 4.0))
+                    continue
+                print(f"PAYMENT_{label}_WRITE_CHUNK={chunk_number}/{totals[tab]} ROWS={start + 1}-{end} STATUS=PASS", flush=True)
+                chunks_written += 1
+                break
+
     try:
-        write_batch(requests)
+        write_chunked(requests)
     except Exception as write_error:
         try:
             current = read_pair()
             if matches(current, saved):
                 raise write_error
             if matches(current, candidate_copy):
-                # Provider applied the atomic request but response was lost.
-                return {"status": "PASS", "ambiguous_write_response": True, "requests": len(requests)}
-            write_batch(atomic_two_tab_update_requests(sheet_ids, current, saved, strict_headers=False))
+                return {"status": "PASS", "ambiguous_write_response": True,
+                        "requests": len(requests), "chunks_written": chunks_written}
+            write_chunked(atomic_two_tab_update_requests(sheet_ids, current, saved, strict_headers=False))
             restored = read_pair()
             if not matches(restored, saved):
                 raise RuntimeError("payment rollback readback mismatch") from write_error
@@ -331,7 +481,7 @@ def publish_payment_pair(
         try:
             current = read_pair()
             if not matches(current, saved):
-                write_batch(atomic_two_tab_update_requests(sheet_ids, current, saved, strict_headers=False))
+                write_chunked(atomic_two_tab_update_requests(sheet_ids, current, saved, strict_headers=False))
                 restored = read_pair()
                 if not matches(restored, saved):
                     raise RuntimeError("payment rollback readback mismatch")
@@ -339,9 +489,10 @@ def publish_payment_pair(
             raise RuntimeError("payment readback failed and rollback could not be verified") from recovery_error
         raise read_error
     if matches(actual, candidate_copy):
-        return {"status": "PASS", "ambiguous_write_response": False, "requests": len(requests)}
+        return {"status": "PASS", "ambiguous_write_response": ambiguous_write_response,
+                "requests": len(requests), "chunks_written": chunks_written}
     try:
-        write_batch(atomic_two_tab_update_requests(sheet_ids, actual, saved, strict_headers=False))
+        write_chunked(atomic_two_tab_update_requests(sheet_ids, actual, saved, strict_headers=False))
         restored = read_pair()
         if not matches(restored, saved):
             raise RuntimeError("payment rollback readback mismatch")
