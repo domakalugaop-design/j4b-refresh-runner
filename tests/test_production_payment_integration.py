@@ -1,4 +1,5 @@
 from decimal import Decimal
+from urllib.parse import unquote
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +20,18 @@ def test_payment_feature_gate_is_off_unless_explicitly_enabled(monkeypatch):
     assert production._payment_refresh_enabled() is False
     monkeypatch.setenv("PAYMENT_REFRESH_ENABLED", "true")
     assert production._payment_refresh_enabled() is True
+
+
+def test_read_payment_tab_uses_authenticated_values_reader_and_normalizes_types():
+    values = [list(VISIT_PUBLICATION_COLUMNS), [123, "Project", None, None, 456, 1.0, 500.0, 250.0, 1.0, 0.0, "[]", "COMPLETE"]]
+    with patch.object(production, "api_get", return_value={"values": values}) as read:
+        result = production._read_payment_tab("token", "sheet", production.PAYMENT_VISIT_TAB)
+    assert read.call_count == 1
+    assert "'Выплаты по визитам'!A:Z" in unquote(read.call_args.args[0])
+    assert result[1][0] == "123"
+    assert result[1][4] == "456"
+    assert result[1][5] == 1
+    assert result[1][6] == Decimal("500.0")
 
 
 def test_regular_payment_preparation_replaces_only_selected_project_rows():
