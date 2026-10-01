@@ -1028,6 +1028,8 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     previous_raw = checkpoint["previous_raw"]
     previous_state_rows = checkpoint["previous_state_rows"]
     state = {str(pid): tuple(value) for pid, value in checkpoint["state"].items()}
+    source_columns = list(previous_raw[0]) if previous_raw else []
+    previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
     if os.environ.get("MATERIALIZATION_PREFLIGHT", "false").strip().lower() == "true":
         _require_complete_operational_acquisition(projects)
         rows = materialize(projects, visits, now())
@@ -1044,10 +1046,8 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         return {"FINAL_STATUS": "MATERIALIZATION_PREFLIGHT_PASS", "CANDIDATE_ROWS": candidate_summary["rows"]}
     meta = _destination_preflight(token, sid)
     physical = next(s.get("properties", {}) for s in meta["sheets"] if s.get("properties", {}).get("title") == "projects_current")
-    source_columns = list(previous_raw[0]) if previous_raw else []
     if physical.get("gridProperties", {}).get("columnCount", 0) < len(source_columns):
         raise RuntimeError("checkpoint baseline schema does not match destination width")
-    previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
     plan = _plan_project_type_layout(meta, columns, source_columns=source_columns)
     _require_complete_operational_acquisition(projects)
     _stage("MATERIALIZATION_START")

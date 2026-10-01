@@ -82,6 +82,48 @@ def test_state_present_is_authoritative_and_never_reads_seed(tmp_path):
     assert digest == "NONE"
 
 
+def test_checkpoint_materialization_preflight_loads_baseline_before_merge(monkeypatch):
+    header = list(production.PROJECT_TYPE_SCHEMA)
+    checkpoint = {
+        "version": 1,
+        "universe": [],
+        "selected": [],
+        "projects": [],
+        "visits": [],
+        "previous_raw": [header],
+        "previous_state_rows": [],
+        "state": {},
+    }
+    observed = {}
+    monkeypatch.setenv("MATERIALIZATION_PREFLIGHT", "true")
+    monkeypatch.setattr(production, "load_acquisition_checkpoint", lambda _path: checkpoint)
+    monkeypatch.setattr(production, "_production_target", lambda: "sheet-id")
+    monkeypatch.setattr(production, "google_token", lambda: "test-token")
+    monkeypatch.setattr(production, "_workflow_enabled", lambda: False)
+    monkeypatch.setattr(production, "_require_complete_operational_acquisition", lambda _projects: None)
+    monkeypatch.setattr(production, "materialize", lambda _projects, _visits, _timestamp: [])
+
+    def merge(_rows, previous, _selected_ids, _timestamp, *, columns):
+        observed["baseline"] = previous
+        assert columns == production.PROJECT_TYPE_SCHEMA
+        return previous
+
+    monkeypatch.setattr(production, "merge_previous", merge)
+    monkeypatch.setattr(production, "apply_canonical_project_names", lambda _rows, _universe: None)
+    monkeypatch.setattr(production, "materialize_project_types", lambda _rows, _state, _applicable: None)
+    monkeypatch.setattr(production, "sheet_rows", lambda _rows, *, columns: [list(columns)])
+    monkeypatch.setattr(
+        production,
+        "summary",
+        lambda _rows: {"rows": 1, "unique": 1, "duplicates": 0},
+    )
+
+    result = production.run_from_acquisition_checkpoint()
+
+    assert result["FINAL_STATUS"] == "MATERIALIZATION_PREFLIGHT_PASS"
+    assert observed["baseline"][0] == header
+
+
 def test_bootstrap_rejects_pre_cutoff_unknown_target_and_name_mismatch(tmp_path):
     cases = [
         (_entry(), set(), _universe()),
