@@ -285,6 +285,44 @@ def merge_previous(rows: list[dict[str, Any]], previous: list[list[Any]], select
     return [merged[k] for k in sorted(merged, key=int)]
 
 
+def reconcile_current_rows(
+    rows: list[dict[str, Any]],
+    authoritative_ids: set[str],
+    *,
+    acquisition_complete: bool,
+    max_stale_ids: int = 50,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Reconcile current-state rows against a complete Portal universe.
+
+    Current-state pruning is deliberately fail-closed: an incomplete or
+    malformed universe must never be interpreted as a deletion signal.  The
+    returned stale set is evidence/telemetry; historical data is not touched.
+    """
+    if not acquisition_complete:
+        raise RuntimeError("authoritative universe acquisition incomplete; stale pruning blocked")
+    normalized = {str(project_id) for project_id in authoritative_ids}
+    if not normalized or any(not project_id.isdigit() for project_id in normalized):
+        raise RuntimeError("authoritative universe is empty or contains invalid project IDs")
+    seen: set[str] = set()
+    stale: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for row in rows:
+        project_id = str(row.get("project_id", ""))
+        if not project_id.isdigit() or project_id in seen:
+            raise RuntimeError("current candidate contains invalid or duplicate project IDs")
+        seen.add(project_id)
+        if project_id in normalized:
+            kept.append(row)
+        else:
+            stale.add(project_id)
+    if len(stale) > max_stale_ids:
+        raise RuntimeError(
+            "authoritative universe implies suspicious stale-project count: "
+            f"stale={len(stale)} limit={max_stale_ids}"
+        )
+    return kept, stale
+
+
 def summary(rows: list[list[Any]]) -> dict[str, int]:
     ids = [str(r[0]) for r in rows[1:] if r and r[0] != ""]
     return {"rows": len(ids), "unique": len(set(ids)), "duplicates": len(ids) - len(set(ids))}

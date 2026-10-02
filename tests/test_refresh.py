@@ -1,7 +1,7 @@
 from datetime import date
 import pytest
 
-from src.refresh import BASE_COLUMNS, COLUMNS, PROJECT_TYPE_COLUMNS, materialize, merge_previous, regular_scope_counts, select_scope, sheet_rows, sheets_serial, summary
+from src.refresh import BASE_COLUMNS, COLUMNS, PROJECT_TYPE_COLUMNS, materialize, merge_previous, reconcile_current_rows, regular_scope_counts, select_scope, sheet_rows, sheets_serial, summary
 from src.production import load_acquisition_checkpoint, serialize_acquisition_checkpoint
 
 
@@ -69,6 +69,50 @@ def test_schema_is_33_columns_and_unique_summary():
     assert len(COLUMNS) == 33
     rows = [COLUMNS, ["1"] + [""] * 32, ["2"] + [""] * 32]
     assert summary(rows) == {"rows": 2, "unique": 2, "duplicates": 0}
+
+
+def test_lifecycle_reconciliation_prunes_ids_absent_from_complete_universe():
+    rows = [{"project_id": "100"}, {"project_id": "101"}, {"project_id": "102"}]
+    current, stale = reconcile_current_rows(rows, {"100", "101"}, acquisition_complete=True)
+    assert [row["project_id"] for row in current] == ["100", "101"]
+    assert stale == {"102"}
+
+
+def test_lifecycle_reconciliation_blocks_pruning_on_incomplete_acquisition():
+    with pytest.raises(RuntimeError, match="incomplete"):
+        reconcile_current_rows([{"project_id": "102"}], {"100"}, acquisition_complete=False)
+
+
+def test_lifecycle_reconciliation_is_id_based_for_duplicate_names():
+    rows = [{"project_id": "8183", "project_name": "same"}, {"project_id": "8184", "project_name": "same"}]
+    current, stale = reconcile_current_rows(rows, {"8183", "8184"}, acquisition_complete=True)
+    assert len(current) == 2 and not stale
+
+
+def test_lifecycle_reconciliation_removes_old_id_but_keeps_new_same_name_id():
+    rows = [{"project_id": "8062", "project_name": "same"}, {"project_id": "8183", "project_name": "same"}]
+    current, stale = reconcile_current_rows(rows, {"8183"}, acquisition_complete=True)
+    assert [row["project_id"] for row in current] == ["8183"]
+    assert stale == {"8062"}
+
+
+def test_lifecycle_reconciliation_keeps_authoritative_row_even_with_null_metrics():
+    rows = [{"project_id": "8184", "completed": None, "execution_pct": None}]
+    current, stale = reconcile_current_rows(rows, {"8184"}, acquisition_complete=True)
+    assert current == rows and not stale
+
+
+def test_lifecycle_reconciliation_keeps_hidden_related_entity_when_authoritative():
+    rows = [{"project_id": "8184"}, {"project_id": "8185"}]
+    current, stale = reconcile_current_rows(rows, {"8184", "8185"}, acquisition_complete=True)
+    assert {row["project_id"] for row in current} == {"8184", "8185"}
+    assert not stale
+
+
+def test_lifecycle_reconciliation_fails_closed_on_unexpected_major_drop():
+    rows = [{"project_id": str(i)} for i in range(100)]
+    with pytest.raises(RuntimeError, match="suspicious stale-project count"):
+        reconcile_current_rows(rows, {"0"}, acquisition_complete=True)
 
 
 def test_sheet_rows_emit_full_width():

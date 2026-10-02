@@ -86,7 +86,7 @@ def test_checkpoint_materialization_preflight_loads_baseline_before_merge(monkey
     header = list(production.PROJECT_TYPE_SCHEMA)
     checkpoint = {
         "version": 1,
-        "universe": [],
+        "universe": [{"project_id": "1", "project_name": "Example_0926"}],
         "selected": [],
         "projects": [],
         "visits": [],
@@ -106,7 +106,7 @@ def test_checkpoint_materialization_preflight_loads_baseline_before_merge(monkey
     def merge(_rows, previous, _selected_ids, _timestamp, *, columns):
         observed["baseline"] = previous
         assert columns == production.PROJECT_TYPE_SCHEMA
-        return previous
+        return [{"project_id": "1"}]
 
     monkeypatch.setattr(production, "merge_previous", merge)
     monkeypatch.setattr(production, "apply_canonical_project_names", lambda _rows, _universe: None)

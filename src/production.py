@@ -53,6 +53,7 @@ from .refresh import (
     publish_project_type_state,
     read_sheet,
     read_project_type_state_rows,
+    reconcile_current_rows,
     select_scope,
     regular_scope_counts,
     sheet_rows,
@@ -358,6 +359,35 @@ def _resolve_project_type_state(
         raise ValueError("project_types state is absent; explicit validated bootstrap artifact is required")
     rows, state, digest = _load_bootstrap_seed(seed_path, seed_sha256, target_ids, universe)
     return rows, state, "LOCAL_VALIDATED_ARTIFACT", digest
+
+
+def _prune_absent_project_type_state_rows(
+    rows: list[list[Any]], authoritative_ids: set[str]
+) -> list[list[Any]]:
+    """Drop only current-state assignments for IDs absent from a complete universe."""
+    if not rows:
+        return rows
+    if rows[0] != STATE_COLUMNS:
+        raise ValueError("project_types header mismatch")
+    ids = {str(project_id) for project_id in authoritative_ids}
+    return [rows[0]] + [row for row in rows[1:] if row and str(row[0]) in ids]
+
+
+def _validate_authoritative_universe(universe: list[dict[str, Any]]) -> set[str]:
+    """Validate the already-fetched /api/project universe before using it for pruning."""
+    if not isinstance(universe, list) or not universe:
+        raise RuntimeError("authoritative project universe is empty")
+    ids: set[str] = set()
+    for item in universe:
+        if not isinstance(item, dict):
+            raise RuntimeError("authoritative project universe contains malformed record")
+        project_id = str(item.get("project_id", ""))
+        if not project_id.isdigit() or project_id in ids:
+            raise RuntimeError("authoritative project universe contains invalid or duplicate project IDs")
+        if item.get("project_name") in (None, ""):
+            raise RuntimeError("authoritative project universe contains a project without a name")
+        ids.add(project_id)
+    return ids
 
 
 def _upgrade_projects_rows(rows: list[list[Any]], source_columns: list[str], target_columns: list[str] | None = None) -> list[list[Any]]:
@@ -1021,6 +1051,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     workflow_enabled = _workflow_enabled()
     columns = primary_columns(PROJECT_TYPE_SCHEMA) if workflow_enabled else PROJECT_TYPE_SCHEMA
     universe = checkpoint["universe"]
+    authoritative_ids = _validate_authoritative_universe(universe)
     selected = checkpoint["selected"]
     scope_counts = checkpoint.get("scope_counts")
     projects = checkpoint["projects"]
@@ -1028,21 +1059,25 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     previous_raw = checkpoint["previous_raw"]
     previous_state_rows = checkpoint["previous_state_rows"]
     state = {str(pid): tuple(value) for pid, value in checkpoint["state"].items()}
+    state = {pid: value for pid, value in state.items() if pid in authoritative_ids}
     source_columns = list(previous_raw[0]) if previous_raw else []
     previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
     if os.environ.get("MATERIALIZATION_PREFLIGHT", "false").strip().lower() == "true":
         _require_complete_operational_acquisition(projects)
         rows = materialize(projects, visits, now())
         merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, now(), columns=columns)
+        merged, stale_ids = reconcile_current_rows(
+            merged, authoritative_ids, acquisition_complete=True
+        )
         if workflow_enabled:
             validate_materialized_rows(merged)
         apply_canonical_project_names(merged, universe)
         materialize_project_types(merged, state, project_type_applicable_ids(universe))
         candidate = sheet_rows(merged, columns=columns)
         candidate_summary = summary(candidate)
-        if candidate_summary["duplicates"] or candidate_summary["unique"] < summary(previous)["unique"]:
-            raise RuntimeError("candidate validation failed")
-        _stage(f"MATERIALIZATION_PREFLIGHT_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
+        if candidate_summary["duplicates"]:
+            raise RuntimeError("candidate validation failed: duplicate project IDs")
+        _stage(f"MATERIALIZATION_PREFLIGHT_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
         return {"FINAL_STATUS": "MATERIALIZATION_PREFLIGHT_PASS", "CANDIDATE_ROWS": candidate_summary["rows"]}
     meta = _destination_preflight(token, sid)
     physical = next(s.get("properties", {}) for s in meta["sheets"] if s.get("properties", {}).get("title") == "projects_current")
@@ -1054,6 +1089,9 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     timestamp = now()
     rows = materialize(projects, visits, timestamp)
     merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp, columns=columns)
+    merged, stale_ids = reconcile_current_rows(
+        merged, authoritative_ids, acquisition_complete=True
+    )
     validate_materialized_rows(merged)
     apply_canonical_project_names(merged, universe)
     applicable = project_type_applicable_ids(universe)
@@ -1075,10 +1113,10 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         _stage("PAYMENT_ACQUISITION_AND_CANDIDATE_VALIDATION_PASS")
     candidate = sheet_rows(merged, columns=columns)
     candidate_summary = summary(candidate)
-    if candidate_summary["duplicates"] or candidate_summary["unique"] < summary(previous)["unique"]:
-        raise RuntimeError("candidate validation failed")
+    if candidate_summary["duplicates"]:
+        raise RuntimeError("candidate validation failed: duplicate project IDs")
     _validate_project_type_state_materialization(merged, state, project_type_applicable_ids(universe))
-    _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
+    _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
     _stage("CANDIDATE_VALIDATION_PASS")
     _require_production_gate()
     _require_persistent_backup_upload()
@@ -1217,21 +1255,23 @@ def run() -> dict[str, Any]:
     try:
         _stage("UNIVERSE_DISCOVERY_START")
         universe = discover_universe(session)
-        _stage(f"UNIVERSE_DISCOVERY_PASS | universe={len(universe)}")
+        authoritative_ids = _validate_authoritative_universe(universe)
+        _stage(f"UNIVERSE_DISCOVERY_PASS | universe={len(universe)} | authoritative=PASS")
 
         type_telemetry = None
         applicable_ids: set[str] = set()
         if project_type_enabled:
             previous_ids = {str(r[0]) for r in previous[1:] if r and r[0] not in (None, "")}
-            previous_state_rows, state, bootstrap_source, bootstrap_sha256 = _resolve_project_type_state(
+            state_rows_for_resolution = _prune_absent_project_type_state_rows(previous_state_rows, authoritative_ids)
+            resolved_state_rows, state, bootstrap_source, bootstrap_sha256 = _resolve_project_type_state(
                 bool(layout_plan["state_exists"]),
-                previous_state_rows,
+                state_rows_for_resolution,
                 os.environ.get("PROJECT_TYPE_BOOTSTRAP_PATH", "").strip(),
                 os.environ.get("PROJECT_TYPE_BOOTSTRAP_SHA256", "").strip(),
                 previous_ids,
                 universe,
             )
-            bootstrap_rows = len(previous_state_rows) - 1 if bootstrap_source == "LOCAL_VALIDATED_ARTIFACT" else 0
+            bootstrap_rows = len(resolved_state_rows) - 1 if bootstrap_source == "LOCAL_VALIDATED_ARTIFACT" else 0
             if bootstrap_source == "LOCAL_VALIDATED_ARTIFACT":
                 _stage(f"PROJECT_TYPE_BOOTSTRAP_VALIDATED | rows={bootstrap_rows} | sha256={bootstrap_sha256}")
             else:
@@ -1393,6 +1433,9 @@ def run() -> dict[str, Any]:
         _stage("MATERIALIZATION_START")
         rows = materialize(projects, visits, timestamp)
         merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp, columns=columns)
+        merged, stale_ids = reconcile_current_rows(
+            merged, authoritative_ids, acquisition_complete=True
+        )
         workflow_backup: dict[str, Any] | None = None
         if workflow_enabled:
             validate_materialized_rows(merged)
@@ -1404,14 +1447,15 @@ def run() -> dict[str, Any]:
         candidate_summary = summary(candidate)
         if candidate_summary["duplicates"] != 0:
             raise RuntimeError("candidate contains duplicate project IDs")
-        if candidate_summary["unique"] < summary(previous)["unique"]:
-            raise RuntimeError("candidate master shrinks previous unique project set")
+        # A smaller current-state set is valid only after the complete,
+        # fail-closed authoritative-universe reconciliation above.
         if project_type_enabled:
             candidate_ids = {str(r[0]) for r in candidate[1:] if r and r[0] not in (None, "")}
             _validate_project_type_state_materialization(merged, state, applicable_ids)
             layout_plan["planned"] = layout_plan.get("planned", []) + (["WRITE project_types state"] if state != validate_state_rows(previous_state_rows) else [])
             layout_plan["planned"] = layout_plan.get("planned", []) + ["WRITE projects_current A:AG"]
-        _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']}")
+        _stage(f"LIFECYCLE_RECONCILIATION_PASS | authoritative={len(authoritative_ids)} | stale_pruned={len(stale_ids)}")
+        _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
         _stage("CANDIDATE_VALIDATION_PASS")
         _stage("DIFF_VALIDATION_PASS")
 
