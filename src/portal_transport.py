@@ -61,6 +61,7 @@ class PortalSession:
         self.base_url = (base_url or _required("PORTAL_BASE_URL")).rstrip("/")
         self.last_effective_url: str | None = None
         self.last_retry_after: str | None = None
+        self.last_content_length: str | None = None
         self.login_value = login if login is not None else _required("PORTAL_LOGIN")
         self.password_value = password if password is not None else _required("PORTAL_PASSWORD")
         self.curl = shutil.which("curl")
@@ -148,6 +149,7 @@ class PortalSession:
                 ]
             args.append(self.base_url + path)
             self.last_retry_after = None
+            self.last_content_length = None
             self.requests += 1
             try:
                 result = subprocess.run(args, capture_output=True, text=True)
@@ -182,6 +184,11 @@ class PortalSession:
             self.last_retry_after = next(
                 (line.split(":", 1)[1].strip() for line in header_text.splitlines()
                  if line.lower().startswith("retry-after:")),
+                None,
+            )
+            self.last_content_length = next(
+                (line.split(":", 1)[1].strip() for line in header_text.splitlines()
+                 if line.lower().startswith("content-length:")),
                 None,
             )
             if result.returncode and status == 0:

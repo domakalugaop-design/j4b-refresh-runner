@@ -146,7 +146,13 @@ def _prepare_regular_payment_publication(
     project_rows: list[list[Any]] = []
     for index, pid in enumerate(selected_ids, start=1):
         payment_rows, status = acquire_project_payment_assignments(
-            pid, session, feature_enabled=True, timeout=60
+            pid,
+            session,
+            feature_enabled=True,
+            timeout=60,
+            ordinal=index,
+            total=len(selected_ids),
+            telemetry=_payment_telemetry,
         )
         if status != 200:
             raise RuntimeError("payment XLSX acquisition returned non-200 status")
@@ -712,6 +718,19 @@ def _production_target() -> str:
 
 def _stage(name: str) -> None:
     print(name, flush=True)
+
+
+def _payment_telemetry(event: str, fields: dict[str, Any]) -> None:
+    """Emit allowlisted payment transport diagnostics without payloads."""
+    allowed = {
+        "project_id", "ordinal", "total", "attempt", "http_status", "content_type",
+        "content_length", "actual_response_bytes", "duration_ms", "row_count",
+        "failure_code", "failure_stage", "exception_class", "response_sha256",
+        "looks_like_html", "looks_like_login", "xlsx_magic_valid", "zip_valid",
+        "workbook_structure_valid", "worksheet_xml_valid", "expected_headers_valid",
+    }
+    safe = {key: value for key, value in fields.items() if key in allowed}
+    _stage("PAYMENT_TELEMETRY " + json.dumps({"event": event, **safe}, sort_keys=True, ensure_ascii=False))
 
 
 def _safe_failure_class(exc: BaseException) -> str:

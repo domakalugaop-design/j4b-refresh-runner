@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 import unittest
 import zipfile
 from io import BytesIO
@@ -10,6 +11,7 @@ from email.message import Message
 
 from src.payment_detail_xlsx import (
     PaymentFeatureDisabled,
+    PaymentTransportError,
     PaymentWorkbookError,
     acquire_project_payment_assignments,
     join_payment_assignments,
@@ -201,6 +203,85 @@ class PaymentParserTests(unittest.TestCase):
         self.assertTrue(session.request.full_url.endswith("/pay/detail?proj=123&send=send"))
         self.assertEqual(session.request.get_method(), "GET")
         self.assertEqual(parsed[0]["my_id"], "5")
+
+    def _acquisition(self, status=200, content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", body=None, callback=None):
+        body = make_xlsx(rows=[row(5)]) if body is None else body
+
+        class Response(BytesIO):
+            def __init__(self):
+                super().__init__(body)
+                self.status = status
+                self.headers = Message()
+                self.headers["Content-Type"] = content_type
+                self.headers["Content-Length"] = str(len(body))
+
+        class FakeOpener:
+            calls = 0
+
+            def open(self, request, timeout):
+                self.calls += 1
+                return Response()
+
+        session = FakeOpener()
+        return session, acquire_project_payment_assignments(
+            "123", session, feature_enabled=True, ordinal=2, total=4, telemetry=callback
+        )
+
+    def test_telemetry_has_safe_lifecycle_and_request_count_is_one(self):
+        events = []
+        session, (parsed, status) = self._acquisition(callback=lambda event, fields: events.append((event, fields)))
+        self.assertEqual(session.calls, 1)
+        self.assertEqual(status, 200)
+        self.assertEqual(parsed[0]["my_id"], "5")
+        self.assertEqual([event for event, _ in events], ["PAYMENT_REQUEST_START", "PAYMENT_RESPONSE", "PAYMENT_REQUEST_SUCCESS"])
+        response = events[1][1]
+        self.assertEqual(response["project_id"], "123")
+        self.assertEqual(response["ordinal"], 2)
+        self.assertEqual(response["total"], 4)
+        self.assertEqual(response["actual_response_bytes"], len(make_xlsx(rows=[row(5)])))
+        self.assertEqual(events[2][1]["row_count"], 1)
+
+    def test_non_200_failure_is_classified_without_response_body(self):
+        events = []
+        with self.assertRaises(PaymentTransportError):
+            self._acquisition(status=503, content_type="text/plain", body=b"private-body", callback=lambda e, f: events.append((e, f)))
+        failure = events[-1][1]
+        self.assertEqual(failure["failure_code"], "HTTP_STATUS")
+        self.assertEqual(failure["http_status"], 503)
+        self.assertEqual(failure["response_sha256"], hashlib.sha256(b"private-body").hexdigest())
+        self.assertNotIn("private-body", repr(failure))
+
+    def test_response_contract_failures_have_stable_codes_and_flags(self):
+        cases = [
+            ("CONTENT_TYPE", "text/html", b"<!doctype html><form>login</form>"),
+            ("EMPTY_RESPONSE", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", b""),
+            ("XLSX_SIGNATURE", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", b"not-a-zip"),
+        ]
+        for expected, content_type, body in cases:
+            events = []
+            with self.subTest(expected=expected), self.assertRaises(PaymentWorkbookError) as caught:
+                self._acquisition(content_type=content_type, body=body, callback=lambda e, f: events.append((e, f)))
+            self.assertEqual(caught.exception.failure_code, expected)
+            self.assertEqual(events[-1][0], "PAYMENT_REQUEST_FAILURE")
+            self.assertEqual(events[-1][1]["actual_response_bytes"], len(body))
+            marker = body.decode("utf-8", errors="ignore")
+            if marker:
+                self.assertNotIn(marker, repr(events[-1][1]))
+
+    def test_header_failure_code_and_telemetry_internal_failure_do_not_change_contract(self):
+        missing = make_xlsx([h for h in HEADERS if h != "Оплачено ранее"], [])
+        with self.assertRaises(PaymentWorkbookError) as caught:
+            self._acquisition(body=missing, callback=lambda *_: (_ for _ in ()).throw(RuntimeError("telemetry sink unavailable")))
+        self.assertEqual(caught.exception.failure_code, "HEADER_MISSING")
+
+    def test_sensitive_values_never_enter_telemetry(self):
+        events = []
+        secret_marker = b"Authorization: Bearer secret-token Cookie=password"
+        with self.assertRaises(PaymentWorkbookError):
+            self._acquisition(content_type="text/html", body=secret_marker, callback=lambda e, f: events.append((e, f)))
+        rendered = repr(events)
+        self.assertNotIn("secret-token", rendered)
+        self.assertNotIn("password", rendered)
 
 
 if __name__ == "__main__":

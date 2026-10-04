@@ -9,8 +9,10 @@ materialized and no money is converted through binary floating point.
 from __future__ import annotations
 
 import http.cookiejar
+import hashlib
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -19,7 +21,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from xml.etree import ElementTree as ET
 
 BASE_URL = "https://lk.j4b.ru"
@@ -56,6 +58,11 @@ _NS = {
 class PaymentWorkbookError(ValueError):
     """The export is not a structurally valid payment workbook."""
 
+    def __init__(self, message: str, *, failure_code: str = "OTHER", failure_stage: str = "workbook_validation"):
+        super().__init__(message)
+        self.failure_code = failure_code
+        self.failure_stage = failure_stage
+
 
 class PaymentTransportError(RuntimeError):
     """The payment export endpoint did not return a successful response."""
@@ -88,7 +95,7 @@ def _as_bytes(source: bytes | bytearray | memoryview | str | os.PathLike[str]) -
 def _column_index(cell_ref: str) -> int:
     letters = re.match(r"[A-Za-z]+", cell_ref)
     if not letters:
-        raise PaymentWorkbookError("invalid XLSX cell reference")
+        raise PaymentWorkbookError("invalid XLSX cell reference", failure_code="ROW_SCHEMA", failure_stage="worksheet_rows")
     result = 0
     for char in letters.group(0).upper():
         result = result * 26 + ord(char) - 64
@@ -113,9 +120,9 @@ def _first_sheet_path(archive: zipfile.ZipFile) -> str:
         rel_id = sheet.attrib[f"{{{_NS['rel']}}}id"] if sheet is not None else None
         rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
     except (KeyError, ET.ParseError) as exc:
-        raise PaymentWorkbookError("invalid XLSX workbook structure") from exc
+        raise PaymentWorkbookError("invalid XLSX workbook structure", failure_code="WORKBOOK_STRUCTURE", failure_stage="workbook_structure") from exc
     if not rel_id:
-        raise PaymentWorkbookError("workbook has no worksheet")
+        raise PaymentWorkbookError("workbook has no worksheet", failure_code="WORKBOOK_STRUCTURE", failure_stage="workbook_structure")
     for rel in rels.findall("pkg:Relationship", _NS):
         if rel.attrib.get("Id") == rel_id:
             target = rel.attrib.get("Target", "")
@@ -125,17 +132,17 @@ def _first_sheet_path(archive: zipfile.ZipFile) -> str:
             for part in path.split("/"):
                 if part == "..":
                     if not parts:
-                        raise PaymentWorkbookError("worksheet path escapes XLSX root")
+                        raise PaymentWorkbookError("worksheet path escapes XLSX root", failure_code="WORKBOOK_STRUCTURE", failure_stage="workbook_structure")
                     parts.pop()
                 elif part not in ("", "."):
                     parts.append(part)
             return "/".join(parts)
-    raise PaymentWorkbookError("first worksheet relationship is missing")
+    raise PaymentWorkbookError("first worksheet relationship is missing", failure_code="WORKBOOK_STRUCTURE", failure_stage="workbook_structure")
 
 
 def _cell_value(cell: ET.Element, shared: list[str]) -> str | None:
     if cell.find("main:f", _NS) is not None:
-        raise PaymentWorkbookError("formula cells are not accepted in payment exports")
+        raise PaymentWorkbookError("formula cells are not accepted in payment exports", failure_code="ROW_SCHEMA", failure_stage="worksheet_rows")
     kind = cell.attrib.get("t")
     if kind == "inlineStr":
         inline = cell.find("main:is", _NS)
@@ -148,7 +155,7 @@ def _cell_value(cell: ET.Element, shared: list[str]) -> str | None:
         try:
             return shared[int(raw)]
         except (ValueError, IndexError) as exc:
-            raise PaymentWorkbookError("invalid shared-string reference") from exc
+            raise PaymentWorkbookError("invalid shared-string reference", failure_code="VALUE_PARSE", failure_stage="worksheet_rows") from exc
     # Keep OOXML numeric lexemes as text: Decimal normalization must not pass
     # through Python float, and source representation remains inspectable.
     return raw
@@ -165,14 +172,15 @@ def parse_payment_detail_xlsx(source: bytes | bytearray | memoryview | str | os.
     try:
         archive = zipfile.ZipFile(BytesIO(payload))
     except (zipfile.BadZipFile, OSError) as exc:
-        raise PaymentWorkbookError("input is not a readable XLSX ZIP package") from exc
+        code = "XLSX_SIGNATURE" if payload[:2] != b"PK" else "ZIP_CONTAINER"
+        raise PaymentWorkbookError("input is not a readable XLSX ZIP package", failure_code=code, failure_stage="response_validation") from exc
     with archive:
         shared = _read_shared_strings(archive)
         sheet_path = _first_sheet_path(archive)
         try:
             root = ET.fromstring(archive.read(sheet_path))
         except (KeyError, ET.ParseError) as exc:
-            raise PaymentWorkbookError("worksheet is missing or malformed") from exc
+            raise PaymentWorkbookError("worksheet is missing or malformed", failure_code="WORKSHEET_XML", failure_stage="worksheet_xml") from exc
         rows: list[dict[int, str | None]] = []
         for row in root.findall(".//main:sheetData/main:row", _NS):
             parsed: dict[int, str | None] = {}
@@ -181,7 +189,7 @@ def parse_payment_detail_xlsx(source: bytes | bytearray | memoryview | str | os.
             if any(value not in (None, "") for value in parsed.values()):
                 rows.append(parsed)
     if not rows:
-        raise PaymentWorkbookError("workbook contains no non-empty header row")
+        raise PaymentWorkbookError("workbook contains no non-empty header row", failure_code="HEADER_SCHEMA", failure_stage="header_validation")
 
     header_row = rows[0]
     header_to_column: dict[str, int] = {}
@@ -189,11 +197,11 @@ def parse_payment_detail_xlsx(source: bytes | bytearray | memoryview | str | os.
         header = (value or "").strip()
         if header:
             if header in header_to_column:
-                raise PaymentWorkbookError(f"duplicate required/recognized header: {header}")
+                raise PaymentWorkbookError(f"duplicate required/recognized header: {header}", failure_code="HEADER_DUPLICATE", failure_stage="header_validation")
             header_to_column[header] = col
     missing = [header for header in REQUIRED_HEADERS if header not in header_to_column]
     if missing:
-        raise PaymentWorkbookError("missing required headers: " + ", ".join(missing))
+        raise PaymentWorkbookError("missing required headers: " + ", ".join(missing), failure_code="HEADER_MISSING", failure_stage="header_validation")
 
     records: list[dict[str, str | None]] = []
     for row in rows[1:]:
@@ -343,12 +351,66 @@ def join_payment_assignments(
     }
 
 
+def _emit_payment_telemetry(
+    telemetry: Callable[[str, dict[str, Any]], None] | None,
+    event: str,
+    **fields: Any,
+) -> None:
+    """Best-effort safe event hook; diagnostics can never change acquisition."""
+    if telemetry is None:
+        return
+    try:
+        telemetry(event, fields)
+    except Exception:
+        pass
+
+
+def _safe_response_flags(body: bytes, failure_code: str | None = None) -> dict[str, Any]:
+    prefix = body[:8192].lower()
+    looks_like_html = b"<html" in prefix or b"<!doctype" in prefix
+    looks_like_login = bool(looks_like_html and b"<form" in prefix and (b"login" in prefix or b"password" in prefix))
+    xlsx_magic_valid = body[:2] == b"PK"
+    try:
+        zip_valid = zipfile.is_zipfile(BytesIO(body)) if body else False
+    except (OSError, ValueError):
+        zip_valid = False
+    workbook_structure_valid = None
+    worksheet_xml_valid = None
+    expected_headers_valid = None
+    if failure_code == "WORKBOOK_STRUCTURE":
+        workbook_structure_valid = False
+    elif xlsx_magic_valid and zip_valid:
+        workbook_structure_valid = True
+    if failure_code == "WORKSHEET_XML":
+        worksheet_xml_valid = False
+    elif workbook_structure_valid is True:
+        worksheet_xml_valid = True
+    if failure_code in {"HEADER_MISSING", "HEADER_DUPLICATE", "HEADER_SCHEMA"}:
+        expected_headers_valid = False
+    elif worksheet_xml_valid is True:
+        expected_headers_valid = True
+    return {
+        "response_sha256": hashlib.sha256(body).hexdigest(),
+        "looks_like_html": looks_like_html,
+        "looks_like_login": looks_like_login,
+        "xlsx_magic_valid": xlsx_magic_valid,
+        "zip_valid": zip_valid,
+        "workbook_structure_valid": workbook_structure_valid,
+        "worksheet_xml_valid": worksheet_xml_valid,
+        "expected_headers_valid": expected_headers_valid,
+    }
+
+
 def acquire_project_payment_assignments(
     project_id: str | int,
     authenticated_session: Any,
     *,
     feature_enabled: bool = False,
     timeout: int = 60,
+    ordinal: int | None = None,
+    total: int | None = None,
+    attempt: int = 1,
+    telemetry: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> tuple[list[dict[str, str | None]], int]:
     """Perform exactly one XLSX GET using an existing authenticated cookie jar.
 
@@ -361,32 +423,93 @@ def acquire_project_payment_assignments(
     if not project.isdigit() or int(project) <= 0:
         raise ValueError("project_id must be a positive integer")
     route = "/pay/detail?" + urllib.parse.urlencode({"proj": project, "send": "send"})
+    started = time.perf_counter()
+    common = {"project_id": project, "ordinal": ordinal, "total": total, "attempt": attempt}
+    _emit_payment_telemetry(telemetry, "PAYMENT_REQUEST_START", **common)
     request = urllib.request.Request(
         BASE_URL + route,
         headers={"Accept": XLSX_MIME},
         method="GET",
     )
-    if hasattr(authenticated_session, "request"):
-        status, content_type, body = authenticated_session.request(
-            route, "GET", accept=XLSX_MIME, follow_redirects=False
+    status = None
+    content_type = ""
+    content_length = None
+    body = b""
+    try:
+        if hasattr(authenticated_session, "request"):
+            status, content_type, body = authenticated_session.request(
+                route, "GET", accept=XLSX_MIME, follow_redirects=False
+            )
+            content_type = content_type.split(";", 1)[0].strip().lower()
+            content_length = getattr(authenticated_session, "last_content_length", None)
+        elif hasattr(authenticated_session, "open"):
+            opener = authenticated_session
+            with opener.open(request, timeout=timeout) as response:
+                status = int(response.status)
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                content_length = response.headers.get("Content-Length")
+                body = response.read()
+        else:
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(authenticated_session), _NoRedirect()
+            )
+            with opener.open(request, timeout=timeout) as response:
+                status = int(response.status)
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                content_length = response.headers.get("Content-Length")
+                body = response.read()
+        elapsed = round((time.perf_counter() - started) * 1000, 3)
+        _emit_payment_telemetry(
+            telemetry,
+            "PAYMENT_RESPONSE",
+            **common,
+            http_status=status,
+            content_type=content_type,
+            content_length=content_length,
+            actual_response_bytes=len(body),
+            duration_ms=elapsed,
         )
-        content_type = content_type.split(";", 1)[0].strip().lower()
-    elif hasattr(authenticated_session, "open"):
-        opener = authenticated_session
-        with opener.open(request, timeout=timeout) as response:
-            status = int(response.status)
-            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            body = response.read()
-    else:
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(authenticated_session), _NoRedirect()
+        if status != 200:
+            raise PaymentTransportError(f"payment export request failed (HTTP {status})")
+        if not body:
+            raise PaymentWorkbookError("payment export response body is empty", failure_code="EMPTY_RESPONSE", failure_stage="response_validation")
+        if content_type != XLSX_MIME:
+            raise PaymentWorkbookError(f"payment export response contract failed (HTTP {status}, content type mismatch)", failure_code="CONTENT_TYPE", failure_stage="response_validation")
+        parsed = parse_payment_detail_xlsx(body)
+        _emit_payment_telemetry(
+            telemetry,
+            "PAYMENT_REQUEST_SUCCESS",
+            **common,
+            http_status=status,
+            content_type=content_type,
+            content_length=content_length,
+            actual_response_bytes=len(body),
+            duration_ms=round((time.perf_counter() - started) * 1000, 3),
+            row_count=len(parsed),
         )
-        with opener.open(request, timeout=timeout) as response:
-            status = int(response.status)
-            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-            body = response.read()
-    if status != 200:
-        raise PaymentTransportError(f"payment export request failed (HTTP {status})")
-    if content_type != XLSX_MIME:
-        raise PaymentWorkbookError(f"payment export response contract failed (HTTP {status}, content type mismatch)")
-    return parse_payment_detail_xlsx(body), status
+        return parsed, status
+    except Exception as exc:
+        if isinstance(exc, PaymentWorkbookError):
+            failure_code = exc.failure_code
+            failure_stage = exc.failure_stage
+        elif status is not None and status != 200:
+            failure_code = "HTTP_STATUS"
+            failure_stage = "response_validation"
+        else:
+            failure_code = "OTHER"
+            failure_stage = "request"
+        fields = {
+            **common,
+            "http_status": status,
+            "content_type": content_type,
+            "content_length": content_length,
+            "actual_response_bytes": len(body),
+            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+            "failure_code": failure_code,
+            "failure_stage": failure_stage,
+            "exception_class": type(exc).__name__,
+        }
+        if body:
+            fields.update(_safe_response_flags(body, failure_code))
+        _emit_payment_telemetry(telemetry, "PAYMENT_REQUEST_FAILURE", **fields)
+        raise
