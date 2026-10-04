@@ -508,6 +508,8 @@ def acquire_project_payment_assignments(
             "failure_code": failure_code,
             "failure_stage": failure_stage,
             "exception_class": type(exc).__name__,
+            "transport_error_class": getattr(exc, "failure_class", None),
+            "retryable": getattr(exc, "retryable", None),
         }
         if body:
             fields.update(_safe_response_flags(body, failure_code))

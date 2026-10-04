@@ -18,6 +18,8 @@ Each payment request emits safe lifecycle events:
 Events contain only project identifier, bounded ordinal/total/attempt metadata,
 HTTP status, normalized content type, content-length metadata, actual response
 byte count, duration, row count on success, and an allowlisted failure class.
+Transport failures additionally expose only the safe transport class and its
+retryable boolean; this telemetry does not introduce retry behavior.
 Failure events may include a SHA-256 digest and structural booleans. Response
 bodies, XLSX rows, cookies, authorization headers, credentials, and query
 secrets are never emitted.

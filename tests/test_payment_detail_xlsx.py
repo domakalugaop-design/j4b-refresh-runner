@@ -18,6 +18,7 @@ from src.payment_detail_xlsx import (
     normalize_money,
     parse_payment_detail_xlsx,
 )
+from src.portal_transport import PortalTransportError
 
 
 HEADERS = [
@@ -282,6 +283,23 @@ class PaymentParserTests(unittest.TestCase):
         rendered = repr(events)
         self.assertNotIn("secret-token", rendered)
         self.assertNotIn("password", rendered)
+
+    def test_transport_failure_reports_safe_class_and_retryability(self):
+        events = []
+
+        class FailingOpener:
+            def open(self, request, timeout):
+                raise PortalTransportError("TIMEOUT", True)
+
+        with self.assertRaises(PortalTransportError):
+            acquire_project_payment_assignments(
+                "123", FailingOpener(), feature_enabled=True,
+                telemetry=lambda e, f: events.append((e, f)),
+            )
+        failure = events[-1][1]
+        self.assertEqual(failure["transport_error_class"], "TIMEOUT")
+        self.assertTrue(failure["retryable"])
+        self.assertEqual(failure["failure_code"], "OTHER")
 
 
 if __name__ == "__main__":

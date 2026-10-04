@@ -726,6 +726,7 @@ def _payment_telemetry(event: str, fields: dict[str, Any]) -> None:
         "project_id", "ordinal", "total", "attempt", "http_status", "content_type",
         "content_length", "actual_response_bytes", "duration_ms", "row_count",
         "failure_code", "failure_stage", "exception_class", "response_sha256",
+        "transport_error_class", "retryable",
         "looks_like_html", "looks_like_login", "xlsx_magic_valid", "zip_valid",
         "workbook_structure_valid", "worksheet_xml_valid", "expected_headers_valid",
     }
