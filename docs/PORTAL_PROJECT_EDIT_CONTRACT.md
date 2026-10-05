@@ -1,7 +1,7 @@
 # Portal project edit and currency contract
 
 Status: locally implemented, not live-production acceptance. The one
-post-recovery control read was project `6164`: authenticated `/proj/6164/edit`,
+post-recovery control read returned an authenticated project edit response,
 HTTP 200, selected currency ID `1`, label `рубль`, dictionary match `RUB` / `₽`.
 No additional currency request is needed: project edit is already one of the
 normal three project acquisition requests.
