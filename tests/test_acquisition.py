@@ -29,6 +29,7 @@ class FakeSession:
 
 def complete_edit(name="Project_Q3_0926", plan="4"):
     return f"""<!doctype html><html><body>
+      <form action='/proj/42/edit' method='post'>
       <input name='name' value='{name}'>
       <input name='dt1' value='01.09.2026'><input name='dt2' value='30.09.2026'>
       <input name='visits' value='{plan}'><input name='cost' value='100'>
@@ -37,6 +38,8 @@ def complete_edit(name="Project_Q3_0926", plan="4"):
       <select name='user2[]'><option selected value='3'>Coordinator</option></select>
       <select name='wave'><option selected value='4'>Wave</option></select>
       <select name='scope'><option selected value='5'>Scope</option></select>
+      <select name='currency'><option value='1' selected>рубль</option></select>
+      </form>
     </body></html>"""
 
 

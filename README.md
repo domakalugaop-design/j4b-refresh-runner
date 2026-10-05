@@ -90,22 +90,41 @@ No secret value belongs in the repository.
 
 ## Production safety
 
-The current workflow is intentionally **manual TEST only**. Code rejects `RUN_MODE != test` and rejects `ALLOW_PRODUCTION_WRITE=true` during qualification.
+The default-branch workflow exposes `workflow_dispatch` and checks out the
+`production-cutover` branch. It has no GitHub schedule; the production
+dispatcher/scheduler is managed outside this repository. Production writes
+remain behind the existing destination, authorization, backup, artifact, and
+readback gates. Code-only changes must not dispatch that workflow.
 
-This code-only cutover does not change a workflow or scheduler and does not
-enable a second recurring production writer.
+## Production materialized schema
 
-## Production Project Type contract
-
-The production materialized schema is 33 columns. The original 31 operational
+The current base materialized schema is 37 columns. The original 31 operational
 columns remain in A:AE, followed by `project_type_code` and
-`project_type_name` in AF:AG. The runner reads and maintains immutable qualified
-assignments in the persisted `project_types` tab; it does not issue a type
-detail request for an already assigned project. New or pending projects are
-eligible only when a valid MMYY marker in `project_name`, normalized to
-`(YYYY, MM)`, is September 2026 or later. A raw Portal type value of zero stays
-pending and may be retried. The code-to-name mapping is validated against the
-qualified dictionary in `src/project_types.py`.
+`project_type_name` in AF:AG, then the nullable project-level currency fields
+`currency_id`, `currency_code`, `currency_name`, and `currency_symbol`.
+Workflow-enabled production retains its existing 54-column operational schema
+and appends these four currency fields, for 58 columns total. Currency is
+parsed from the existing `/proj/{id}/edit` acquisition; it adds no Portal
+request. Raw IDs map through the qualified Portal currency dictionary in
+`src/parsers.py`; missing currency remains blank, while an unknown ID or a
+dictionary-label mismatch fails acquisition closed. Payment-tab schemas are
+unchanged.
+
+The runner reads and maintains immutable qualified Project Type assignments in
+the persisted `project_types` tab; it does not issue a type-detail request for
+an already assigned project. New or pending projects are eligible only when a
+valid MMYY marker in `project_name`, normalized to `(YYYY, MM)`, is September
+2026 or later. A raw Portal type value of zero stays pending and may be retried.
+The code-to-name mapping is validated against the qualified dictionary in
+`src/project_types.py`.
+
+Every HTTP 200 project-edit response is structurally qualified. It must be an
+HTML document containing the expected authenticated project form, expected
+fields, canonical project identity, and no login, PHP-error, or access-denied
+markers. A valid edit form may omit the currency control or selection, which
+stays nullable; an invalid response can never be interpreted as a missing
+business value. Login POST completion alone is not treated as authentication:
+the first normal project/edit acquisition must pass these structural checks.
 
 Publication is guarded: source acquisition, state validation, candidate
 validation, and diff planning happen before the production write authorization
@@ -124,6 +143,6 @@ Migration sequence:
 
 ## Status
 
-The production-cutover runner contains the 33-column Project Type contract.
-This code change does not execute or push a live refresh and does not enable a
-scheduled production workflow.
+The production-cutover runner contains the additive currency and structural
+validation contract. Code-only qualification does not execute a live refresh
+or enable another scheduled production workflow.

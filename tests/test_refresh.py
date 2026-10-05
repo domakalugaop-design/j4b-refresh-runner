@@ -1,7 +1,7 @@
 from datetime import date
 import pytest
 
-from src.refresh import BASE_COLUMNS, COLUMNS, PROJECT_TYPE_COLUMNS, materialize, merge_previous, reconcile_current_rows, regular_scope_counts, select_scope, sheet_rows, sheets_serial, summary
+from src.refresh import BASE_COLUMNS, COLUMNS, CURRENCY_COLUMNS, PROJECT_TYPE_COLUMNS, CURRENCY_PROJECT_COLUMNS, materialize, merge_previous, reconcile_current_rows, regular_scope_counts, select_scope, sheet_rows, sheets_serial, summary
 from src.production import load_acquisition_checkpoint, serialize_acquisition_checkpoint
 
 
@@ -105,8 +105,9 @@ def test_native_serial_conversion():
     assert sheets_serial(46267.0) == 46267.0
 
 
-def test_schema_is_33_columns_and_unique_summary():
-    assert len(COLUMNS) == 33
+def test_current_schema_is_37_columns_and_unique_summary():
+    assert len(COLUMNS) == 37
+    assert COLUMNS[-4:] == CURRENCY_COLUMNS
     rows = [COLUMNS, ["1"] + [""] * 32, ["2"] + [""] * 32]
     assert summary(rows) == {"rows": 2, "unique": 2, "duplicates": 0}
 
@@ -160,8 +161,8 @@ def test_sheet_rows_emit_full_width():
     row["project_id"] = "1"
     row["last_refreshed"] = "2026-09-04T10:00:00+00:00"
     values = sheet_rows([row])
-    assert len(values[0]) == 33
-    assert len(values[1]) == 33
+    assert len(values[0]) == 37
+    assert len(values[1]) == 37
     assert values[1][0] == 1 and type(values[1][0]) is int
     assert values[1][1] == ""  # textual dimensions remain text
 
@@ -178,10 +179,11 @@ def test_sheet_row_builder_normalizes_digit_string_ids_and_rejects_bad_ids():
 
 
 def test_project_type_schema_appends_only_two_columns_after_original_contract():
-    assert COLUMNS == PROJECT_TYPE_COLUMNS
+    assert CURRENCY_PROJECT_COLUMNS == COLUMNS
     assert PROJECT_TYPE_COLUMNS[: len(BASE_COLUMNS)] == BASE_COLUMNS
     assert PROJECT_TYPE_COLUMNS[-2:] == ["project_type_code", "project_type_name"]
     assert len(PROJECT_TYPE_COLUMNS) == 33
+    assert COLUMNS[:len(PROJECT_TYPE_COLUMNS)] == PROJECT_TYPE_COLUMNS
     row = {name: None for name in PROJECT_TYPE_COLUMNS}
     row.update({"project_id": "7975", "project_name": "4 Лапы_Москва_Q3_0926", "project_type_code": "0001", "project_type_name": "Обычный"})
     values = sheet_rows([row], columns=PROJECT_TYPE_COLUMNS)

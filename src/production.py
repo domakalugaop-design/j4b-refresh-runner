@@ -45,6 +45,7 @@ from .refresh import (
     COLUMNS,
     BASE_COLUMNS,
     PROJECT_TYPE_COLUMNS as PROJECT_TYPE_SCHEMA,
+    CURRENCY_COLUMNS,
     materialize,
     merge_previous,
     now,
@@ -202,12 +203,18 @@ def _plan_project_type_layout(
     if not current:
         raise RuntimeError("projects_current tab not found")
     column_count = current.get("gridProperties", {}).get("columnCount")
-    target_columns = list(target_columns or PROJECT_TYPE_SCHEMA)
+    target_columns = list(target_columns or COLUMNS)
     if source_columns is None:
         if column_count == len(BASE_COLUMNS):
             source_columns = list(BASE_COLUMNS)
         elif column_count == len(PROJECT_TYPE_SCHEMA):
             source_columns = list(PROJECT_TYPE_SCHEMA)
+        elif column_count == len(COLUMNS):
+            source_columns = list(COLUMNS)
+        elif column_count == len(primary_columns(PROJECT_TYPE_SCHEMA)):
+            source_columns = primary_columns(PROJECT_TYPE_SCHEMA)
+        elif column_count == len(primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS):
+            source_columns = primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS
         else:
             raise RuntimeError("source columns are required for an arbitrary baseline width")
     else:
@@ -228,11 +235,13 @@ def _plan_project_type_layout(
         "projects_sheet_id": current["sheetId"],
         "project_types_sheet_id": state.get("sheetId") if state else None,
         "source_column_count": len(source_columns),
+        "source_grid_column_count": column_count,
         "source_columns": source_columns,
+        "target_columns": target_columns,
         "state_exists": state is not None,
         "requests": requests,
         "target_column_count": len(target_columns),
-        "planned": ([("EXPAND projects_current A:AE -> A:AG" if len(target_columns) == len(PROJECT_TYPE_SCHEMA) else f"EXPAND projects_current to {len(target_columns)} columns")] if column_count < len(target_columns) else [])
+        "planned": ([(f"EXPAND projects_current to {len(target_columns)} columns")] if column_count < len(target_columns) else [])
         + (["CREATE project_types"] if not state else []),
     }
 
@@ -248,17 +257,23 @@ def _execute_project_type_layout(token: str, sid: str, plan: dict[str, Any]) -> 
     fresh_sheets = fresh.get("sheets", [])
     current = next((s.get("properties", {}) for s in fresh_sheets if s.get("properties", {}).get("title") == "projects_current"), None)
     state = next((s.get("properties", {}) for s in fresh_sheets if s.get("properties", {}).get("title") == "project_types"), None)
-    if not current or current.get("gridProperties", {}).get("columnCount") != plan["target_column_count"] or not state:
+    if not current or current.get("gridProperties", {}).get("columnCount", 0) < plan["target_column_count"] or not state:
         raise RuntimeError("Project Type schema migration failed")
+    target_columns = plan["target_columns"]
+    project_type_code_index = target_columns.index("project_type_code")
+    currency_id_index = target_columns.index("currency_id") if "currency_id" in target_columns else None
+    formatting_requests = [
+        {"repeatCell": {"range": {"sheetId": current["sheetId"], "startRowIndex": 1, "startColumnIndex": project_type_code_index, "endColumnIndex": project_type_code_index + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}},
+        {"repeatCell": {"range": {"sheetId": state["sheetId"], "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 2}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}},
+        {"autoResizeDimensions": {"dimensions": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "startIndex": len(BASE_COLUMNS), "endIndex": plan["target_column_count"]}}},
+        {"autoResizeDimensions": {"dimensions": {"sheetId": state["sheetId"], "dimension": "COLUMNS", "startIndex": 0, "endIndex": 3}}},
+    ]
+    if currency_id_index is not None:
+        formatting_requests.append({"repeatCell": {"range": {"sheetId": current["sheetId"], "startRowIndex": 1, "startColumnIndex": currency_id_index, "endColumnIndex": currency_id_index + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}})
     api(
         f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate",
         token,
-        {"requests": [
-            {"repeatCell": {"range": {"sheetId": current["sheetId"], "startRowIndex": 1, "startColumnIndex": len(BASE_COLUMNS), "endColumnIndex": len(BASE_COLUMNS) + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}},
-            {"repeatCell": {"range": {"sheetId": state["sheetId"], "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 2}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}},
-            {"autoResizeDimensions": {"dimensions": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "startIndex": len(BASE_COLUMNS), "endIndex": plan["target_column_count"]}}},
-            {"autoResizeDimensions": {"dimensions": {"sheetId": state["sheetId"], "dimension": "COLUMNS", "startIndex": 0, "endIndex": 3}}},
-        ]},
+        {"requests": formatting_requests},
     )
     return {"sheets": fresh_sheets, "project_types_sheet_id": state["sheetId"]}
 
@@ -277,9 +292,9 @@ def _rollback_project_type_layout(token: str, sid: str, plan: dict[str, Any], pr
     requests: list[dict[str, Any]] = []
     if not plan["state_exists"] and state:
         requests.append({"deleteSheet": {"sheetId": state["sheetId"]}})
-    if plan["source_column_count"] < plan["target_column_count"]:
+    if plan["source_grid_column_count"] < plan["target_column_count"]:
         actual_count = current.get("gridProperties", {}).get("columnCount", 0)
-        source_count = plan["source_column_count"]
+        source_count = plan["source_grid_column_count"]
         if actual_count > source_count:
             requests.append({"deleteDimension": {"range": {"sheetId": current["sheetId"], "dimension": "COLUMNS", "startIndex": source_count, "endIndex": actual_count}}})
     if requests:
@@ -291,7 +306,7 @@ def _rollback_project_type_layout(token: str, sid: str, plan: dict[str, Any], pr
     restored_sheets = restored_meta.get("sheets", [])
     restored_current = next((s.get("properties", {}) for s in restored_sheets if s.get("properties", {}).get("title") == "projects_current"), None)
     restored_state = next((s.get("properties", {}) for s in restored_sheets if s.get("properties", {}).get("title") == "project_types"), None)
-    expected_count = plan["source_column_count"]
+    expected_count = plan["source_grid_column_count"]
     if not restored_current or restored_current.get("gridProperties", {}).get("columnCount") != expected_count:
         raise RuntimeError("schema rollback column-count readback mismatch")
     if not plan["state_exists"] and restored_state:
@@ -397,26 +412,27 @@ def _validate_authoritative_universe(universe: list[dict[str, Any]]) -> set[str]
 
 
 def _upgrade_projects_rows(rows: list[list[Any]], source_columns: list[str], target_columns: list[str] | None = None) -> list[list[Any]]:
-    target_columns = target_columns or PROJECT_TYPE_SCHEMA
+    target_columns = target_columns or COLUMNS
     if not rows:
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
-    if source_columns == target_columns:
-        if rows[0] != target_columns:
-            raise RuntimeError("baseline sheet unavailable or schema mismatch")
-        return [target_columns] + [list(row) + [""] * max(0, len(target_columns) - len(row)) for row in rows[1:]]
-    if source_columns == PROJECT_TYPE_SCHEMA:
-        if rows[0] == target_columns:
-            return [list(row) + [""] * max(0, len(target_columns) - len(row)) for row in rows]
-        if rows[0] == PROJECT_TYPE_SCHEMA:
-            return [target_columns] + [list(row) + [""] * (len(target_columns) - len(PROJECT_TYPE_SCHEMA)) for row in rows[1:]]
-        if rows[0] == BASE_COLUMNS:
-            return [target_columns] + [list(row) + [""] * (len(target_columns) - len(BASE_COLUMNS)) for row in rows[1:]]
+    if rows[0] != source_columns or len(source_columns) != len(set(source_columns)):
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
-    if rows[0] != source_columns:
-        raise RuntimeError("baseline sheet unavailable or schema mismatch")
-    if source_columns != BASE_COLUMNS:
+    supported_source_schemas = {tuple(BASE_COLUMNS), tuple(PROJECT_TYPE_SCHEMA), tuple(COLUMNS)}
+    # A workflow-enabled projects_current has its 21 analytics fields after
+    # the qualified 33-column contract. Accept that exact additive schema too.
+    workflow_source = tuple(primary_columns(PROJECT_TYPE_SCHEMA))
+    supported_source_schemas.add(workflow_source)
+    if tuple(source_columns) not in supported_source_schemas and tuple(source_columns) != tuple(target_columns):
         raise RuntimeError("unsupported projects_current source schema")
-    return [target_columns] + [list(row) + [""] * (len(target_columns) - len(BASE_COLUMNS)) for row in rows[1:]]
+    if any(column not in target_columns for column in source_columns):
+        raise RuntimeError("projects_current source columns are not a subset of target schema")
+    if source_columns == target_columns:
+        return [target_columns] + [list(row) + [""] * max(0, len(target_columns) - len(row)) for row in rows[1:]]
+    output = [target_columns]
+    for row in rows[1:]:
+        mapped = {column: row[index] if index < len(row) else "" for index, column in enumerate(source_columns)}
+        output.append([mapped.get(column, "") for column in target_columns])
+    return output
 
 
 def _workflow_enabled() -> bool:
@@ -1069,7 +1085,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     sid = _production_target()
     token = google_token()
     workflow_enabled = _workflow_enabled()
-    columns = primary_columns(PROJECT_TYPE_SCHEMA) if workflow_enabled else PROJECT_TYPE_SCHEMA
+    columns = (primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS) if workflow_enabled else COLUMNS
     universe = checkpoint["universe"]
     authoritative_ids = _validate_authoritative_universe(universe)
     selected = checkpoint["selected"]
@@ -1218,13 +1234,12 @@ def run() -> dict[str, Any]:
     sid = _production_target()
     started_at = now()
     started_monotonic = time.monotonic()
-    # Production is already on the persisted 33-column Project Type contract.
-    # Keep this schema unconditional so a missing feature flag cannot silently
-    # publish the legacy 31-column layout over AF:AG.
+    # Keep the current additive schema unconditional; a missing feature flag
+    # cannot publish an older layout over established production columns.
     project_type_enabled = True
     workflow_enabled = _workflow_enabled()
     payment_enabled = _payment_refresh_enabled()
-    columns = primary_columns(PROJECT_TYPE_SCHEMA) if workflow_enabled else PROJECT_TYPE_SCHEMA
+    columns = (primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS) if workflow_enabled else COLUMNS
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
     _stage("BASELINE_READ_START")
@@ -1247,6 +1262,10 @@ def run() -> dict[str, Any]:
             source_columns = BASE_COLUMNS
         elif header == PROJECT_TYPE_SCHEMA:
             source_columns = PROJECT_TYPE_SCHEMA
+        elif header == COLUMNS:
+            source_columns = COLUMNS
+        elif header == primary_columns(PROJECT_TYPE_SCHEMA):
+            source_columns = primary_columns(PROJECT_TYPE_SCHEMA)
         elif header == columns:
             source_columns = columns
         else:
@@ -1473,7 +1492,7 @@ def run() -> dict[str, Any]:
             candidate_ids = {str(r[0]) for r in candidate[1:] if r and r[0] not in (None, "")}
             _validate_project_type_state_materialization(merged, state, applicable_ids)
             layout_plan["planned"] = layout_plan.get("planned", []) + (["WRITE project_types state"] if state != validate_state_rows(previous_state_rows) else [])
-            layout_plan["planned"] = layout_plan.get("planned", []) + ["WRITE projects_current A:AG"]
+            layout_plan["planned"] = layout_plan.get("planned", []) + [f"WRITE projects_current A:{col(len(columns)-1)}"]
         _stage(f"LIFECYCLE_RECONCILIATION_PASS | authoritative={len(authoritative_ids)} | stale_pruned={len(stale_ids)}")
         _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
         _stage("CANDIDATE_VALIDATION_PASS")

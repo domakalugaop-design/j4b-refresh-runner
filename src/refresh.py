@@ -24,9 +24,14 @@ from .technical_ids import integer_id
 SHEET_NAME = os.environ.get("GOOGLE_WORKSHEET", "projects_current")
 BASE_COLUMNS = ["project_id","project_name","period","plan","plan_value","plan_status","created","completed","unassigned","execution_pct","plan_missing_with_activity","has_period_marker","project_start","project_end","elapsed_pct","lag","risk_status","risk_reason","validation_state","last_refreshed","client","primary_manager","coordinators","date_from","date_to","scope","manager_payment","wave","assigned","questionnaire_filled","rejected"]
 PROJECT_TYPE_COLUMNS = BASE_COLUMNS + ["project_type_code", "project_type_name"]
+# Currency is a project-level dimension sourced from the already acquired edit
+# response. Keep the prior 33-column contract named for migration/readback,
+# then append nullable currency facts without moving any existing columns.
+CURRENCY_COLUMNS = ["currency_id", "currency_code", "currency_name", "currency_symbol"]
+CURRENCY_PROJECT_COLUMNS = PROJECT_TYPE_COLUMNS + CURRENCY_COLUMNS
 # The normal runner contract is the production schema. BASE_COLUMNS remains
 # explicit for validating and upgrading legacy 31-column baselines.
-COLUMNS = PROJECT_TYPE_COLUMNS
+COLUMNS = CURRENCY_PROJECT_COLUMNS
 PERIOD_MARKER_RE = re.compile(r"(?:^|[^0-9])(0[1-9]|1[0-2])(\d{2})(?!\d)")
 UNMAPPED_PRESERVE_COLUMNS = [
     "period", "unassigned", "has_period_marker", "project_start", "project_end", "elapsed_pct", "lag",
@@ -209,6 +214,10 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
             "scope": text(project.get("scope")),
             "manager_payment": value(project.get("manager_payment")),
             "wave": text(project.get("wave")),
+            "currency_id": text(project.get("currency_id")),
+            "currency_code": text(project.get("currency_code")),
+            "currency_name": text(project.get("currency_name")),
+            "currency_symbol": text(project.get("currency_symbol")),
             "assigned": sum(code == "20" for code in codes),
             "questionnaire_filled": sum(code == "30" for code in codes),
             "rejected": sum(code == "35" for code in codes),

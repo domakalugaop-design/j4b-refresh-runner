@@ -3,6 +3,7 @@ from __future__ import annotations
 import html as html_lib
 import re
 from typing import Any
+from html.parser import HTMLParser
 
 from .workflow_analytics import WORKFLOW_STATES
 
@@ -23,6 +24,154 @@ _WORKFLOW_LABELS.update({
     "отчет выполнен", "отчет принят", "оплачено", "ожидает оплату",
     "анкета подтверждена", "есть претензия",
 })
+
+# Read-only snapshot of the Portal currency dictionary on dfb, used only to
+# resolve stable dictionary keys emitted by the already-acquired project edit
+# form. Unknown/new keys fail closed in acquisition rather than guessing.
+# Values are (code, name, raw Portal sym); html entities in sym are decoded
+# before materialization for a usable display symbol.
+PORTAL_CURRENCY_DICTIONARY: dict[str, tuple[str, str, str]] = {
+    "1": ("RUB", "рубль", "₽"),
+    "2": ("ARM", "Драм - армянский", "֏"),
+    "3": ("AZN", "Манат - азейбарджаский", "₼"),
+    "4": ("GEL", "Лари - грузинский", "&#8382;"),
+    "5": ("BYN", "Белорусский рубль", "Б"),
+    "6": ("KZT", "Казахский тенге", "₸"),
+    "7": ("KGS", "Киргизский сом", "с"),
+    "8": ("USDT", "долар - крипта", "$"),
+    "9": ("UZS", "Узбекский сум", "UZS"),
+    "10": ("XOF", "Западноафриканский франк", "₣"),
+}
+
+
+class _EditFormInspector(HTMLParser):
+    """Collect only form/control structure; never retain response text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.forms: list[set[str]] = []
+        self._form: set[str] | None = None
+        self.currency_selects: list[dict[str, Any]] = []
+        self._currency: dict[str, Any] | None = None
+        self.login_form = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        tag = tag.lower()
+        if tag == "form":
+            self._form = set()
+            self.forms.append(self._form)
+        name = attributes.get("name")
+        if tag in {"input", "select", "textarea", "button"} and name:
+            if self._form is not None:
+                self._form.add(name)
+            if name in {"_login", "_password"}:
+                self.login_form = True
+        if tag == "select" and name == "currency":
+            self._currency = {
+                "multiple": "multiple" in attributes,
+                "options": [],
+            }
+            self.currency_selects.append(self._currency)
+        elif tag == "option" and self._currency is not None:
+            self._currency["options"].append({
+                "value": attributes.get("value"),
+                "selected": "selected" in attributes,
+                "text": "",
+            })
+
+    def handle_data(self, data: str) -> None:
+        if self._currency is not None and self._currency["options"]:
+            self._currency["options"][-1]["text"] += data
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "select":
+            self._currency = None
+        elif tag.lower() == "form":
+            self._form = None
+
+
+def parse_currency_select(html: str) -> dict[str, Any]:
+    """Parse the selected raw Portal currency key and its dictionary values.
+
+    An absent control, empty selection, or control without an explicit
+    selected option remains nullable. Browser fallback selection of the first
+    option is deliberately not treated as a persisted project value.
+    """
+    inspector = _EditFormInspector()
+    inspector.feed(html)
+    if not inspector.currency_selects:
+        return {
+            "state": "FIELD_NOT_EXPOSED", "value": None,
+            "currency_code": None, "currency_name": None,
+            "currency_symbol": None, "dictionary_match": None,
+        }
+    if len(inspector.currency_selects) != 1:
+        return {
+            "state": "CONTROL_AMBIGUOUS", "value": None,
+            "currency_code": None, "currency_name": None,
+            "currency_symbol": None, "dictionary_match": False,
+        }
+    control = inspector.currency_selects[0]
+    selected = [option for option in control["options"] if option["selected"]]
+    if len(selected) > 1 or control["multiple"]:
+        return {
+            "state": "SELECTION_AMBIGUOUS", "value": None,
+            "currency_code": None, "currency_name": None,
+            "currency_symbol": None, "dictionary_match": False,
+        }
+    if not selected:
+        return {
+            "state": "CONTROL_PRESENT_NO_SELECTION", "value": None,
+            "currency_code": None, "currency_name": None,
+            "currency_symbol": None, "dictionary_match": None,
+        }
+    option = selected[0]
+    raw_id = option["value"]
+    if raw_id in (None, ""):
+        return {
+            "state": "FIELD_PRESENT_EMPTY", "value": None,
+            "currency_code": None, "currency_name": None,
+            "currency_symbol": None, "dictionary_match": None,
+        }
+    raw_id = str(raw_id).strip()
+    dictionary = PORTAL_CURRENCY_DICTIONARY.get(raw_id)
+    if dictionary is None:
+        return {
+            "state": "VALUE_PRESENT", "value": raw_id,
+            "currency_code": None, "currency_name": None,
+            "currency_symbol": None, "dictionary_match": False,
+        }
+    code, name, symbol = dictionary
+    selected_text = " ".join(html_lib.unescape(option["text"]).split())
+    dictionary_match = selected_text == " ".join(name.split())
+    return {
+        "state": "VALUE_PRESENT", "value": raw_id,
+        "currency_code": code, "currency_name": name,
+        "currency_symbol": html_lib.unescape(symbol),
+        "dictionary_match": dictionary_match,
+    }
+
+
+def inspect_project_edit_structure(html: str) -> dict[str, Any]:
+    """Return safe structural markers for an expected project edit resource."""
+    inspector = _EditFormInspector()
+    inspector.feed(html)
+    required = {"name", "dt1", "dt2", "visits", "client", "user"}
+    form_present = any(required.issubset(form) for form in inspector.forms)
+    lower = html.lower()
+    text = plain_text(html).casefold()
+    php_error = bool(re.search(r"php\s+(?:parse|fatal)\s+error|parse error:|fatal error:|uncaught exception", text))
+    access_denied = bool(re.search(r"access denied|доступ запрещ[её]н|нет доступа|http\s*403", text))
+    return {
+        "html_document": "<!doctype" in lower or "<html" in lower,
+        "form_present": bool(inspector.forms),
+        "project_form_present": form_present,
+        "login_form_present": inspector.login_form,
+        "php_error_present": php_error,
+        "access_denied_present": access_denied,
+        "currency_control_count": len(inspector.currency_selects),
+    }
 
 
 def plain_text(fragment: str) -> str:
@@ -114,6 +263,17 @@ def parse_edit(html: str) -> dict[str, Any]:
             "selected_count": len(selected),
             "selected_values": selected,
             "value": value,
+        }
+    currency = parse_currency_select(html)
+    fields["currency_id"] = {
+        "state": currency["state"], "value": currency["value"],
+        "dictionary_match": currency["dictionary_match"],
+    }
+    for name in ("currency_code", "currency_name", "currency_symbol"):
+        fields[name] = {
+            "state": currency["state"] if currency["value"] is not None else currency["state"],
+            "value": currency[name],
+            "dictionary_match": currency["dictionary_match"],
         }
     return fields
 

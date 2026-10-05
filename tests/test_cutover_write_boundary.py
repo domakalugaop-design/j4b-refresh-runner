@@ -40,7 +40,7 @@ def test_prevalidation_write_regression_31_columns_and_missing_state_only_plans(
     with patch("src.production.api") as sheet_api:
         plan = production._plan_project_type_layout(_meta())
     assert plan["state_exists"] is False
-    assert plan["planned"] == ["EXPAND projects_current A:AE -> A:AG", "CREATE project_types"]
+    assert plan["planned"] == ["EXPAND projects_current to 37 columns", "CREATE project_types"]
     assert plan["requests"]
     sheet_api.assert_not_called()
 
@@ -105,7 +105,7 @@ def test_checkpoint_materialization_preflight_loads_baseline_before_merge(monkey
 
     def merge(_rows, previous, _selected_ids, _timestamp, *, columns):
         observed["baseline"] = previous
-        assert columns == production.PROJECT_TYPE_SCHEMA
+        assert columns == production.COLUMNS
         return [{"project_id": "1"}]
 
     monkeypatch.setattr(production, "merge_previous", merge)
@@ -121,7 +121,8 @@ def test_checkpoint_materialization_preflight_loads_baseline_before_merge(monkey
     result = production.run_from_acquisition_checkpoint()
 
     assert result["FINAL_STATUS"] == "MATERIALIZATION_PREFLIGHT_PASS"
-    assert observed["baseline"][0] == header
+    assert observed["baseline"][0] == production.COLUMNS
+    assert observed["baseline"][0][:len(header)] == header
 
 
 def test_bootstrap_rejects_pre_cutoff_unknown_target_and_name_mismatch(tmp_path):

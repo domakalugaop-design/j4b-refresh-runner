@@ -78,7 +78,7 @@ def _initial_portal_session() -> PortalSession:
         password=_keychain_credential("password"),
     )
 NON_PAYMENT_TABS = {
-    "projects_current": "A:AG",
+    "projects_current": None,
     "project_types": "A:C",
     "Статусы проектов": "A:Y",
 }
@@ -164,6 +164,11 @@ def _fingerprint_nonpayment_tabs(token: str, sid: str) -> dict[str, str]:
     for title, columns in NON_PAYMENT_TABS.items():
         if title not in properties:
             raise RuntimeError(f"protected non-payment tab is missing: {title}")
+        if title == "projects_current":
+            width = properties[title].get("gridProperties", {}).get("columnCount")
+            if not isinstance(width, int) or width < 1:
+                raise RuntimeError("projects_current protected width unavailable")
+            columns = f"A:{production.col(width - 1)}"
         encoded = urllib.parse.quote(f"'{title}'!{columns}", safe="!:'")
         rows = api_get(
             f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE",

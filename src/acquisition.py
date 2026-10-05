@@ -11,7 +11,10 @@ from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from .parsers import parse_action_table, parse_edit, parse_visit_table, plain_text
+from .parsers import (
+    inspect_project_edit_structure, parse_action_table, parse_edit,
+    parse_visit_table, plain_text,
+)
 from .portal_transport import PortalTransportError
 from .workflow_analytics import WORKFLOW_STATE_CODES
 
@@ -280,6 +283,19 @@ def _semantic_failures(
     if canonical_name in (None, ""):
         failures.append("universe:PROJECT_NAME_MISSING")
 
+    edit_structure = inspect_project_edit_structure(edit_html)
+    if edit.get("http_status") == 200 and edit.get("body"):
+        if not edit_structure["html_document"]:
+            failures.append("edit:NOT_HTML_DOCUMENT")
+        if edit_structure["login_form_present"]:
+            failures.append("edit:LOGIN_PAGE")
+        if edit_structure["php_error_present"]:
+            failures.append("edit:PHP_ERROR")
+        if edit_structure["access_denied_present"]:
+            failures.append("edit:ACCESS_DENIED")
+        if not edit_structure["project_form_present"]:
+            failures.append("edit:PROJECT_FORM_MISSING")
+
     expected_edit_fields = (
         "project_name", "date_from", "date_to", "planned_visit_count", "client",
         "primary_manager", "coordinators", "scope", "manager_payment", "wave",
@@ -311,6 +327,11 @@ def _semantic_failures(
         failures.append("edit:CANONICAL_NAME_MISMATCH")
     if edit_html and ("<html" not in edit_html.lower() and "<!doctype" not in edit_html.lower()):
         failures.append("edit:NOT_HTML_DOCUMENT")
+    currency_id = edit_fields.get("currency_id", {}) if edit_fields else {}
+    if currency_id.get("state") == "VALUE_PRESENT" and currency_id.get("dictionary_match") is False:
+        failures.append("edit:CURRENCY_DICTIONARY_MISMATCH")
+    if currency_id.get("state") in {"CONTROL_AMBIGUOUS", "SELECTION_AMBIGUOUS"}:
+        failures.append("edit:CURRENCY_SELECTION_AMBIGUOUS")
     if action_html and ("<html" not in action_html.lower() and "<!doctype" not in action_html.lower()):
         failures.append("action:NOT_HTML_DOCUMENT")
     return failures
@@ -378,6 +399,10 @@ def acquire_project(
         "scope": edit_fields.get("scope", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "manager_payment": edit_fields.get("manager_payment", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "wave": edit_fields.get("wave", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
+        "currency_id": edit_fields.get("currency_id", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
+        "currency_code": edit_fields.get("currency_code", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
+        "currency_name": edit_fields.get("currency_name", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
+        "currency_symbol": edit_fields.get("currency_symbol", {"value": None, "state": "FIELD_NOT_EXPOSED"}),
         "acquisition_state": acquisition_state,
         "acquisition_failure_reasons": [
             f"{failure['request_stage']}:{failure['failure_class']}" for failure in request_failures
