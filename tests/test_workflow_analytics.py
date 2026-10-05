@@ -1,6 +1,6 @@
 import pytest
 
-from src.acquisition import ACTION_STATE_CODES, Reader, acquire_project
+from src.acquisition import ACTION_STATE_CODES, Reader, action_index, acquire_project
 from src.parsers import parse_action_table
 from src.workflow_analytics import WORKFLOW_STATE_CODES, deduplicate_memberships, project_workflow_metrics
 
@@ -128,3 +128,29 @@ def test_unrelated_numeric_control_with_non_state_label_is_ignored():
         '<a href="/action/362206">Открыть действие</a></td></tr>'
     )
     assert parse_action_table(html, "42")[0]["workflow_state_codes"] == []
+
+
+def test_action_zero_red_row_is_explicit_unassigned_not_state_or_assigned():
+    html = (
+        '<tr class="table-red"><td><a href="/proj/42">P</a>'
+        '<a href="/visit/9">V</a><a href="/action/0">0</a></td></tr>'
+    )
+    row = parse_action_table(html, "42")[0]
+    assert row["action_id"] == "0"
+    assert row["participant_assigned"] is False
+    assert row["assignment_state"] == "UNASSIGNED_FREE"
+    assert row["workflow_state_codes"] == []
+    indexed = action_index(html, "42")["9"]
+    assert indexed["action_id"] == "0"
+    assert indexed["assignment_state"] == "UNASSIGNED_FREE"
+
+
+def test_explicit_unassigned_marker_wins_over_invitation_event_for_same_visit():
+    html = (
+        labeled_action_row("9", 0, "Отправлено приглашение", action="222")
+        + '<tr class="table-red"><td><a href="/proj/42">P</a>'
+        '<a href="/visit/9">V</a><a href="/action/0">0</a></td></tr>'
+    )
+    indexed = action_index(html, "42")["9"]
+    assert indexed["action_id"] == "0"
+    assert indexed["assignment_state"] == "UNASSIGNED_FREE"

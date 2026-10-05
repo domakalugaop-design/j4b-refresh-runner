@@ -186,6 +186,14 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
             "plan_value": plan,
             "plan_status": "PLAN_MISSING_DATA" if plan is None else "VALID_PLAN",
             "created": len(pv),
+            # Portal-defined free Visits are explicit /action/0 rows.  Count
+            # unique existing Visit IDs; never infer from plan or sum states.
+            "unassigned": len({
+                str(v.get("visit_id"))
+                for v in pv
+                if str(value(v.get("assignment_state")) or "") == "UNASSIGNED_FREE"
+                or str(value(v.get("action_id")) or "") == "0"
+            }),
             "completed": sum(code in COMPLETED_CODES for code in codes),
             "execution_pct": (sum(code in COMPLETED_CODES for code in codes) / plan if isinstance(plan, (int, float)) and plan > 0 else None),
             "plan_missing_with_activity": plan is None and bool(pv),

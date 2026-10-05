@@ -59,6 +59,46 @@ def test_missing_plan_is_not_zero():
     assert row["plan_missing_with_activity"] is True
 
 
+def test_project_dates_materialize_from_existing_edit_fields_and_preserve_missing():
+    projects = [
+        {"project_id": "8184", "date_from": {"value": "01.09.2026"}, "date_to": {"value": "30.09.2026"}},
+        {"project_id": "8185", "date_from": {"value": None}, "date_to": {"value": None}},
+    ]
+    rows = materialize(projects, [], "2026-10-05T00:00:00+00:00")
+    assert rows[0]["date_from"] == "2026-09-01"
+    assert rows[0]["date_to"] == "2026-09-30"
+    assert rows[1]["date_from"] is None
+    assert rows[1]["date_to"] is None
+    assert "date_from" in COLUMNS and "date_to" in COLUMNS
+
+
+def test_free_visits_counts_distinct_explicit_unassigned_ids_not_plan_or_states():
+    projects = [{"project_id": "8184", "planned_visit_count": {"value": 13}, "acquisition_state": "ACQUIRED"}]
+    visits = [
+        {"project_id": "8184", "visit_id": "730180", "action_id": {"value": "0"}, "assignment_state": {"value": "UNASSIGNED_FREE"}, "raw_status": {"value": ""}},
+        {"project_id": "8184", "visit_id": "730180", "action_id": {"value": "0"}, "assignment_state": {"value": "UNASSIGNED_FREE"}, "raw_status": {"value": ""}},
+        {"project_id": "8184", "visit_id": "730182", "action_id": {"value": "123"}, "assignment_state": {"value": "ASSIGNED"}, "raw_status": {"value": "15"}},
+        {"project_id": "8184", "visit_id": "730186", "action_id": {"value": "124"}, "assignment_state": {"value": "ASSIGNED"}, "raw_status": {"value": "20"}},
+        {"project_id": "8184", "visit_id": "730189", "action_id": {"value": None}, "assignment_state": {"value": "UNKNOWN"}, "raw_status": {"value": ""}},
+    ]
+    row = materialize(projects, visits, "2026-10-05T00:00:00+00:00")[0]
+    assert row["plan"] == 13
+    assert row["created"] == 5
+    assert row["unassigned"] == 1
+
+
+def test_free_visits_are_project_scoped_and_hidden_project_does_not_leak():
+    projects = [{"project_id": "8184", "planned_visit_count": {"value": 1}, "acquisition_state": "ACQUIRED"}]
+    visits = [
+        {"project_id": "8184", "visit_id": "1", "action_id": {"value": "0"}, "assignment_state": {"value": "UNASSIGNED_FREE"}},
+        {"project_id": "8185", "visit_id": "2", "action_id": {"value": "0"}, "assignment_state": {"value": "UNASSIGNED_FREE"}},
+    ]
+    rows = materialize(projects, visits, "2026-10-05T00:00:00+00:00")
+    assert [row["project_id"] for row in rows] == [8184]
+    assert rows[0]["created"] == 1
+    assert rows[0]["unassigned"] == 1
+
+
 def test_native_serial_conversion():
     assert isinstance(sheets_serial("2026-09-04"), float)
     assert isinstance(sheets_serial("2026-09-04T10:00:00+00:00"), float)

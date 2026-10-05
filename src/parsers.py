@@ -133,9 +133,12 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
             continue
         action_match = re.search(r"/action/(\d+)", row)
         action_id = action_match.group(1) if action_match else ""
+        explicitly_unassigned = action_id == "0" and "table-red" in row_class
         links = [(identifier, plain_text(body)) for identifier, body in ACTION_LINK_RE.findall(row)]
         numeric = [text for _, text in links if text.isdigit()]
-        codes = [text for text in numeric if int(text) in WORKFLOW_STATES]
+        # In the red unassigned branch /action/0 is a sentinel link, not a
+        # my.state=0 membership (state-0 invitation rows use their my.i ID).
+        codes = [] if explicitly_unassigned else [text for text in numeric if int(text) in WORKFLOW_STATES]
         labels = [text for _, text in links if not text.isdigit()]
         # A structurally valid state control is represented by an action link
         # with a visible state label.  If such a control has no canonical code,
@@ -153,10 +156,18 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
             if label and not label.isdigit():
                 status_label = label
                 break
+        # The action page's optional unassigned Visit branch is represented
+        # by a red row linked to /action/0.  Keep this structural marker
+        # distinct from raw workflow-state predicates.
+        participant_assigned = (
+            False if explicitly_unassigned else
+            (action_id not in ("", "0") if "table-red" in row_class else True)
+        )
         rows.append({
             "visit_id": visit_match.group(1),
             "action_id": action_id,
-            "participant_assigned": "table-red" not in row_class or bool(action_id),
+            "participant_assigned": participant_assigned,
+            "assignment_state": "UNASSIGNED_FREE" if explicitly_unassigned else None,
             "visit_status": codes[-1] if codes else "",
             "workflow_state_codes": codes,
             "visit_status_label": status_label,

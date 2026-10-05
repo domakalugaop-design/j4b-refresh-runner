@@ -209,14 +209,21 @@ class Reader:
 def action_index(markup: str, project_id: str) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for row in parse_action_table(markup, project_id):
-        existing = result.get(row["visit_id"])
-        if existing and int(row.get("action_id") or 0) <= int(existing.get("action_id") or 0):
+        visit_id = row["visit_id"]
+        existing = result.get(visit_id)
+        explicit_free = row.get("assignment_state") == "UNASSIGNED_FREE"
+        if existing and existing.get("assignment_state") == "UNASSIGNED_FREE":
             continue
-        result[row["visit_id"]] = {
+        if existing and not explicit_free and int(row.get("action_id") or 0) <= int(existing.get("action_id") or 0):
+            continue
+        explicit_assignment = row.get("assignment_state")
+        if explicit_assignment != "UNASSIGNED_FREE":
+            explicit_assignment = "ASSIGNED" if row.get("participant_assigned") else "UNKNOWN"
+        result[visit_id] = {
             "raw_status": row.get("visit_status") or None,
             "status_label": row.get("visit_status_label") or None,
-            "assignment_state": "ASSIGNED" if row.get("participant_assigned") else "UNKNOWN",
-            "action_id": row.get("action_id") or None,
+            "assignment_state": explicit_assignment,
+            "action_id": row.get("action_id"),
         }
     return result
 
@@ -390,6 +397,7 @@ def acquire_project(
             "visit_id": visit_id,
             "raw_status": field(raw, "VALUE_PRESENT" if raw else "UNKNOWN", f"/action?project={project_id}"),
             "assignment_state": field(action_row.get("assignment_state", "UNKNOWN"), "VALUE_PRESENT" if visit_id in actions else "UNKNOWN", f"/action?project={project_id}"),
+            "action_id": field(action_row.get("action_id"), "VALUE_PRESENT" if action_row.get("action_id") is not None else "FIELD_NOT_EXPOSED", f"/action?project={project_id}"),
         })
     if track_progress:
         reader.project_done(acquisition_state)

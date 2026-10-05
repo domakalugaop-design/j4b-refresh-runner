@@ -52,6 +52,7 @@ def test_http_200_structurally_incomplete_edit_fails_closed_and_keeps_last_good(
         "project_id": "7998", "visit_id": "1",
         "raw_status": {"value": None, "state": "UNKNOWN", "provenance": {"route": "/action?project=7998"}},
         "assignment_state": {"value": "UNKNOWN", "state": "UNKNOWN", "provenance": {"route": "/action?project=7998"}},
+        "action_id": {"value": None, "state": "FIELD_NOT_EXPOSED", "provenance": {"route": "/action?project=7998"}},
     }]
     assert record["acquisition_state"] == "SEMANTIC_FAILURE"
     assert any(reason.startswith("edit:FIELD_NOT_EXPOSED:") for reason in record["acquisition_failure_reasons"])
