@@ -236,7 +236,75 @@ def textarea_field_state(html: str, field_name: str) -> tuple[str, str | None]:
     return "FIELD_NOT_EXPOSED", None
 
 
+class _ProjectEditFormLocator(HTMLParser):
+    """Locate forms by their project-edit controls, ignoring input-like text elsewhere."""
+
+    REQUIRED_FIELDS = {"name", "dt1", "dt2", "visits", "client", "user"}
+
+    def __init__(self, source: str):
+        super().__init__(convert_charrefs=True)
+        self.source = source
+        self.line_offsets = [0]
+        for match in re.finditer("\n", source):
+            self.line_offsets.append(match.end())
+        self.forms: list[dict[str, Any]] = []
+        self.current: dict[str, Any] | None = None
+
+    def _offset(self) -> int:
+        line, column = self.getpos()
+        return self.line_offsets[line - 1] + column
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "form":
+            self.current = {"start": self._offset(), "end": None, "fields": set()}
+            self.forms.append(self.current)
+            return
+        if self.current is not None and tag in {"input", "select", "textarea", "button"}:
+            name = dict(attrs).get("name")
+            if name:
+                self.current["fields"].add(name)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag.lower() == "form":
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "form" and self.current is not None:
+            offset = self._offset()
+            end_tag = re.match(r"</\s*form\s*>", self.source[offset:], re.IGNORECASE)
+            self.current["end"] = offset + (len(end_tag.group(0)) if end_tag else len("</form>"))
+            self.current = None
+
+    def project_form(self) -> str | None:
+        candidates = [
+            form for form in self.forms
+            if self.REQUIRED_FIELDS.issubset(form["fields"])
+            and form["end"] is not None
+        ]
+        if len(candidates) != 1:
+            return None
+        form = candidates[0]
+        return self.source[form["start"]:form["end"]]
+
+
+def _project_edit_form(html: str) -> str | None:
+    locator = _ProjectEditFormLocator(html)
+    locator.feed(html)
+    return locator.project_form()
+
+
 def parse_edit(html: str) -> dict[str, Any]:
+    # Portal pages may contain input-like fragments outside the project form
+    # (for example template/search markup). Regex parsing the full document can
+    # select one of those before the actual project name field.
+    project_form = _project_edit_form(html)
+    if project_form is None:
+        html = ""
+    else:
+        html = project_form
+
     fields: dict[str, Any] = {}
     for html_name, canonical_name in (
         ("name", "project_name"),

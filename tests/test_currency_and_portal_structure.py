@@ -75,6 +75,22 @@ def test_rub_currency_id_and_authoritative_dictionary_values_round_trip():
     assert [matrix[1][COLUMNS.index(key)] for key in COLUMNS[-4:]] == ["1", "RUB", "рубль", "₽"]
 
 
+def test_parse_edit_ignores_name_like_markup_outside_the_project_form():
+    decoys = (
+        "<form><input name='name' value='Men'></form>"
+        "<textarea><input name='name' value='Also Men'></textarea>"
+    )
+    source = decoys + edit_page()
+
+    parsed = parse_edit(source)
+    assert parsed["project_name"] == {
+        "state": "VALUE_PRESENT", "value": PROJECT_NAME,
+    }
+    record, _visits, _session = acquired(source)
+    assert record["project_name"]["value"] == PROJECT_NAME
+    assert record["acquisition_state"] == "ACQUIRED"
+
+
 def test_nullable_currency_control_empty_and_missing_are_not_defaulted():
     no_explicit_selection = "<select name='currency'><option value='1'>рубль</option></select>"
     assert parse_currency_select(edit_page(no_explicit_selection))["state"] == "CONTROL_PRESENT_NO_SELECTION"
