@@ -136,6 +136,18 @@ def test_project_redirect_to_different_id_fails_even_if_name_matches():
     assert "project:IDENTITY_MISMATCH" in record["acquisition_failure_reasons"]
 
 
+def test_edit_redirect_to_different_id_fails_even_if_name_matches():
+    name = "Project_Q3_0926"
+    session = FakeSession([
+        response(f"<!doctype html><html><body>{name}/visit/1</body></html>"),
+        (*response(complete_edit(name=name)), "https://lk.j4b.ru/proj/99/edit"),
+        response("<!doctype html><html><body>actions</body></html>"),
+    ])
+    record, _ = acquire_project(Reader(session, 3), {"project_id": "42", "project_name": name}, 0)
+    assert record["acquisition_state"] == "SEMANTIC_FAILURE"
+    assert "edit:IDENTITY_MISMATCH" in record["acquisition_failure_reasons"]
+
+
 def test_missing_name_does_not_allow_malformed_project_or_edit_page():
     session = FakeSession([
         response("plain response with no canonical name"),

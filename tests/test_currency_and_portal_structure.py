@@ -1,3 +1,5 @@
+import html
+
 from src.acquisition import Reader, acquire_project
 from src.parsers import inspect_project_edit_structure, parse_currency_select, parse_edit
 from src.payment_materialization import PROJECT_PUBLICATION_COLUMNS, VISIT_PUBLICATION_COLUMNS
@@ -27,8 +29,9 @@ def edit_page(currency="<select name='currency'><option value='1' selected>ру�
 class FakeSession:
     base_url = "https://lk.j4b.ru"
 
-    def __init__(self, edit):
+    def __init__(self, edit, project_name=PROJECT_NAME):
         self.edit = edit
+        self.project_name = project_name
         self.calls = []
         self.last_retry_after = None
         self.last_effective_url = None
@@ -37,7 +40,7 @@ class FakeSession:
         self.calls.append((path, method))
         self.last_effective_url = self.base_url + path
         body = (
-            f"<!doctype html><html><body>{PROJECT_NAME}<a href='/visit/123'>visit</a></body></html>"
+            f"<!doctype html><html><body>{html.escape(self.project_name)}<a href='/visit/123'>visit</a></body></html>"
             if path == f"/proj/{PROJECT_ID}"
             else self.edit
             if path == f"/proj/{PROJECT_ID}/edit"
@@ -46,11 +49,11 @@ class FakeSession:
         return 200, "text/html; charset=UTF-8", body.encode()
 
 
-def acquired(edit):
-    session = FakeSession(edit)
+def acquired(edit, project_name=PROJECT_NAME):
+    session = FakeSession(edit, project_name)
     record, visits = acquire_project(
         Reader(session, 3, max_retries=0, sleep=lambda _seconds: None),
-        {"project_id": PROJECT_ID, "project_name": PROJECT_NAME}, 0,
+        {"project_id": PROJECT_ID, "project_name": project_name}, 0,
     )
     return record, visits, session
 
@@ -88,6 +91,38 @@ def test_parse_edit_ignores_name_like_markup_outside_the_project_form():
     }
     record, _visits, _session = acquired(source)
     assert record["project_name"]["value"] == PROJECT_NAME
+    assert record["acquisition_state"] == "ACQUIRED"
+
+
+def test_real_structure_apostrophe_fix_and_html_attribute_values():
+    values = [
+        ('Men\'s Look', '"Men\'s Look"'),
+        ('O\'Reilly', '"O\'Reilly"'),
+        ('John\'s project', '"John\'s project"'),
+        ('Проект без апострофа', '"Проект без апострофа"'),
+        ('"quoted" project', "'\"quoted\" project'"),
+        ('A & B', '"A & B"'),
+        ('A < B', '"A &lt; B"'),
+        ('O\'Reilly', '"O&#39;Reilly"'),
+    ]
+    for expected, attribute in values:
+        # Mirrors the observed Portal shape: a project form with POST method,
+        # no explicit action, and a double-quoted name value when apostrophes
+        # occur. The placeholder remains intentionally synthetic.
+        source = edit_page().replace(
+            f"<form action='/proj/{PROJECT_ID}/edit' method='post'>",
+            "<form method='post'>",
+        ).replace(f"value='{PROJECT_NAME}'", f"value={attribute}")
+        parsed = parse_edit(source)["project_name"]
+        assert parsed["state"] == "VALUE_PRESENT"
+        assert html.unescape(parsed["value"]) == expected
+
+    apostrophe_source = edit_page().replace(
+        f"<form action='/proj/{PROJECT_ID}/edit' method='post'>",
+        "<form method='post'>",
+    ).replace(f"value='{PROJECT_NAME}'", 'value="Men\'s Look store"')
+    record, _visits, _session = acquired(apostrophe_source, "Men's Look store")
+    assert record["project_name"]["value"] == "Men's Look store"
     assert record["acquisition_state"] == "ACQUIRED"
 
 

@@ -13,7 +13,10 @@ SELECT_RE = re.compile(r"<select\b([^>]*)>(.*?)</select\s*>", re.IGNORECASE | re
 TEXTAREA_RE = re.compile(r"<textarea\b([^>]*)>(.*?)</textarea\s*>", re.IGNORECASE | re.DOTALL)
 OPTION_OPEN_RE = re.compile(r"<option\b([^>]*)>", re.IGNORECASE)
 NAME_RE = re.compile(r"\bname\s*=\s*[\"']([^\"']+)[\"']", re.IGNORECASE)
-VALUE_RE = re.compile(r"\bvalue\s*=\s*[\"']([^\"']*)[\"']", re.IGNORECASE)
+VALUE_RE = re.compile(
+    r"\bvalue\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'=<>`]+))",
+    re.IGNORECASE,
+)
 VISIT_LINK_RE = re.compile(r"/visit/(\d+)", re.IGNORECASE)
 ACTION_LINK_RE = re.compile(r'<a\b[^>]*href=["\']/action/(\d+)["\'][^>]*>(.*?)</a\s*>', re.IGNORECASE | re.DOTALL)
 
@@ -187,16 +190,40 @@ def _number_or_text(value: str | None) -> int | str | None:
         return value
 
 
+def _attribute_value(match: re.Match[str]) -> str:
+    """Return an HTML attribute value without treating the other quote as its delimiter."""
+    return next((group for group in match.groups() if group is not None), "")
+
+
+class _InputFieldLocator(HTMLParser):
+    """Find a named input structurally, then read its raw attribute spelling."""
+
+    def __init__(self, field_name: str):
+        super().__init__(convert_charrefs=True)
+        self.field_name = field_name
+        self.state = "FIELD_NOT_EXPOSED"
+        self.value: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "input" or self.state != "FIELD_NOT_EXPOSED":
+            return
+        attributes = dict(attrs)
+        if attributes.get("name") != self.field_name:
+            return
+        if "value" not in attributes or attributes["value"] in (None, ""):
+            self.state = "FIELD_PRESENT_EMPTY"
+            self.value = None
+            return
+        raw_tag = self.get_starttag_text() or ""
+        value_match = VALUE_RE.search(raw_tag)
+        self.state = "VALUE_PRESENT"
+        self.value = _attribute_value(value_match) if value_match else str(attributes["value"])
+
+
 def input_field_state(html: str, field_name: str) -> tuple[str, str | None]:
-    for attrs in INPUT_RE.findall(html):
-        name = NAME_RE.search(attrs)
-        if not name or name.group(1) != field_name:
-            continue
-        value = VALUE_RE.search(attrs)
-        if value and value.group(1).strip():
-            return "VALUE_PRESENT", value.group(1).strip()
-        return "FIELD_PRESENT_EMPTY", None
-    return "FIELD_NOT_EXPOSED", None
+    locator = _InputFieldLocator(field_name)
+    locator.feed(html)
+    return locator.state, locator.value.strip() if locator.value is not None else None
 
 
 def select_field_state(html: str, field_name: str) -> tuple[str, list[dict[str, str]]]:
@@ -219,7 +246,7 @@ def select_field_state(html: str, field_name: str) -> tuple[str, list[dict[str, 
             if re.search(r"\bselected\b", option_attrs, re.IGNORECASE):
                 raw = VALUE_RE.search(option_attrs)
                 selected.append({
-                    "value": raw.group(1).strip() if raw and raw.group(1) else "",
+                    "value": _attribute_value(raw).strip() if raw else "",
                     "label": plain_text(options[start:end]),
                 })
         return ("VALUE_PRESENT", selected) if selected else ("FIELD_PRESENT_EMPTY", [])
