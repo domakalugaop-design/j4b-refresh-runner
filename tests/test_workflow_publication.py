@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from src.refresh import COLUMNS
+from src.production import _log_publication_failure
 from src.workflow_publication import (
     PRIMARY_ANALYTICS_COLUMNS,
     THIRD_TAB_COLUMNS,
@@ -30,6 +31,15 @@ def materialized(pid, **overrides):
     row["workflow_covered_visits"] = min(row.get("workflow_covered_visits", 0), row["project_visit_count"])
     row["workflow_unclassified_visits"] = row["project_visit_count"] - row["workflow_covered_visits"]
     return row
+
+
+def test_publication_failure_emits_safe_specific_diagnostic(capsys):
+    _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", RuntimeError("projects_current full readback mismatch"))
+    output = capsys.readouterr().out
+    assert "PUBLICATION_FAILURE" in output
+    assert "PROJECT_TYPE_AND_PROJECTS_CURRENT" in output
+    assert '"function": "publish_project_type_refresh"' in output
+    assert "PROJECTS_CURRENT_READBACK_MISMATCH" in output
 
 
 def test_third_tab_has_exactly_fourteen_human_readable_workflow_columns_and_business_diagnostics():

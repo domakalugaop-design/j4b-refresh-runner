@@ -754,6 +754,12 @@ def _safe_failure_class(exc: BaseException) -> str:
     """Map internal failures to a non-sensitive operational diagnostic."""
     message = str(exc).casefold()
     classifications = (
+        ("projects_current full readback mismatch", "PROJECTS_CURRENT_READBACK_MISMATCH"),
+        ("project_types rollback readback mismatch", "PROJECT_TYPES_ROLLBACK_READBACK_MISMATCH"),
+        ("project_types rollback failed", "PROJECT_TYPES_ROLLBACK_FAILED"),
+        ("project type state rollback failed", "PROJECT_TYPE_STATE_ROLLBACK_FAILED"),
+        ("project_types readback mismatch", "PROJECT_TYPES_READBACK_MISMATCH"),
+        ("non-target worksheet fingerprint changed", "NON_TARGET_FINGERPRINT_CHANGED"),
         ("source schema width mismatch", "SHEET_SOURCE_SCHEMA_WIDTH_MISMATCH"),
         ("baseline sheet header schema mismatch", "SHEET_HEADER_SCHEMA_MISMATCH"),
         ("baseline sheet unavailable or schema mismatch", "SHEET_BASELINE_SCHEMA_MISMATCH"),
@@ -766,6 +772,16 @@ def _safe_failure_class(exc: BaseException) -> str:
         if needle in message:
             return classification
     return type(exc).__name__.upper()
+
+
+def _log_publication_failure(stage: str, exc: BaseException) -> None:
+    """Emit a safe, actionable diagnostic before the outer rollback handler."""
+    _stage("PUBLICATION_FAILURE " + json.dumps({
+        "stage": stage,
+        "function": "publish_project_type_refresh",
+        "exception_class": type(exc).__name__,
+        "failure_code": _safe_failure_class(exc),
+    }, sort_keys=True, ensure_ascii=False))
 
 
 def _encode_private_backup(value: Any) -> Any:
@@ -1178,7 +1194,11 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         _stage("WORKFLOW_PUBLICATION_START")
         _publish_workflow_tab(token, sid, merged, backup)
         _stage("WORKFLOW_PUBLICATION_PASS")
-        publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+        try:
+            publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+        except Exception as exc:
+            _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", exc)
+            raise
         if payment_publication is not None:
             old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
             _stage("PAYMENT_PUBLICATION_START | tabs=2")
@@ -1549,7 +1569,11 @@ def run() -> dict[str, Any]:
                     _stage("WORKFLOW_PUBLICATION_START")
                     _publish_workflow_tab(token, sid, merged, workflow_backup or {})
                     _stage("WORKFLOW_PUBLICATION_PASS")
-                publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+                try:
+                    publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+                except Exception as exc:
+                    _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", exc)
+                    raise
                 if payment_publication is not None:
                     old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
                     _stage("PAYMENT_PUBLICATION_START | tabs=2")
