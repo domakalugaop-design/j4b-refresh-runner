@@ -32,11 +32,86 @@ CURRENCY_PROJECT_COLUMNS = PROJECT_TYPE_COLUMNS + CURRENCY_COLUMNS
 # The normal runner contract is the production schema. BASE_COLUMNS remains
 # explicit for validating and upgrading legacy 31-column baselines.
 COLUMNS = CURRENCY_PROJECT_COLUMNS
+PUBLICATION_DIAGNOSTIC_ATTRIBUTE = "_j4b_publication_diagnostic"
 PERIOD_MARKER_RE = re.compile(r"(?:^|[^0-9])(0[1-9]|1[0-2])(\d{2})(?!\d)")
 UNMAPPED_PRESERVE_COLUMNS = [
     "period", "unassigned", "has_period_marker", "project_start", "project_end", "elapsed_pct", "lag",
     "project_type_code", "project_type_name",
 ]
+
+
+class PublicationRollbackError(RuntimeError):
+    """Fixed-message wrapper retaining both publication and rollback failures."""
+
+    def __init__(self, diagnostic: dict[str, Any]):
+        super().__init__("publication failed and rollback was incomplete")
+        self.diagnostic = diagnostic
+        setattr(self, PUBLICATION_DIAGNOSTIC_ATTRIBUTE, diagnostic)
+        self.primary_error = diagnostic["primary_error"]
+        self.rollback_error = diagnostic["rollback_error"]
+
+
+def _publication_diagnostic(primary_error: BaseException, primary_stage: str) -> dict[str, Any]:
+    existing = getattr(primary_error, PUBLICATION_DIAGNOSTIC_ATTRIBUTE, None)
+    if isinstance(existing, dict):
+        return existing
+    return {
+        "primary_error": primary_error,
+        "primary_stage": primary_stage,
+        "rollback_attempted": False,
+        "rollback_status": "NOT_ATTEMPTED",
+        "rollback_scopes": {},
+        "rollback_failure_stage": None,
+        "rollback_error": None,
+    }
+
+
+def _record_publication_rollback(
+    primary_error: BaseException,
+    primary_stage: str,
+    rollback_stage: str,
+    rollback_scope: str,
+    rollback_error: BaseException | None = None,
+) -> None:
+    diagnostic = _publication_diagnostic(primary_error, primary_stage)
+    diagnostic["rollback_attempted"] = True
+    scopes = diagnostic.setdefault("rollback_scopes", {})
+    scopes[rollback_scope] = "FAIL" if rollback_error is not None else "PASS"
+    if rollback_scope == "FULL_REFRESH" and rollback_error is None:
+        for scope in scopes:
+            scopes[scope] = "PASS"
+    diagnostic["rollback_status"] = "FAIL" if "FAIL" in scopes.values() else "PASS"
+    if rollback_error is not None:
+        if rollback_scope == "FULL_REFRESH" or diagnostic.get("rollback_error") is None:
+            diagnostic["rollback_failure_stage"] = rollback_stage
+            diagnostic["rollback_error"] = rollback_error
+        try:
+            setattr(primary_error, PUBLICATION_DIAGNOSTIC_ATTRIBUTE, diagnostic)
+        except Exception:
+            pass
+        wrapped = PublicationRollbackError(diagnostic)
+        raise wrapped from diagnostic["primary_error"]
+    try:
+        setattr(primary_error, PUBLICATION_DIAGNOSTIC_ATTRIBUTE, diagnostic)
+    except Exception:
+        pass
+
+
+def record_publication_rollback_result(
+    primary_error: BaseException,
+    primary_stage: str,
+    rollback_stage: str,
+    rollback_scope: str,
+    rollback_error: BaseException | None = None,
+) -> PublicationRollbackError | None:
+    """Attach one verified rollback outcome to the original publication failure."""
+    try:
+        _record_publication_rollback(
+            primary_error, primary_stage, rollback_stage, rollback_scope, rollback_error
+        )
+    except PublicationRollbackError as wrapped:
+        return wrapped
+    return None
 
 
 def now() -> str:
@@ -388,9 +463,12 @@ def publish_project_type_state(
     candidate = serialize_state(new_state)
     if candidate == previous_rows:
         return candidate
+    primary_stage = "PROJECT_TYPES_WRITE"
     try:
         _write_project_type_state_rows(token, sid, candidate)
+        primary_stage = "PROJECT_TYPES_TAIL_CLEAR"
         _clear_project_type_state_tail(token, sid, len(candidate) + 1, len(previous_rows))
+        primary_stage = "PROJECT_TYPES_READBACK"
         actual = read_project_type_state_rows(token, sid)
         # The Sheets Values API may return the numeric project_id column as
         # strings even when the RAW write used integers.  Compare the
@@ -406,7 +484,8 @@ def publish_project_type_state(
         if actual_state != candidate_state:
             raise RuntimeError("project_types readback mismatch")
         return candidate
-    except Exception:
+    except Exception as primary_error:
+        rollback_stage = "PROJECT_TYPES_RESTORE"
         try:
             if previous_rows:
                 _write_project_type_state_rows(token, sid, previous_rows)
@@ -417,8 +496,13 @@ def publish_project_type_state(
                     {},
                     method="POST",
                 )
+            rollback_stage = "PROJECT_TYPES_RESTORE_READBACK"
+            restored_rows = read_project_type_state_rows(token, sid)
+            if not state_rows_equivalent(restored_rows, previous_rows):
+                raise RuntimeError("project_types rollback readback mismatch")
         except Exception as rollback_exc:
-            raise RuntimeError("project_types rollback failed") from rollback_exc
+            _record_publication_rollback(primary_error, primary_stage, rollback_stage, "PROJECT_TYPES", rollback_exc)
+        _record_publication_rollback(primary_error, primary_stage, rollback_stage, "PROJECT_TYPES")
         raise
 
 
@@ -431,10 +515,13 @@ def publish_project_type_refresh(
     new_state: dict[str, tuple[str, str]],
     previous_state_rows: list[list[Any]],
 ) -> None:
+    primary_stage = "PROJECT_TYPE_STATE_PUBLISH"
     try:
         publish_project_type_state(token, sid, new_state, previous_state_rows)
+        primary_stage = "PROJECTS_CURRENT_PUBLISH"
         publish(token, sid, candidate, previous, columns=columns)
-    except Exception:
+    except Exception as primary_error:
+        rollback_stage = "PROJECT_TYPES_RESTORE_AND_READBACK"
         try:
             if previous_state_rows:
                 _write_project_type_state_rows(token, sid, previous_state_rows)
@@ -448,7 +535,8 @@ def publish_project_type_refresh(
             if not state_rows_equivalent(read_project_type_state_rows(token, sid), previous_state_rows):
                 raise RuntimeError("project_types rollback readback mismatch")
         except Exception as rollback_exc:
-            raise RuntimeError("Project Type state rollback failed; workbook state requires recovery") from rollback_exc
+            _record_publication_rollback(primary_error, primary_stage, rollback_stage, "PROJECT_TYPES", rollback_exc)
+        _record_publication_rollback(primary_error, primary_stage, rollback_stage, "PROJECT_TYPES")
         raise
 
 
@@ -471,20 +559,36 @@ def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[lis
     candidate_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{max(len(candidate), 1)}"
     encoded = urllib.parse.quote(rng, safe="!:")
     previous_copy = previous
+    primary_stage = "PROJECTS_CURRENT_CLEAR"
     try:
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
+        primary_stage = "PROJECTS_CURRENT_WRITE"
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": candidate_rng, "majorDimension": "ROWS", "values": candidate}]})
+        primary_stage = "PROJECTS_CURRENT_FORMAT"
         date_cols = [columns.index("date_from"), columns.index("date_to"), columns.index("last_refreshed")]
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"repeatCell": {"range": {"sheetId": target["sheetId"], "startRowIndex": 1, "endRowIndex": len(candidate), "startColumnIndex": c, "endColumnIndex": c + 1}, "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE_TIME" if c == date_cols[-1] else "DATE", "pattern": "yyyy-mm-dd hh:mm:ss" if c == date_cols[-1] else "yyyy-mm-dd"}}}, "fields": "userEnteredFormat.numberFormat"}} for c in date_cols]})
+        primary_stage = "PROJECTS_CURRENT_READBACK"
         actual = read_sheet(token, sid, logical_height + 10, columns=columns)
         normalized_actual = [_pad(row, columns) for row in actual]
         normalized_expected = [_pad(row, columns) for row in candidate]
         if summary(actual) != after or normalized_actual != normalized_expected:
             raise RuntimeError("projects_current full readback mismatch")
-    except Exception:
+    except Exception as primary_error:
+        rollback_stage = "PROJECTS_CURRENT_RESTORE_CLEAR"
         restore_rng = f"{SHEET_NAME}!A1:{col(len(columns)-1)}{max(logical_height, 1)}"
-        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(restore_rng, safe='!:')}:clear", token, {}, method="POST")
-        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": restore_rng, "majorDimension": "ROWS", "values": previous_copy}]})
+        try:
+            api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{urllib.parse.quote(restore_rng, safe='!:')}:clear", token, {}, method="POST")
+            rollback_stage = "PROJECTS_CURRENT_RESTORE_WRITE"
+            api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": restore_rng, "majorDimension": "ROWS", "values": previous_copy}]})
+            rollback_stage = "PROJECTS_CURRENT_RESTORE_READBACK"
+            restored = read_sheet(token, sid, columns=columns)
+            if summary(restored) != before or [_pad(row, columns) for row in restored] != [
+                _pad(row, columns) for row in previous_copy
+            ]:
+                raise RuntimeError("projects_current rollback readback mismatch")
+        except Exception as rollback_exc:
+            _record_publication_rollback(primary_error, primary_stage, rollback_stage, "PROJECTS_CURRENT", rollback_exc)
+        _record_publication_rollback(primary_error, primary_stage, rollback_stage, "PROJECTS_CURRENT")
         raise
 
 

@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from src import production
 from src.refresh import COLUMNS
 from src.production import _log_publication_failure
+from src.refresh import PublicationRollbackError
 from src.workflow_publication import (
     PRIMARY_ANALYTICS_COLUMNS,
     THIRD_TAB_COLUMNS,
@@ -33,13 +35,96 @@ def materialized(pid, **overrides):
     return row
 
 
-def test_publication_failure_emits_safe_specific_diagnostic(capsys):
-    _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", RuntimeError("projects_current full readback mismatch"))
+def test_publication_failure_logs_primary_after_successful_rollback(capsys):
+    primary = RuntimeError("projects_current full readback mismatch")
+    primary._j4b_publication_diagnostic = {
+        "primary_error": primary,
+        "primary_stage": "PROJECTS_CURRENT_READBACK",
+        "rollback_attempted": True,
+        "rollback_status": "PASS",
+        "rollback_failure_stage": None,
+        "rollback_error": None,
+    }
+
+    _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", primary)
     output = capsys.readouterr().out
     assert "PUBLICATION_FAILURE" in output
-    assert "PROJECT_TYPE_AND_PROJECTS_CURRENT" in output
-    assert '"function": "publish_project_type_refresh"' in output
-    assert "PROJECTS_CURRENT_READBACK_MISMATCH" in output
+    assert '"PRIMARY_FAILURE_STAGE": "PROJECTS_CURRENT_READBACK"' in output
+    assert '"PRIMARY_FAILURE_CLASS": "PROJECTS_CURRENT_READBACK_MISMATCH"' in output
+    assert '"ROLLBACK_ATTEMPTED": "YES"' in output
+    assert '"ROLLBACK_STATUS": "PASS"' in output
+    assert '"ROLLBACK_FAILURE_CLASS": "NONE"' in output
+
+
+def test_publication_failure_logs_both_safe_codes_without_exception_text(capsys):
+    primary = RuntimeError("projects_current full readback mismatch; private-row=alice@example.test")
+    rollback = OSError("Authorization: Bearer top-secret-token")
+    diagnostic = {
+        "primary_error": primary,
+        "primary_stage": "PROJECTS_CURRENT_READBACK",
+        "rollback_attempted": True,
+        "rollback_status": "FAIL",
+        "rollback_failure_stage": "PROJECTS_CURRENT_RESTORE_WRITE",
+        "rollback_error": rollback,
+    }
+    wrapped = PublicationRollbackError(diagnostic)
+
+    _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", wrapped)
+    output = capsys.readouterr().out
+
+    assert '"PRIMARY_FAILURE_CLASS": "PROJECTS_CURRENT_READBACK_MISMATCH"' in output
+    assert '"ROLLBACK_ATTEMPTED": "YES"' in output
+    assert '"ROLLBACK_STATUS": "FAIL"' in output
+    assert '"ROLLBACK_FAILURE_STAGE": "PROJECTS_CURRENT_RESTORE_WRITE"' in output
+    assert '"ROLLBACK_FAILURE_CLASS": "OS_ERROR"' in output
+    assert "alice@example.test" not in output
+    assert "top-secret-token" not in output
+    assert "Authorization" not in output
+
+
+def test_full_refresh_rollback_status_reports_final_verified_recovery(capsys):
+    primary = RuntimeError("projects_current full readback mismatch")
+    primary._j4b_publication_diagnostic = {
+        "primary_error": primary,
+        "primary_stage": "PROJECTS_CURRENT_READBACK",
+        "rollback_attempted": True,
+        "rollback_status": "FAIL",
+        "rollback_scopes": {"PROJECTS_CURRENT": "FAIL"},
+        "rollback_failure_stage": "PROJECTS_CURRENT_RESTORE_WRITE",
+        "rollback_error": OSError("earlier restore failed"),
+    }
+
+    production._finish_full_refresh_rollback(primary)
+    output = capsys.readouterr().out
+
+    assert '"ROLLBACK_STATUS": "PASS"' in output
+    assert '"PRIMARY_FAILURE_CLASS": "PROJECTS_CURRENT_READBACK_MISMATCH"' in output
+    assert '"ROLLBACK_FAILURE_CLASS": "OS_ERROR"' in output
+
+
+def test_full_refresh_rollback_failure_preserves_primary_and_final_rollback_errors(capsys):
+    primary = RuntimeError("projects_current full readback mismatch")
+    primary._j4b_publication_diagnostic = {
+        "primary_error": primary,
+        "primary_stage": "PROJECTS_CURRENT_READBACK",
+        "rollback_attempted": True,
+        "rollback_status": "FAIL",
+        "rollback_scopes": {"PROJECTS_CURRENT": "FAIL"},
+        "rollback_failure_stage": "PROJECTS_CURRENT_RESTORE_WRITE",
+        "rollback_error": OSError("earlier restore failed"),
+    }
+    final_rollback = RuntimeError("full refresh rollback incomplete: projects_current: RuntimeError")
+
+    with pytest.raises(PublicationRollbackError) as caught:
+        production._finish_full_refresh_rollback(primary, final_rollback)
+    output = capsys.readouterr().out
+
+    assert caught.value.primary_error is primary
+    assert caught.value.rollback_error is final_rollback
+    assert caught.value.__cause__ is primary
+    assert '"ROLLBACK_STATUS": "FAIL"' in output
+    assert '"ROLLBACK_FAILURE_STAGE": "FULL_REFRESH_ROLLBACK"' in output
+    assert '"ROLLBACK_FAILURE_CLASS": "FULL_REFRESH_ROLLBACK_INCOMPLETE"' in output
 
 
 def test_third_tab_has_exactly_fourteen_human_readable_workflow_columns_and_business_diagnostics():

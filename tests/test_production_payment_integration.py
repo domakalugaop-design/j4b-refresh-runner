@@ -64,6 +64,23 @@ def test_full_refresh_rollback_restores_core_after_a_later_stage_failure():
                                          columns=list(production.PROJECT_TYPE_SCHEMA))
 
 
+def test_full_refresh_rollback_clears_project_types_when_previous_state_was_empty():
+    before = [list(production.PROJECT_TYPE_SCHEMA), ["1", "Old"] + [""] * (len(production.PROJECT_TYPE_SCHEMA) - 2)]
+    live_state = [["project_id", "project_type_code", "project_type_name"], [1, "0001", "Обычный"]]
+    with patch("src.production.read_sheet", return_value=before), patch(
+        "src.production.read_project_type_state_rows", side_effect=[live_state, []]
+    ), patch("src.production.api") as api:
+        production._rollback_full_refresh(
+            "opaque", "sheet", columns=list(production.PROJECT_TYPE_SCHEMA),
+            previous=before, previous_raw=before, previous_state_rows=[],
+            workflow_backup=None, payment_publication=None,
+            layout_plan={"planned": []},
+        )
+
+    api.assert_called_once()
+    assert api.call_args.args[0].endswith("values/project_types%21A%3AC:clear")
+
+
 def test_read_payment_tab_uses_authenticated_values_reader_and_normalizes_types():
     values = [list(VISIT_PUBLICATION_COLUMNS), [123, "Project", None, None, 456, 1.0, 500.0, 250.0, 1.0, 0.0, "[]", "COMPLETE"]]
     with patch.object(production, "api_get", return_value={"values": values}) as read:

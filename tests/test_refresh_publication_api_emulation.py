@@ -10,7 +10,7 @@ from src.project_types import STATE_COLUMNS
 class SheetsEmulator:
     """Small in-memory Google Sheets Values API emulator for publication tests."""
 
-    def __init__(self, *, fail_current_read=False, fail_current_write=False, current_mutation=None, type_mutation=None):
+    def __init__(self, *, fail_current_read=False, fail_current_write=False, fail_current_restore=False, current_mutation=None, current_restore_mutation=None, type_mutation=None, type_restore_mutation=None):
         self.previous_current = [refresh.COLUMNS, self.row(10)]
         self.candidate_current = [refresh.COLUMNS, self.row(10), self.row(11)]
         self.previous_types = [STATE_COLUMNS, [10, "0001", "Обычный"]]
@@ -19,8 +19,11 @@ class SheetsEmulator:
         self.project_types = deepcopy(self.previous_types)
         self.fail_current_read = fail_current_read
         self.fail_current_write = fail_current_write
+        self.fail_current_restore = fail_current_restore
         self.current_mutation = current_mutation
+        self.current_restore_mutation = current_restore_mutation
         self.type_mutation = type_mutation
+        self.type_restore_mutation = type_restore_mutation
         self.current_reads = 0
         self.type_reads = 0
         self.events = []
@@ -42,6 +45,8 @@ class SheetsEmulator:
             self.events.append("read_project_types")
             if self.type_mutation and self.type_reads == 1:
                 return {"values": self.type_mutation(deepcopy(self.project_types))}
+            if self.type_restore_mutation and self.events.count("write_project_types") > 1:
+                return {"values": self.type_restore_mutation(deepcopy(self.project_types))}
             # Sheets may return numeric IDs as strings and omit trailing empty cells.
             rows = deepcopy(self.project_types)
             for row in rows[1:]:
@@ -73,12 +78,19 @@ class SheetsEmulator:
             if range_name.startswith("project_types!"):
                 self.project_types = rows
                 self.events.append("write_project_types")
+                if self.type_restore_mutation and self.events.count("write_project_types") == 2:
+                    self.project_types = self.type_restore_mutation(deepcopy(self.project_types))
             elif range_name.startswith("projects_current!"):
                 self.current = rows
                 self.events.append("write_projects_current")
                 if self.fail_current_write and self.events.count("write_projects_current") == 1:
                     self.current = rows[:2]
                     raise RuntimeError("injected partial current write failure")
+                if self.fail_current_restore and self.events.count("write_projects_current") == 2:
+                    self.current = rows[:1]
+                    raise RuntimeError("injected current rollback write failure")
+                if self.current_restore_mutation and self.events.count("write_projects_current") == 2:
+                    self.current = self.current_restore_mutation(deepcopy(self.current))
             else:
                 raise AssertionError(f"unexpected batch range: {range_name}")
             return {}
@@ -157,11 +169,12 @@ def test_current_readback_real_differences_fail_and_restore_both_tabs(emulated_s
 def test_current_readback_api_failure_preserves_original_error_and_restores_tabs(emulated_sheets):
     emulator = emulated_sheets(SheetsEmulator(fail_current_read=True))
 
-    with pytest.raises(RuntimeError, match="injected current readback API failure"):
+    with pytest.raises(RuntimeError, match="injected current readback API failure") as caught:
         publish(emulator)
 
     assert emulator.current == emulator.previous_current
     assert emulator.project_types == emulator.previous_types
+    assert caught.value._j4b_publication_diagnostic["rollback_status"] == "PASS"
 
 
 def test_partial_current_write_is_restored_and_project_types_rolled_back(emulated_sheets):
@@ -196,6 +209,56 @@ def test_numeric_representation_change_on_current_readback_is_not_silently_coerc
         publish(emulator)
 
     assert emulator.current == emulator.previous_current
+
+
+def test_publish_preserves_readback_and_rollback_failures(emulated_sheets):
+    emulator = emulated_sheets(
+        SheetsEmulator(
+            fail_current_restore=True,
+            current_mutation=lambda rows: [rows[0], ["999"] + rows[1][1:], *rows[2:]],
+        )
+    )
+
+    with pytest.raises(refresh.PublicationRollbackError) as caught:
+        refresh.publish("token", "isolated-test-sheet", emulator.candidate_current, emulator.previous_current)
+
+    error = caught.value
+    assert "projects_current full readback mismatch" in str(error.primary_error)
+    assert "injected current rollback write failure" in str(error.rollback_error)
+    assert error.__cause__ is error.primary_error
+    assert error.diagnostic["primary_stage"] == "PROJECTS_CURRENT_READBACK"
+    assert error.diagnostic["rollback_status"] == "FAIL"
+    assert error.diagnostic["rollback_failure_stage"] == "PROJECTS_CURRENT_RESTORE_WRITE"
+
+
+def test_publish_preserves_api_failure_and_failed_rollback(emulated_sheets):
+    emulator = emulated_sheets(
+        SheetsEmulator(fail_current_read=True, fail_current_restore=True)
+    )
+
+    with pytest.raises(refresh.PublicationRollbackError) as caught:
+        refresh.publish("token", "isolated-test-sheet", emulator.candidate_current, emulator.previous_current)
+
+    assert str(caught.value.primary_error) == "injected current readback API failure"
+    assert str(caught.value.rollback_error) == "injected current rollback write failure"
+    assert caught.value.diagnostic["primary_stage"] == "PROJECTS_CURRENT_READBACK"
+    assert caught.value.diagnostic["rollback_status"] == "FAIL"
+
+
+def test_publish_readback_mismatch_and_rollback_readback_mismatch_are_distinguished(emulated_sheets):
+    emulator = emulated_sheets(
+        SheetsEmulator(
+            current_mutation=lambda rows: [rows[0], ["999"] + rows[1][1:], *rows[2:]],
+            current_restore_mutation=lambda rows: [rows[0], ["998"] + rows[1][1:]],
+        )
+    )
+
+    with pytest.raises(refresh.PublicationRollbackError) as caught:
+        refresh.publish("token", "isolated-test-sheet", emulator.candidate_current, emulator.previous_current)
+
+    assert "projects_current full readback mismatch" in str(caught.value.primary_error)
+    assert "projects_current rollback readback mismatch" in str(caught.value.rollback_error)
+    assert caught.value.diagnostic["rollback_failure_stage"] == "PROJECTS_CURRENT_RESTORE_READBACK"
 
 
 def test_candidate_duplicate_and_shrink_guards_fail_before_any_sheet_mutation(emulated_sheets):

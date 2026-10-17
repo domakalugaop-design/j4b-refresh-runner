@@ -55,6 +55,7 @@ from .refresh import (
     publish_project_type_state,
     read_sheet,
     read_project_type_state_rows,
+    record_publication_rollback_result,
     reconcile_current_rows,
     select_scope,
     regular_scope_counts,
@@ -689,13 +690,19 @@ def _rollback_full_refresh(
         errors.append(f"projects_current: {type(exc).__name__}")
     try:
         live_state_rows = read_project_type_state_rows(token, sid)
-        if previous_state_rows and not state_rows_equivalent(live_state_rows, previous_state_rows):
-            publish_project_type_state(
-                token, sid, validate_state_rows(previous_state_rows), live_state_rows
-            )
-        if previous_state_rows and not state_rows_equivalent(
-            read_project_type_state_rows(token, sid), previous_state_rows
-        ):
+        if not state_rows_equivalent(live_state_rows, previous_state_rows):
+            if previous_state_rows:
+                publish_project_type_state(
+                    token, sid, validate_state_rows(previous_state_rows), live_state_rows
+                )
+            else:
+                api(
+                    f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/project_types%21A%3AC:clear",
+                    token,
+                    {},
+                    method="POST",
+                )
+        if not state_rows_equivalent(read_project_type_state_rows(token, sid), previous_state_rows):
             raise RuntimeError("project_types rollback readback mismatch")
     except Exception as exc:
         errors.append(f"project_types: {type(exc).__name__}")
@@ -757,7 +764,9 @@ def _safe_failure_class(exc: BaseException) -> str:
     """Map internal failures to a non-sensitive operational diagnostic."""
     message = str(exc).casefold()
     classifications = (
+        ("full refresh rollback incomplete", "FULL_REFRESH_ROLLBACK_INCOMPLETE"),
         ("projects_current full readback mismatch", "PROJECTS_CURRENT_READBACK_MISMATCH"),
+        ("projects_current rollback readback mismatch", "PROJECTS_CURRENT_ROLLBACK_READBACK_MISMATCH"),
         ("project_types rollback readback mismatch", "PROJECT_TYPES_ROLLBACK_READBACK_MISMATCH"),
         ("project_types rollback failed", "PROJECT_TYPES_ROLLBACK_FAILED"),
         ("project type state rollback failed", "PROJECT_TYPE_STATE_ROLLBACK_FAILED"),
@@ -774,17 +783,86 @@ def _safe_failure_class(exc: BaseException) -> str:
     for needle, classification in classifications:
         if needle in message:
             return classification
-    return type(exc).__name__.upper()
+    exception_codes = {
+        "AssertionError": "ASSERTION_FAILURE",
+        "ConnectionError": "NETWORK_ERROR",
+        "ConnectionResetError": "NETWORK_ERROR",
+        "HTTPError": "HTTP_FAILURE",
+        "IncompleteRead": "INCOMPLETE_READ",
+        "KeyError": "KEY_ERROR",
+        "OSError": "OS_ERROR",
+        "RemoteDisconnected": "NETWORK_ERROR",
+        "RuntimeError": "RUNTIME_ERROR",
+        "TimeoutError": "TIMEOUT",
+        "TypeError": "TYPE_ERROR",
+        "URLError": "NETWORK_ERROR",
+        "ValueError": "VALIDATION_ERROR",
+    }
+    return exception_codes.get(type(exc).__name__, "OTHER_FAILURE")
+
+
+_SAFE_PUBLICATION_STAGES = {
+    "PROJECT_TYPE_AND_PROJECTS_CURRENT",
+    "PROJECT_TYPES_WRITE",
+    "PROJECT_TYPES_TAIL_CLEAR",
+    "PROJECT_TYPES_READBACK",
+    "PROJECT_TYPES_RESTORE",
+    "PROJECT_TYPES_RESTORE_READBACK",
+    "PROJECT_TYPE_STATE_PUBLISH",
+    "PROJECTS_CURRENT_PUBLISH",
+    "PROJECTS_CURRENT_CLEAR",
+    "PROJECTS_CURRENT_WRITE",
+    "PROJECTS_CURRENT_FORMAT",
+    "PROJECTS_CURRENT_READBACK",
+    "PROJECTS_CURRENT_RESTORE_CLEAR",
+    "PROJECTS_CURRENT_RESTORE_WRITE",
+    "PROJECTS_CURRENT_RESTORE_READBACK",
+    "PROJECT_TYPES_RESTORE_AND_READBACK",
+    "FULL_REFRESH_PUBLICATION",
+    "FULL_REFRESH_ROLLBACK",
+}
 
 
 def _log_publication_failure(stage: str, exc: BaseException) -> None:
-    """Emit a safe, actionable diagnostic before the outer rollback handler."""
+    """Emit allowlisted failure codes only; never include exception messages."""
+    diagnostic = getattr(exc, "_j4b_publication_diagnostic", None)
+    if not isinstance(diagnostic, dict):
+        diagnostic = {}
+    primary_error = diagnostic.get("primary_error", exc)
+    rollback_error = diagnostic.get("rollback_error")
+    primary_stage = diagnostic.get("primary_stage", stage)
+    if primary_stage not in _SAFE_PUBLICATION_STAGES:
+        primary_stage = "UNKNOWN_STAGE"
+    rollback_stage = diagnostic.get("rollback_failure_stage")
+    if rollback_stage not in _SAFE_PUBLICATION_STAGES:
+        rollback_stage = "UNKNOWN_STAGE" if rollback_error is not None else "NOT_APPLICABLE"
+    rollback_status = diagnostic.get("rollback_status", "NOT_ATTEMPTED")
+    if rollback_status not in {"PASS", "FAIL", "NOT_ATTEMPTED"}:
+        rollback_status = "FAIL"
     _stage("PUBLICATION_FAILURE " + json.dumps({
-        "stage": stage,
-        "function": "publish_project_type_refresh",
-        "exception_class": type(exc).__name__,
-        "failure_code": _safe_failure_class(exc),
-    }, sort_keys=True, ensure_ascii=False))
+        "PRIMARY_FAILURE_STAGE": primary_stage,
+        "PRIMARY_FAILURE_CLASS": _safe_failure_class(primary_error),
+        "ROLLBACK_ATTEMPTED": "YES" if diagnostic.get("rollback_attempted") else "NO",
+        "ROLLBACK_STATUS": rollback_status,
+        "ROLLBACK_FAILURE_STAGE": rollback_stage,
+        "ROLLBACK_FAILURE_CLASS": _safe_failure_class(rollback_error) if rollback_error is not None else "NONE",
+    }, sort_keys=True))
+
+
+def _finish_full_refresh_rollback(
+    primary_error: BaseException, rollback_error: BaseException | None = None
+) -> None:
+    combined = record_publication_rollback_result(
+        primary_error,
+        "FULL_REFRESH_PUBLICATION",
+        "FULL_REFRESH_ROLLBACK",
+        "FULL_REFRESH",
+        rollback_error,
+    )
+    final_error = combined or primary_error
+    _log_publication_failure("FULL_REFRESH_ROLLBACK", final_error)
+    if combined is not None:
+        raise combined from combined.primary_error
 
 
 def _encode_private_backup(value: Any) -> Any:
@@ -1219,12 +1297,17 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
             raise RuntimeError("non-target worksheet fingerprint changed during unified refresh")
         _stage(f"NON_TARGET_TABS_FINGERPRINT_PASS | tabs={len(non_target_after)} | sha256={_fingerprint_summary(non_target_after)}")
         _stage("PUBLISH_PASS")
-    except Exception:
-        _rollback_full_refresh(
-            token, sid, columns=columns, previous=previous, previous_raw=previous_raw,
-            previous_state_rows=previous_state_rows, workflow_backup=backup,
-            payment_publication=payment_publication, layout_plan=plan,
-        )
+    except Exception as primary_error:
+        try:
+            _rollback_full_refresh(
+                token, sid, columns=columns, previous=previous, previous_raw=previous_raw,
+                previous_state_rows=previous_state_rows, workflow_backup=backup,
+                payment_publication=payment_publication, layout_plan=plan,
+            )
+        except Exception as rollback_error:
+            _finish_full_refresh_rollback(primary_error, rollback_error)
+        else:
+            _finish_full_refresh_rollback(primary_error)
         raise
     _stage("READBACK_PASS")
     _stage("TYPE_VALIDATION=EXTERNAL_POSTCHECK_REQUIRED")
@@ -1594,14 +1677,19 @@ def run() -> dict[str, Any]:
                     raise RuntimeError("non-target worksheet fingerprint changed during unified refresh")
                 _stage(f"NON_TARGET_TABS_FINGERPRINT_PASS | tabs={len(non_target_after)} | sha256={_fingerprint_summary(non_target_after)}")
                 _stage("PUBLISH_PASS")
-            except Exception:
-                _rollback_full_refresh(
-                    token, sid, columns=columns, previous=previous, previous_raw=previous_raw,
-                    previous_state_rows=previous_state_rows,
-                    workflow_backup=workflow_backup if workflow_enabled else None,
-                    payment_publication=payment_publication,
-                    layout_plan=layout_plan,
-                )
+            except Exception as primary_error:
+                try:
+                    _rollback_full_refresh(
+                        token, sid, columns=columns, previous=previous, previous_raw=previous_raw,
+                        previous_state_rows=previous_state_rows,
+                        workflow_backup=workflow_backup if workflow_enabled else None,
+                        payment_publication=payment_publication,
+                        layout_plan=layout_plan,
+                    )
+                except Exception as rollback_error:
+                    _finish_full_refresh_rollback(primary_error, rollback_error)
+                else:
+                    _finish_full_refresh_rollback(primary_error)
                 raise
         else:
             if run_mode == "production":

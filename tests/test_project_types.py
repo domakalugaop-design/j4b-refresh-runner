@@ -17,7 +17,7 @@ from src.project_types import (
     state_rows_equivalent,
     validate_state_rows,
 )
-from src.refresh import publish_project_type_refresh
+from src.refresh import PublicationRollbackError, publish_project_type_refresh, publish_project_type_state
 
 
 @pytest.mark.parametrize(
@@ -154,13 +154,127 @@ def test_project_type_state_readback_rejects_real_state_differences(actual_rows)
     previous_rows = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
     with patch("src.refresh._write_project_type_state_rows"), patch(
         "src.refresh._clear_project_type_state_tail"
-    ), patch("src.refresh.read_project_type_state_rows", return_value=actual_rows):
+    ), patch("src.refresh.read_project_type_state_rows", side_effect=[actual_rows, previous_rows]):
         from src.refresh import publish_project_type_state
 
         with pytest.raises(RuntimeError, match="project_types readback mismatch"):
             publish_project_type_state(
                 "token", "workbook-1", {"1": ("0001", "Обычный")}, previous_rows
             )
+
+
+def test_project_type_state_primary_failure_with_successful_rollback_preserves_exception():
+    previous = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
+    primary = RuntimeError("injected state write failure")
+    with patch("src.refresh._write_project_type_state_rows", side_effect=[primary, None]), patch(
+        "src.refresh.read_project_type_state_rows", return_value=previous
+    ):
+        with pytest.raises(RuntimeError) as caught:
+            publish_project_type_state("token", "sheet", {"1": ("0001", "Обычный")}, previous)
+
+    assert caught.value is primary
+    assert primary._j4b_publication_diagnostic["primary_stage"] == "PROJECT_TYPES_WRITE"
+    assert primary._j4b_publication_diagnostic["rollback_attempted"] is True
+    assert primary._j4b_publication_diagnostic["rollback_status"] == "PASS"
+
+
+def test_project_type_state_primary_and_rollback_failures_are_both_preserved():
+    previous = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
+    primary = RuntimeError("primary state write failure")
+    rollback = OSError("external detail must not be logged")
+    with patch("src.refresh._write_project_type_state_rows", side_effect=[primary, rollback]):
+        with pytest.raises(PublicationRollbackError) as caught:
+            publish_project_type_state("token", "sheet", {"1": ("0001", "Обычный")}, previous)
+
+    assert caught.value.primary_error is primary
+    assert caught.value.rollback_error is rollback
+    assert caught.value.__cause__ is primary
+    assert caught.value.diagnostic["rollback_status"] == "FAIL"
+
+
+def test_project_type_readback_mismatch_and_failed_rollback_are_both_preserved():
+    previous = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
+    rollback = OSError("sensitive external error details")
+    wrong_readback = [STATE_COLUMNS, [1, "0003", "Такси_ТП"]]
+    with patch("src.refresh._write_project_type_state_rows", side_effect=[None, rollback]), patch(
+        "src.refresh._clear_project_type_state_tail"
+    ), patch("src.refresh.read_project_type_state_rows", return_value=wrong_readback):
+        with pytest.raises(PublicationRollbackError) as caught:
+            publish_project_type_state("token", "sheet", {"1": ("0001", "Обычный")}, previous)
+
+    assert str(caught.value.primary_error) == "project_types readback mismatch"
+    assert caught.value.rollback_error is rollback
+    assert caught.value.diagnostic["primary_stage"] == "PROJECT_TYPES_READBACK"
+
+
+def test_project_type_readback_mismatch_and_rollback_readback_mismatch_are_distinguished():
+    previous = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
+    wrong = [STATE_COLUMNS, [1, "0003", "Такси_ТП"]]
+    with patch("src.refresh._write_project_type_state_rows"), patch(
+        "src.refresh._clear_project_type_state_tail"
+    ), patch("src.refresh.read_project_type_state_rows", side_effect=[wrong, wrong]):
+        with pytest.raises(PublicationRollbackError) as caught:
+            publish_project_type_state("token", "sheet", {"1": ("0001", "Обычный")}, previous)
+
+    assert str(caught.value.primary_error) == "project_types readback mismatch"
+    assert str(caught.value.rollback_error) == "project_types rollback readback mismatch"
+    assert caught.value.diagnostic["rollback_failure_stage"] == "PROJECT_TYPES_RESTORE_READBACK"
+
+
+def test_project_type_refresh_primary_failure_with_successful_rollback_preserves_exception():
+    previous = [STATE_COLUMNS, [1, "0001", "Обычный"]]
+    primary = RuntimeError("projects_current API failure")
+    with patch("src.refresh.publish_project_type_state"), patch(
+        "src.refresh.publish", side_effect=primary
+    ), patch("src.refresh._write_project_type_state_rows"), patch(
+        "src.refresh.read_project_type_state_rows", return_value=previous
+    ):
+        with pytest.raises(RuntimeError) as caught:
+            publish_project_type_refresh("token", "sheet", [], [], [], {"1": ("0001", "Обычный")}, previous)
+
+    assert caught.value is primary
+    assert primary._j4b_publication_diagnostic["primary_stage"] == "PROJECTS_CURRENT_PUBLISH"
+    assert primary._j4b_publication_diagnostic["rollback_status"] == "PASS"
+
+
+def test_project_type_refresh_primary_and_rollback_failures_are_both_preserved():
+    previous = [STATE_COLUMNS, [1, "0001", "Обычный"]]
+    primary = RuntimeError("primary current publication failure")
+    rollback = OSError("private rollback API detail")
+    with patch("src.refresh.publish_project_type_state"), patch(
+        "src.refresh.publish", side_effect=primary
+    ), patch("src.refresh._write_project_type_state_rows", side_effect=rollback):
+        with pytest.raises(PublicationRollbackError) as caught:
+            publish_project_type_refresh("token", "sheet", [], [], [], {"1": ("0001", "Обычный")}, previous)
+
+    assert caught.value.primary_error is primary
+    assert caught.value.rollback_error is rollback
+    assert caught.value.diagnostic["rollback_status"] == "FAIL"
+
+
+def test_project_type_refresh_retains_readback_and_first_rollback_failures():
+    previous = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
+    primary = RuntimeError("project_types readback mismatch")
+    first_rollback = OSError("first state restore failed")
+    outer_rollback = OSError("second state restore failed")
+    diagnostic = {
+        "primary_error": primary,
+        "primary_stage": "PROJECT_TYPES_READBACK",
+        "rollback_attempted": True,
+        "rollback_status": "FAIL",
+        "rollback_failure_stage": "PROJECT_TYPES_RESTORE",
+        "rollback_error": first_rollback,
+    }
+    inner = PublicationRollbackError(diagnostic)
+    with patch("src.refresh.publish_project_type_state", side_effect=inner), patch(
+        "src.refresh._write_project_type_state_rows", side_effect=outer_rollback
+    ):
+        with pytest.raises(PublicationRollbackError) as caught:
+            publish_project_type_refresh("token", "sheet", [], [], [], {}, previous)
+
+    assert caught.value.primary_error is primary
+    assert caught.value.rollback_error is first_rollback
+    assert caught.value.diagnostic["primary_stage"] == "PROJECT_TYPES_READBACK"
 
 
 def test_materialized_join_blanks_pre_cutoff_and_unresolved_rows():
