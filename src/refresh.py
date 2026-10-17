@@ -17,7 +17,7 @@ from urllib.error import URLError
 
 from .acquisition import MAX_REQUEST_RETRIES, COMPLETED_CODES, Reader, acquire_project, discover_universe
 from .portal_transport import PortalSession
-from .project_types import STATE_COLUMNS, serialize_state, validate_state_rows
+from .project_types import STATE_COLUMNS, serialize_state, state_rows_equivalent, validate_state_rows
 from .workflow_analytics import project_workflow_metrics
 from .technical_ids import integer_id
 
@@ -445,7 +445,7 @@ def publish_project_type_refresh(
                     {},
                     method="POST",
                 )
-            if read_project_type_state_rows(token, sid) != previous_state_rows:
+            if not state_rows_equivalent(read_project_type_state_rows(token, sid), previous_state_rows):
                 raise RuntimeError("project_types rollback readback mismatch")
         except Exception as rollback_exc:
             raise RuntimeError("Project Type state rollback failed; workbook state requires recovery") from rollback_exc

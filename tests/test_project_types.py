@@ -14,6 +14,7 @@ from src.project_types import (
     normalized_period_marker,
     project_type_applicable_ids,
     serialize_state,
+    state_rows_equivalent,
     validate_state_rows,
 )
 from src.refresh import publish_project_type_refresh
@@ -91,6 +92,17 @@ def test_duplicate_state_ids_and_invalid_codes_are_rejected():
 def test_state_serialization_uses_numeric_project_id_and_text_code():
     assert serialize_state({"9": ("0001", "Обычный")}) == [STATE_COLUMNS, [9, "0001", "Обычный"]]
     assert type(serialize_state({"9": ("0001", "Обычный")})[1][0]) is int
+
+
+def test_state_rows_equivalence_normalizes_numeric_ids_but_rejects_semantic_changes():
+    numeric = [STATE_COLUMNS, [9, "0001", "Обычный"]]
+    stringified = [STATE_COLUMNS, ["9", "0001", "Обычный"]]
+    changed = [STATE_COLUMNS, ["9", "0002", "Классика_ТП"]]
+    malformed = [STATE_COLUMNS, ["9", "9999", "unknown"]]
+
+    assert state_rows_equivalent(numeric, stringified)
+    assert not state_rows_equivalent(numeric, changed)
+    assert not state_rows_equivalent(numeric, malformed)
 
 
 def test_project_type_state_shrink_clears_obsolete_tail():

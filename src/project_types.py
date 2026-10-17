@@ -107,6 +107,14 @@ def validate_state_rows(rows: list[list[Any]]) -> dict[str, tuple[str, str]]:
     return state
 
 
+def state_rows_equivalent(left: list[list[Any]], right: list[list[Any]]) -> bool:
+    """Compare persisted state semantically while validating both snapshots."""
+    try:
+        return validate_state_rows(left) == validate_state_rows(right)
+    except Exception:
+        return False
+
+
 def merge_assignment(
     state: dict[str, tuple[str, str]], project_id: str, code: str, name: str
 ) -> tuple[dict[str, tuple[str, str]], bool, bool]:

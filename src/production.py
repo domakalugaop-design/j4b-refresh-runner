@@ -39,6 +39,7 @@ from .project_types import (
     acquire_pending_types,
     materialize_project_types,
     project_type_applicable_ids,
+    state_rows_equivalent,
     validate_state_rows,
 )
 from .refresh import (
@@ -688,11 +689,13 @@ def _rollback_full_refresh(
         errors.append(f"projects_current: {type(exc).__name__}")
     try:
         live_state_rows = read_project_type_state_rows(token, sid)
-        if previous_state_rows and live_state_rows != previous_state_rows:
+        if previous_state_rows and not state_rows_equivalent(live_state_rows, previous_state_rows):
             publish_project_type_state(
                 token, sid, validate_state_rows(previous_state_rows), live_state_rows
             )
-        if previous_state_rows and read_project_type_state_rows(token, sid) != previous_state_rows:
+        if previous_state_rows and not state_rows_equivalent(
+            read_project_type_state_rows(token, sid), previous_state_rows
+        ):
             raise RuntimeError("project_types rollback readback mismatch")
     except Exception as exc:
         errors.append(f"project_types: {type(exc).__name__}")
