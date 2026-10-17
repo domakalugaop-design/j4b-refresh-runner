@@ -392,9 +392,19 @@ def publish_project_type_state(
         _write_project_type_state_rows(token, sid, candidate)
         _clear_project_type_state_tail(token, sid, len(candidate) + 1, len(previous_rows))
         actual = read_project_type_state_rows(token, sid)
-        if actual != candidate:
+        # The Sheets Values API may return the numeric project_id column as
+        # strings even when the RAW write used integers.  Compare the
+        # persisted business state after strict schema/dictionary validation,
+        # rather than comparing transport representations byte-for-byte.
+        # Missing rows, duplicates, invalid codes, wrong names, and any other
+        # real state difference remain fail-closed mismatches.
+        try:
+            actual_state = validate_state_rows(actual)
+            candidate_state = validate_state_rows(candidate)
+        except Exception:
+            raise RuntimeError("project_types readback mismatch") from None
+        if actual_state != candidate_state:
             raise RuntimeError("project_types readback mismatch")
-        validate_state_rows(actual)
         return candidate
     except Exception:
         try:

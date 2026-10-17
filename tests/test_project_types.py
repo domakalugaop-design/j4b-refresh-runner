@@ -115,6 +115,42 @@ def test_project_type_state_shrink_clears_obsolete_tail():
     clear_tail.assert_called_once_with("token", "workbook-1", 3, 4)
 
 
+def test_project_type_state_readback_accepts_sheets_string_ids():
+    previous_rows = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
+    actual_rows = [STATE_COLUMNS, ["1", "0001", "Обычный"]]
+    with patch("src.refresh._write_project_type_state_rows"), patch(
+        "src.refresh._clear_project_type_state_tail"
+    ), patch("src.refresh.read_project_type_state_rows", return_value=actual_rows):
+        from src.refresh import publish_project_type_state
+
+        result = publish_project_type_state(
+            "token", "workbook-1", {"1": ("0001", "Обычный")}, previous_rows
+        )
+
+    assert result == [STATE_COLUMNS, [1, "0001", "Обычный"]]
+
+
+@pytest.mark.parametrize(
+    "actual_rows",
+    [
+        [STATE_COLUMNS],
+        [STATE_COLUMNS, ["1", "0002", "Классика_ТП"]],
+        [STATE_COLUMNS, ["1", "0001", "Обычный"], ["1", "0001", "Обычный"]],
+    ],
+)
+def test_project_type_state_readback_rejects_real_state_differences(actual_rows):
+    previous_rows = [STATE_COLUMNS, [1, "0002", "Классика_ТП"]]
+    with patch("src.refresh._write_project_type_state_rows"), patch(
+        "src.refresh._clear_project_type_state_tail"
+    ), patch("src.refresh.read_project_type_state_rows", return_value=actual_rows):
+        from src.refresh import publish_project_type_state
+
+        with pytest.raises(RuntimeError, match="project_types readback mismatch"):
+            publish_project_type_state(
+                "token", "workbook-1", {"1": ("0001", "Обычный")}, previous_rows
+            )
+
+
 def test_materialized_join_blanks_pre_cutoff_and_unresolved_rows():
     rows = [{"project_id": "1", "project_name": "A_0926"}, {"project_id": "2", "project_name": "B_0826"}, {"project_id": "3", "project_name": "C_0926"}]
     state = {"1": ("0001", "Обычный")}
