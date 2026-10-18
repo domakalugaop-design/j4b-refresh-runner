@@ -810,10 +810,14 @@ _SAFE_PUBLICATION_STAGES = {
     "PROJECT_TYPES_RESTORE_READBACK",
     "PROJECT_TYPE_STATE_PUBLISH",
     "PROJECTS_CURRENT_PUBLISH",
+    "PROJECTS_CURRENT_CANDIDATE_VALIDATION",
+    "PROJECTS_CURRENT_BASELINE_GUARD",
+    "PROJECTS_CURRENT_WORKSHEET_METADATA",
     "PROJECTS_CURRENT_CLEAR",
     "PROJECTS_CURRENT_WRITE",
     "PROJECTS_CURRENT_FORMAT",
     "PROJECTS_CURRENT_READBACK",
+    "PROJECTS_CURRENT_SEMANTIC_COMPARE",
     "PROJECTS_CURRENT_RESTORE_CLEAR",
     "PROJECTS_CURRENT_RESTORE_WRITE",
     "PROJECTS_CURRENT_RESTORE_READBACK",
@@ -1276,7 +1280,16 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         _publish_workflow_tab(token, sid, merged, backup)
         _stage("WORKFLOW_PUBLICATION_PASS")
         try:
-            publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+            publish_project_type_refresh(
+                token,
+                sid,
+                candidate,
+                previous,
+                columns,
+                state,
+                previous_state_rows,
+                authoritative_stale_ids=stale_ids,
+            )
         except Exception as exc:
             _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", exc)
             raise
@@ -1656,7 +1669,16 @@ def run() -> dict[str, Any]:
                     _publish_workflow_tab(token, sid, merged, workflow_backup or {})
                     _stage("WORKFLOW_PUBLICATION_PASS")
                 try:
-                    publish_project_type_refresh(token, sid, candidate, previous, columns, state, previous_state_rows)
+                    publish_project_type_refresh(
+                        token,
+                        sid,
+                        candidate,
+                        previous,
+                        columns,
+                        state,
+                        previous_state_rows,
+                        authoritative_stale_ids=stale_ids,
+                    )
                 except Exception as exc:
                     _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", exc)
                     raise
@@ -1694,7 +1716,14 @@ def run() -> dict[str, Any]:
         else:
             if run_mode == "production":
                 _require_production_gate()
-            publish(token, sid, candidate, previous, columns=columns)
+            publish(
+                token,
+                sid,
+                candidate,
+                previous,
+                columns=columns,
+                authoritative_stale_ids=stale_ids,
+            )
             if payment_publication is not None:
                 old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
                 _stage("PAYMENT_PUBLICATION_START | tabs=2")

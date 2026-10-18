@@ -66,6 +66,16 @@ def _publication_diagnostic(primary_error: BaseException, primary_stage: str) ->
     }
 
 
+def _record_publication_failure_stage(primary_error: BaseException, primary_stage: str) -> None:
+    """Attach an allowlisted stage without replacing the original exception."""
+    try:
+        diagnostic = _publication_diagnostic(primary_error, primary_stage)
+        setattr(primary_error, PUBLICATION_DIAGNOSTIC_ATTRIBUTE, diagnostic)
+    except Exception:
+        # Diagnostics must never mask the publication failure.
+        pass
+
+
 def _record_publication_rollback(
     primary_error: BaseException,
     primary_stage: str,
@@ -514,12 +524,21 @@ def publish_project_type_refresh(
     columns: list[str],
     new_state: dict[str, tuple[str, str]],
     previous_state_rows: list[list[Any]],
+    *,
+    authoritative_stale_ids: set[str] | None = None,
 ) -> None:
     primary_stage = "PROJECT_TYPE_STATE_PUBLISH"
     try:
         publish_project_type_state(token, sid, new_state, previous_state_rows)
         primary_stage = "PROJECTS_CURRENT_PUBLISH"
-        publish(token, sid, candidate, previous, columns=columns)
+        publish(
+            token,
+            sid,
+            candidate,
+            previous,
+            columns=columns,
+            authoritative_stale_ids=authoritative_stale_ids,
+        )
     except Exception as primary_error:
         rollback_stage = "PROJECT_TYPES_RESTORE_AND_READBACK"
         try:
@@ -540,18 +559,52 @@ def publish_project_type_refresh(
         raise
 
 
-def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[list[Any]], columns: list[str] | None = None) -> None:
-    columns = columns or COLUMNS
-    before = summary(previous)
-    after = summary(candidate)
-    if after["duplicates"] != 0:
-        raise RuntimeError("candidate contains duplicate project IDs")
-    if after["unique"] < before["unique"]:
-        raise RuntimeError("candidate master shrinks previous unique project set")
-    meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId)", token)
-    target = next((s["properties"] for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == SHEET_NAME), None)
-    if not target:
-        raise RuntimeError("target worksheet not found")
+def publish(
+    token: str,
+    sid: str,
+    candidate: list[list[Any]],
+    previous: list[list[Any]],
+    columns: list[str] | None = None,
+    *,
+    authoritative_stale_ids: set[str] | None = None,
+) -> None:
+    primary_stage = "PROJECTS_CURRENT_CANDIDATE_VALIDATION"
+    try:
+        columns = columns or COLUMNS
+        after = summary(candidate)
+        if after["duplicates"] != 0:
+            raise RuntimeError("candidate contains duplicate project IDs")
+    except Exception as primary_error:
+        _record_publication_failure_stage(primary_error, primary_stage)
+        raise
+
+    primary_stage = "PROJECTS_CURRENT_BASELINE_GUARD"
+    try:
+        before = summary(previous)
+        if after["unique"] < before["unique"]:
+            previous_ids = {str(row[0]) for row in previous[1:] if row and row[0] not in (None, "")}
+            candidate_ids = {str(row[0]) for row in candidate[1:] if row and row[0] not in (None, "")}
+            removed_ids = previous_ids - candidate_ids
+            allowed_stale_ids = {str(project_id) for project_id in (authoritative_stale_ids or set())}
+            permitted_removed_ids = previous_ids & allowed_stale_ids
+            if (
+                any(not project_id.isdigit() for project_id in allowed_stale_ids)
+                or removed_ids != permitted_removed_ids
+            ):
+                raise RuntimeError("candidate master shrinks previous unique project set")
+    except Exception as primary_error:
+        _record_publication_failure_stage(primary_error, primary_stage)
+        raise
+
+    primary_stage = "PROJECTS_CURRENT_WORKSHEET_METADATA"
+    try:
+        meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId)", token)
+        target = next((s["properties"] for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == SHEET_NAME), None)
+        if not target:
+            raise RuntimeError("target worksheet not found")
+    except Exception as primary_error:
+        _record_publication_failure_stage(primary_error, primary_stage)
+        raise
     # A logical replacement must clear the whole previous logical range too;
     # otherwise rows beyond a shorter candidate survive as stale tail data.
     logical_height = max(len(candidate), len(previous), 1)
@@ -571,6 +624,7 @@ def publish(token: str, sid: str, candidate: list[list[Any]], previous: list[lis
         actual = read_sheet(token, sid, logical_height + 10, columns=columns)
         normalized_actual = [_pad(row, columns) for row in actual]
         normalized_expected = [_pad(row, columns) for row in candidate]
+        primary_stage = "PROJECTS_CURRENT_SEMANTIC_COMPARE"
         if summary(actual) != after or normalized_actual != normalized_expected:
             raise RuntimeError("projects_current full readback mismatch")
     except Exception as primary_error:

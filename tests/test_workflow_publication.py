@@ -56,6 +56,25 @@ def test_publication_failure_logs_primary_after_successful_rollback(capsys):
     assert '"ROLLBACK_FAILURE_CLASS": "NONE"' in output
 
 
+def test_publication_failure_logs_internal_baseline_guard_stage_without_exception_text(capsys):
+    primary = RuntimeError("candidate master shrinks previous unique project set; private-row=alice@example.test")
+    primary._j4b_publication_diagnostic = {
+        "primary_error": primary,
+        "primary_stage": "PROJECTS_CURRENT_BASELINE_GUARD",
+        "rollback_attempted": True,
+        "rollback_status": "PASS",
+        "rollback_failure_stage": None,
+        "rollback_error": None,
+    }
+
+    _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", primary)
+    output = capsys.readouterr().out
+
+    assert '"PRIMARY_FAILURE_STAGE": "PROJECTS_CURRENT_BASELINE_GUARD"' in output
+    assert '"PRIMARY_FAILURE_CLASS": "RUNTIME_ERROR"' in output
+    assert "alice@example.test" not in output
+
+
 def test_publication_failure_logs_both_safe_codes_without_exception_text(capsys):
     primary = RuntimeError("projects_current full readback mismatch; private-row=alice@example.test")
     rollback = OSError("Authorization: Bearer top-secret-token")

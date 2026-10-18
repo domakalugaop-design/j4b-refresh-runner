@@ -10,7 +10,7 @@ from src.project_types import STATE_COLUMNS
 class SheetsEmulator:
     """Small in-memory Google Sheets Values API emulator for publication tests."""
 
-    def __init__(self, *, fail_current_read=False, fail_current_write=False, fail_current_restore=False, current_mutation=None, current_restore_mutation=None, type_mutation=None, type_restore_mutation=None):
+    def __init__(self, *, fail_current_read=False, fail_current_write=False, fail_current_restore=False, fail_current_format=False, fail_metadata=False, missing_current_sheet=False, current_mutation=None, current_restore_mutation=None, type_mutation=None, type_restore_mutation=None):
         self.previous_current = [refresh.COLUMNS, self.row(10)]
         self.candidate_current = [refresh.COLUMNS, self.row(10), self.row(11)]
         self.previous_types = [STATE_COLUMNS, [10, "0001", "Обычный"]]
@@ -20,6 +20,9 @@ class SheetsEmulator:
         self.fail_current_read = fail_current_read
         self.fail_current_write = fail_current_write
         self.fail_current_restore = fail_current_restore
+        self.fail_current_format = fail_current_format
+        self.fail_metadata = fail_metadata
+        self.missing_current_sheet = missing_current_sheet
         self.current_mutation = current_mutation
         self.current_restore_mutation = current_restore_mutation
         self.type_mutation = type_mutation
@@ -27,6 +30,7 @@ class SheetsEmulator:
         self.current_reads = 0
         self.type_reads = 0
         self.events = []
+        self.format_requests = []
 
     @staticmethod
     def row(project_id):
@@ -104,9 +108,16 @@ class SheetsEmulator:
                 raise AssertionError(f"unexpected clear: {decoded}")
             return {}
         if "?fields=sheets.properties(title,sheetId)" in url:
+            if self.fail_metadata:
+                raise RuntimeError("injected worksheet metadata failure")
+            if self.missing_current_sheet:
+                return {"sheets": []}
             return {"sheets": [{"properties": {"title": "projects_current", "sheetId": 7}}]}
         if url.endswith(":batchUpdate"):
             self.events.append("format_projects_current")
+            self.format_requests.extend(deepcopy(body["requests"]))
+            if self.fail_current_format:
+                raise RuntimeError("injected current date-format failure")
             return {}
         raise AssertionError(f"unexpected API call: {url}")
 
@@ -121,7 +132,7 @@ def emulated_sheets(monkeypatch):
     return install
 
 
-def publish(emulator):
+def publish(emulator, authoritative_stale_ids=None):
     return refresh.publish_project_type_refresh(
         "not-a-real-token",
         "isolated-test-sheet",
@@ -130,6 +141,7 @@ def publish(emulator):
         refresh.COLUMNS,
         {"10": ("0001", "Обычный"), "11": ("0002", "Классика_ТП")},
         emulator.previous_types,
+        authoritative_stale_ids=authoritative_stale_ids,
     )
 
 
@@ -142,6 +154,80 @@ def test_full_publication_accepts_project_type_string_ids_and_omitted_trailing_b
     assert emulator.project_types == emulator.candidate_types
     assert emulator.events.index("write_project_types") < emulator.events.index("write_projects_current")
     assert emulator.events.index("read_projects_current") > emulator.events.index("write_projects_current")
+
+
+def test_authoritatively_pruned_previous_project_can_shrink_current_snapshot(emulated_sheets):
+    emulator = emulated_sheets(SheetsEmulator())
+    source_rows = [{"project_id": str(pid)} for pid in (10, 11, 12, 13, 14, 15, 16)]
+    reconciled, stale_ids = refresh.reconcile_current_rows(
+        source_rows, {"10", "11", "15", "16"}, acquisition_complete=True
+    )
+    emulator.previous_current = [refresh.COLUMNS, *(emulator.row(pid) for pid in (10, 11, 12, 13, 14))]
+    emulator.candidate_current = [refresh.COLUMNS, *(emulator.row(row["project_id"]) for row in reconciled)]
+    emulator.current = deepcopy(emulator.previous_current)
+
+    assert stale_ids == {"12", "13", "14"}
+    assert len(emulator.candidate_current) - 1 < len(emulator.previous_current) - 1
+    publish(emulator, authoritative_stale_ids=stale_ids)
+
+    assert emulator.current == emulator.candidate_current
+    assert emulator.project_types == emulator.candidate_types
+    assert "write_projects_current" in emulator.events
+
+
+@pytest.mark.parametrize("authoritative_stale_ids", [None, {"99"}, {"10", "12"}])
+def test_unapproved_shrink_is_rejected_with_precise_stage_before_mutation(emulated_sheets, authoritative_stale_ids):
+    emulator = emulated_sheets(SheetsEmulator())
+    previous = [refresh.COLUMNS, emulator.row(10), emulator.row(12)]
+    candidate = [refresh.COLUMNS, emulator.row(10)]
+
+    with pytest.raises(RuntimeError, match="candidate master shrinks") as caught:
+        refresh.publish(
+            "token",
+            "isolated-test-sheet",
+            candidate,
+            previous,
+            authoritative_stale_ids=authoritative_stale_ids,
+        )
+
+    assert caught.value._j4b_publication_diagnostic["primary_stage"] == "PROJECTS_CURRENT_BASELINE_GUARD"
+    assert emulator.events == []
+
+
+@pytest.mark.parametrize(
+    ("options", "expected_stage", "message"),
+    [
+        ({"fail_metadata": True}, "PROJECTS_CURRENT_WORKSHEET_METADATA", "worksheet metadata"),
+        ({"missing_current_sheet": True}, "PROJECTS_CURRENT_WORKSHEET_METADATA", "target worksheet not found"),
+        ({"fail_current_format": True}, "PROJECTS_CURRENT_FORMAT", "date-format"),
+    ],
+)
+def test_projects_current_failure_stages_are_safe_and_rollback(emulated_sheets, options, expected_stage, message):
+    emulator = emulated_sheets(SheetsEmulator(**options))
+
+    with pytest.raises(RuntimeError, match=message) as caught:
+        publish(emulator)
+
+    diagnostic = caught.value._j4b_publication_diagnostic
+    assert diagnostic["primary_stage"] == expected_stage
+    assert diagnostic["rollback_status"] == "PASS"
+    assert emulator.current == emulator.previous_current
+    assert emulator.project_types == emulator.previous_types
+
+
+def test_large_projects_current_range_and_date_formats_are_preserved(emulated_sheets):
+    emulator = emulated_sheets(SheetsEmulator())
+    emulator.previous_current = [refresh.COLUMNS, *(emulator.row(pid) for pid in range(1, 1001))]
+    emulator.candidate_current = [refresh.COLUMNS, *(emulator.row(pid) for pid in range(1, 1201))]
+    emulator.current = deepcopy(emulator.previous_current)
+
+    refresh.publish("token", "isolated-test-sheet", emulator.candidate_current, emulator.previous_current)
+
+    assert emulator.current == emulator.candidate_current
+    assert len(emulator.format_requests) == 3
+    formats = [request["repeatCell"]["cell"]["userEnteredFormat"]["numberFormat"] for request in emulator.format_requests]
+    assert [item["type"] for item in formats] == ["DATE", "DATE", "DATE_TIME"]
+    assert emulator.events.index("format_projects_current") < emulator.events.index("read_projects_current")
 
 
 @pytest.mark.parametrize(
@@ -226,7 +312,7 @@ def test_publish_preserves_readback_and_rollback_failures(emulated_sheets):
     assert "projects_current full readback mismatch" in str(error.primary_error)
     assert "injected current rollback write failure" in str(error.rollback_error)
     assert error.__cause__ is error.primary_error
-    assert error.diagnostic["primary_stage"] == "PROJECTS_CURRENT_READBACK"
+    assert error.diagnostic["primary_stage"] == "PROJECTS_CURRENT_SEMANTIC_COMPARE"
     assert error.diagnostic["rollback_status"] == "FAIL"
     assert error.diagnostic["rollback_failure_stage"] == "PROJECTS_CURRENT_RESTORE_WRITE"
 
