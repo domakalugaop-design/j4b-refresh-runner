@@ -13,8 +13,10 @@ from src.project_types import (
     merge_assignment,
     normalized_period_marker,
     project_type_applicable_ids,
+    reconcile_project_type_assignments,
     serialize_state,
     state_rows_equivalent,
+    validate_project_type_catalog,
     validate_state_rows,
 )
 from src.refresh import PublicationRollbackError, publish_project_type_refresh, publish_project_type_state
@@ -103,6 +105,91 @@ def test_state_rows_equivalence_normalizes_numeric_ids_but_rejects_semantic_chan
     assert state_rows_equivalent(numeric, stringified)
     assert not state_rows_equivalent(numeric, changed)
     assert not state_rows_equivalent(numeric, malformed)
+
+
+def test_dynamic_catalog_accepts_new_type_and_preserves_leading_zero_codes():
+    catalog = validate_project_type_catalog([
+        ("0001", "Обычный"),
+        ("0009", "Home Test"),
+        ("0010", "A & B <Research>"),
+    ])
+    assert catalog == {"0001": "Обычный", "0009": "Home Test", "0010": "A & B <Research>"}
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        [("0001", "Обычный"), ("0001", "Обычный")],
+        [("0001", "Обычный"), ("0001", "Different")],
+        [(1, "Обычный")],
+        [("0001", " ")],
+        [("0001", "Обычный"), ("0002", " Классика")],
+    ],
+)
+def test_dynamic_catalog_rejects_empty_malformed_or_duplicate_codes(rows):
+    with pytest.raises(ValueError):
+        validate_project_type_catalog(rows)
+
+
+def test_reconciliation_updates_existing_type_and_type_rename_by_project_id():
+    existing = {
+        "10": ("0007", "B2B_тайный покупатель"),
+        "11": ("0005", "Old label"),
+    }
+    state, counts = reconcile_project_type_assignments(
+        existing,
+        [(10, "0009"), (11, "0005")],
+        {"10", "11"},
+        [("0005", "Качественные исследования"), ("0007", "B2B_тайный покупатель"), ("0009", "Home Test")],
+    )
+    assert state["10"] == ("0009", "Home Test")
+    assert state["11"] == ("0005", "Качественные исследования")
+    assert counts == {"added": 0, "changed": 2, "unchanged": 0}
+
+
+def test_reconciliation_adds_new_project_without_duplicate_on_repeat():
+    catalog = [("0009", "Home Test")]
+    state, counts = reconcile_project_type_assignments({}, [(12, "0009")], {"12"}, catalog)
+    repeated, repeated_counts = reconcile_project_type_assignments(state, [(12, "0009")], {"12"}, catalog)
+    assert state == repeated == {"12": ("0009", "Home Test")}
+    assert counts == {"added": 1, "changed": 0, "unchanged": 0}
+    assert repeated_counts == {"added": 0, "changed": 0, "unchanged": 1}
+
+
+def test_reconciliation_corrects_eleven_existing_assignments_without_changing_sheet_contract():
+    existing = {str(project_id): ("0007", "Old label") for project_id in range(1, 12)}
+    observations = [(project_id, "0009") for project_id in range(1, 12)]
+    state, counts = reconcile_project_type_assignments(
+        existing, observations, set(existing), [("0009", "Home Test")]
+    )
+    assert all(state[str(project_id)] == ("0009", "Home Test") for project_id in range(1, 12))
+    assert counts == {"added": 0, "changed": 11, "unchanged": 0}
+    assert serialize_state(state)[0] == STATE_COLUMNS
+
+
+@pytest.mark.parametrize(
+    ("observations", "expected", "catalog"),
+    [
+        ([(1, "0001")], {"1", "2"}, [("0001", "Обычный")]),
+        ([(1, "0001"), (2, "0001")], {"1"}, [("0001", "Обычный")]),
+        ([(1, "0001"), (1, "0001")], {"1"}, [("0001", "Обычный")]),
+        ([(1, "0009")], {"1"}, [("0001", "Обычный")]),
+        ([(1, "0001")], {"1"}, []),
+    ],
+)
+def test_reconciliation_fails_closed_on_incomplete_duplicate_or_unknown_data(observations, expected, catalog):
+    with pytest.raises(ValueError):
+        reconcile_project_type_assignments({}, observations, expected, catalog)
+
+
+def test_reconciliation_preserves_unobserved_assignments_and_does_not_touch_payments():
+    existing = {"1": ("0007", "B2B_тайный покупатель"), "99": ("0005", "Качественные исследования")}
+    state, counts = reconcile_project_type_assignments(
+        existing, [(1, "0009")], {"1"}, [("0009", "Home Test")]
+    )
+    assert state == {"1": ("0009", "Home Test"), "99": existing["99"]}
+    assert counts == {"added": 0, "changed": 1, "unchanged": 0}
 
 
 def test_project_type_state_shrink_clears_obsolete_tail():

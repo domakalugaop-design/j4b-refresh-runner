@@ -107,6 +107,76 @@ def validate_state_rows(rows: list[list[Any]]) -> dict[str, tuple[str, str]]:
     return state
 
 
+def validate_project_type_catalog(rows: list[tuple[Any, Any]]) -> dict[str, str]:
+    """Validate a catalog payload without assuming its Portal transport/shape.
+
+    The caller must obtain these code/name pairs from a verified source. Codes
+    stay strings so leading zeroes are preserved. Empty, partial, duplicate, or
+    contradictory catalogs are rejected rather than treated as authoritative.
+    """
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("project type catalog is empty or malformed")
+    catalog: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, (tuple, list)) or len(row) != 2:
+            raise ValueError("project type catalog row is malformed")
+        code, name = row
+        if not isinstance(code, str) or not code.strip() or code != code.strip():
+            raise ValueError("project type catalog code is invalid")
+        if not isinstance(name, str) or not name.strip() or name != name.strip():
+            raise ValueError("project type catalog name is invalid")
+        if code in catalog:
+            raise ValueError("project type catalog contains a duplicate code")
+        catalog[code] = name
+    return catalog
+
+
+def reconcile_project_type_assignments(
+    existing: dict[str, tuple[str, str]],
+    observations: list[tuple[Any, Any]],
+    expected_project_ids: set[str],
+    catalog_rows: list[tuple[Any, Any]],
+) -> tuple[dict[str, tuple[str, str]], dict[str, int]]:
+    """Apply a complete, catalog-qualified observation set by stable project ID.
+
+    This pure reconciliation layer deliberately knows nothing about Portal
+    endpoints. The caller must supply a verified complete catalog and exactly
+    one current type-code observation for every expected applicable project.
+    """
+    catalog = validate_project_type_catalog(catalog_rows)
+    expected = {str(integer_id(project_id, "project_id")) for project_id in expected_project_ids}
+    observed: dict[str, str] = {}
+    for row in observations:
+        if not isinstance(row, (tuple, list)) or len(row) != 2:
+            raise ValueError("project type observation is malformed")
+        raw_project_id, code = row
+        project_id = str(integer_id(raw_project_id, "project_id"))
+        if project_id in observed:
+            raise ValueError("duplicate project type observation")
+        if not isinstance(code, str) or not code or code != code.strip():
+            raise ValueError("project type observation code is invalid")
+        observed[project_id] = code
+    if set(observed) != expected:
+        raise ValueError("project type observations are incomplete or unexpected")
+
+    updated_state = dict(existing)
+    added = changed = unchanged = 0
+    for project_id in sorted(expected, key=int):
+        code = observed[project_id]
+        if code not in catalog:
+            raise ValueError("project type code is absent from verified catalog")
+        assignment = (code, catalog[code])
+        previous = existing.get(project_id)
+        if previous is None:
+            added += 1
+        elif previous != assignment:
+            changed += 1
+        else:
+            unchanged += 1
+        updated_state[project_id] = assignment
+    return updated_state, {"added": added, "changed": changed, "unchanged": unchanged}
+
+
 def state_rows_equivalent(left: list[list[Any]], right: list[list[Any]]) -> bool:
     """Compare persisted state semantically while validating both snapshots."""
     try:
