@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
+from urllib.error import HTTPError, URLError
 
+from .portal_transport import PortalTransportError
 from .technical_ids import integer_id
 
 
@@ -24,6 +27,76 @@ PERIOD_MARKER_RE = re.compile(r"(?<!\d)(0[1-9]|1[0-2])(\d{2})(?!\d)")
 APPLICABILITY_CUTOFF = (2026, 9)
 PROJECT_TYPE_DIRECTORY_PATH = "/admin/proj-type"
 VERIFIED_DIRECTORY_CODES = {"0002", "0003", "0004", "0005", "0007", "0008", "0009"}
+
+
+class ProjectTypeAcquisitionError(RuntimeError):
+    """Fail-closed acquisition error carrying only allowlisted diagnostics."""
+
+    _STAGES = {
+        "PROJECT_DETAIL_REQUEST",
+        "PROJECT_DETAIL_HTTP_STATUS",
+        "PROJECT_DETAIL_RESPONSE",
+        "PROJECT_DETAIL_UTF8",
+        "PROJECT_DETAIL_JSON",
+        "PROJECT_DETAIL_TYPE_CLASSIFICATION",
+    }
+    _CATEGORIES = {
+        "TRANSPORT_ERROR", "HTTP_ERROR", "UTF8_ERROR", "JSON_ERROR",
+        "UNRESOLVED_TYPE", "INTERNAL_ERROR",
+    }
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        project_index: int | str,
+        project_total: int | str,
+        project_id: Any,
+        failure_category: str,
+        http_status: int | str,
+    ) -> None:
+        super().__init__("project type acquisition is incomplete")
+        if type(project_index) is not int or project_index < 1:
+            project_index = "UNKNOWN"
+        if type(project_total) is not int or project_total < 1:
+            project_total = "UNKNOWN"
+        if project_index != "UNKNOWN" and project_total != "UNKNOWN" and project_index > project_total:
+            project_index = "UNKNOWN"
+        if stage not in self._STAGES:
+            stage = "PROJECT_DETAIL_REQUEST"
+        if failure_category not in self._CATEGORIES:
+            failure_category = "INTERNAL_ERROR"
+        self._stage = stage
+        self._project_index = project_index
+        self._project_total = project_total
+        self._project_id = _safe_project_id(project_id)
+        self._failure_category = failure_category
+        self._http_status = _safe_http_status(http_status)
+
+    @property
+    def diagnostic(self) -> dict[str, Any]:
+        return {
+            "STAGE": self._stage,
+            "PROJECT_INDEX": self._project_index,
+            "PROJECT_TOTAL": self._project_total,
+            "PROJECT_ID": self._project_id,
+            "FAILURE_CATEGORY": self._failure_category,
+            "HTTP_STATUS": self._http_status,
+        }
+
+
+def _safe_project_id(project_id: Any) -> str:
+    if type(project_id) is int and project_id >= 0:
+        return str(project_id)
+    if type(project_id) is str and re.fullmatch(r"\d+", project_id):
+        return project_id
+    return "UNKNOWN"
+
+
+def _safe_http_status(status: Any) -> int | str:
+    if type(status) is int and 100 <= status <= 599:
+        return status
+    return "UNKNOWN"
 
 
 class _ProjectTypeDirectoryHTML(HTMLParser):
@@ -443,24 +516,63 @@ def acquire_current_types(
     )
     observations: list[tuple[str, str]] = []
     started = time.monotonic()
-    for index, project_id in enumerate(sorted(applicable, key=int), start=1):
+    ordered_project_ids = sorted(applicable, key=int)
+    project_total = len(ordered_project_ids)
+    for index, project_id in enumerate(ordered_project_ids, start=1):
+        safe_pid = _safe_project_id(project_id)
+
+        def fail(category: str, failure_stage: str, status: int | str = "UNKNOWN") -> None:
+            telemetry.request_failures += 1
+            telemetry.request_elapsed_seconds = time.monotonic() - started
+            raise ProjectTypeAcquisitionError(
+                stage=failure_stage,
+                project_index=index,
+                project_total=project_total,
+                project_id=safe_pid,
+                failure_category=category,
+                http_status=status,
+            ) from None
+
         try:
             status, _content_type, body = session.request(
                 f"/api/project/{project_id}", "GET", accept="application/json"
             )
             telemetry.detail_get_additional += 1
-            if status != 200 or not body:
-                raise ValueError("project type detail response unavailable")
-            import json
-            payload = json.loads(body.decode("utf-8", "strict"))
-            bucket, code, _name = classify_raw_type(payload, catalog)
-            if bucket != "VALID" or code is None:
-                raise ValueError("project type detail is unresolved")
-            observations.append((project_id, code))
+        except Exception as exc:
+            if isinstance(exc, HTTPError):
+                fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", _safe_http_status(exc.code))
+            if isinstance(exc, (PortalTransportError, TimeoutError, ConnectionError, URLError)):
+                fail("TRANSPORT_ERROR", "PROJECT_DETAIL_REQUEST")
+            fail("INTERNAL_ERROR", "PROJECT_DETAIL_REQUEST")
+
+        http_status = _safe_http_status(status)
+        if status != 200:
+            fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", http_status)
+
+        if not body:
+            fail("UNRESOLVED_TYPE", "PROJECT_DETAIL_RESPONSE", http_status)
+
+        try:
+            payload_text = body.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            fail("UTF8_ERROR", "PROJECT_DETAIL_UTF8", http_status)
         except Exception:
-            telemetry.request_failures += 1
-            telemetry.request_elapsed_seconds = time.monotonic() - started
-            raise RuntimeError("project type acquisition is incomplete") from None
+            fail("INTERNAL_ERROR", "PROJECT_DETAIL_UTF8", http_status)
+
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            fail("JSON_ERROR", "PROJECT_DETAIL_JSON", http_status)
+        except Exception:
+            fail("INTERNAL_ERROR", "PROJECT_DETAIL_JSON", http_status)
+
+        try:
+            bucket, code, _name = classify_raw_type(payload, catalog)
+        except Exception:
+            fail("INTERNAL_ERROR", "PROJECT_DETAIL_TYPE_CLASSIFICATION", http_status)
+        if bucket != "VALID" or code is None:
+            fail("UNRESOLVED_TYPE", "PROJECT_DETAIL_TYPE_CLASSIFICATION", http_status)
+        observations.append((project_id, code))
         if delay:
             time.sleep(delay)
 

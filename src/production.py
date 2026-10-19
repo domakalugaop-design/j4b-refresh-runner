@@ -34,6 +34,7 @@ from .portal_transport import PortalSession
 from .google_service_account import google_token
 from .project_types import (
     PROJECT_TYPE_DICTIONARY,
+    ProjectTypeAcquisitionError,
     STATE_COLUMNS,
     acquire_current_types,
     acquire_project_type_catalog,
@@ -1849,13 +1850,18 @@ def main() -> int:
         )
         return 1
     except Exception as exc:
+        failure = {
+            "FINAL_STATUS": "FAILED",
+            "ERROR_TYPE": type(exc).__name__,
+            "FAILURE_CLASS": _safe_failure_class(exc),
+        }
+        if isinstance(exc, ProjectTypeAcquisitionError):
+            # This object is constructed only from fixed stage/category codes,
+            # numeric IDs, counters, and a validated numeric HTTP status.
+            failure.update(exc.diagnostic)
         print(
             json.dumps(
-                {
-                    "FINAL_STATUS": "FAILED",
-                    "ERROR_TYPE": type(exc).__name__,
-                    "FAILURE_CLASS": _safe_failure_class(exc),
-                },
+                failure,
                 ensure_ascii=False,
                 sort_keys=True,
             ),

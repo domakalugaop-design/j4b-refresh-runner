@@ -1,10 +1,12 @@
 import json
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 import pytest
 
 from src.project_types import (
     PROJECT_TYPE_DICTIONARY,
+    ProjectTypeAcquisitionError,
     STATE_COLUMNS,
     apply_canonical_project_names,
     acquire_pending_types,
@@ -22,7 +24,9 @@ from src.project_types import (
     validate_project_type_catalog,
     validate_state_rows,
 )
+from src import production
 from src.refresh import PublicationRollbackError, publish_project_type_refresh, publish_project_type_state
+from src.portal_transport import PortalTransportError
 
 
 DIRECTORY_HTML = b"""<!doctype html><html><body><table>
@@ -117,6 +121,157 @@ def test_current_type_acquisition_fails_closed_for_unknown_or_duplicate_project_
         reconcile_project_type_assignments(
             {}, [("1", "0009"), ("1", "0009")], {"1"}, list(catalog.items())
         )
+
+
+_DIAGNOSTIC_CATALOG = {"0002": "Classic", "0009": "Home Test"}
+_DIAGNOSTIC_UNIVERSE = [
+    {"project_id": str(i), "project_name": f"Fixture_{i}_0926"}
+    for i in range(1, 4)
+]
+
+
+class _DiagnosticSession:
+    def __init__(self, fail_at, failure=None, response=None):
+        self.fail_at = fail_at
+        self.failure = failure
+        self.response = response or (200, "application/json", b'{"type":"0002"}')
+        self.calls = []
+
+    def request(self, path, method, accept):
+        self.calls.append((path, method, accept))
+        if len(self.calls) == self.fail_at and self.failure is not None:
+            raise self.failure
+        if len(self.calls) == self.fail_at and self.response is not None:
+            return self.response
+        return 200, "application/json", b'{"type":"0002"}'
+
+
+def _acquire_failure(session):
+    with pytest.raises(ProjectTypeAcquisitionError) as caught:
+        acquire_current_types(
+            session, _DIAGNOSTIC_UNIVERSE, {}, _DIAGNOSTIC_CATALOG, delay=0
+        )
+    return caught.value
+
+
+@pytest.mark.parametrize(
+    ("failure", "category"),
+    [
+        (TimeoutError("timeout text must not be logged"), "TRANSPORT_ERROR"),
+        (ConnectionError("connection text must not be logged"), "TRANSPORT_ERROR"),
+        (PortalTransportError("TIMEOUT", True), "TRANSPORT_ERROR"),
+        (RuntimeError("arbitrary upstream exception"), "INTERNAL_ERROR"),
+    ],
+)
+def test_project_type_acquisition_transport_and_internal_diagnostics(failure, category):
+    session = _DiagnosticSession(1, failure=failure, response=None)
+    error = _acquire_failure(session)
+    assert error.diagnostic == {
+        "STAGE": "PROJECT_DETAIL_REQUEST",
+        "PROJECT_INDEX": 1,
+        "PROJECT_TOTAL": 3,
+        "PROJECT_ID": "1",
+        "FAILURE_CATEGORY": category,
+        "HTTP_STATUS": "UNKNOWN",
+    }
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("status", [500, 403])
+def test_project_type_acquisition_http_diagnostics(status):
+    error = _acquire_failure(
+        _DiagnosticSession(1, response=(status, "text/plain", b"sensitive body"))
+    )
+    assert error.diagnostic["FAILURE_CATEGORY"] == "HTTP_ERROR"
+    assert error.diagnostic["HTTP_STATUS"] == status
+    assert error.diagnostic["STAGE"] == "PROJECT_DETAIL_HTTP_STATUS"
+
+
+@pytest.mark.parametrize("status", [500, 403])
+def test_project_type_acquisition_http_exception_uses_numeric_status_without_message(status):
+    error = _acquire_failure(
+        _DiagnosticSession(
+            1,
+            failure=HTTPError("https://example.invalid/?token=DO_NOT_LOG", status, "PRIVATE BODY", None, None),
+            response=None,
+        )
+    )
+    assert error.diagnostic["FAILURE_CATEGORY"] == "HTTP_ERROR"
+    assert error.diagnostic["HTTP_STATUS"] == status
+    assert "DO_NOT_LOG" not in json.dumps(error.diagnostic)
+    assert "PRIVATE BODY" not in json.dumps(error.diagnostic)
+
+
+@pytest.mark.parametrize(
+    ("body", "category", "stage"),
+    [
+        (bytes([255]), "UTF8_ERROR", "PROJECT_DETAIL_UTF8"),
+        (b'{"password":"SENSITIVE_RESPONSE_BODY"', "JSON_ERROR", "PROJECT_DETAIL_JSON"),
+        (b'{"type":"9999","token":"SENSITIVE_RESPONSE_BODY"}', "UNRESOLVED_TYPE", "PROJECT_DETAIL_TYPE_CLASSIFICATION"),
+    ],
+)
+def test_project_type_acquisition_payload_diagnostics_are_sanitized(body, category, stage):
+    error = _acquire_failure(
+        _DiagnosticSession(1, response=(200, "application/json", body))
+    )
+    assert error.diagnostic["FAILURE_CATEGORY"] == category
+    assert error.diagnostic["STAGE"] == stage
+    assert error.diagnostic["HTTP_STATUS"] == 200
+
+
+@pytest.mark.parametrize(("failure_index", "project_id"), [(1, "1"), (3, "3")])
+def test_project_type_acquisition_reports_first_and_last_failure(failure_index, project_id):
+    error = _acquire_failure(
+        _DiagnosticSession(failure_index, failure=TimeoutError(), response=None)
+    )
+    assert error.diagnostic["PROJECT_INDEX"] == failure_index
+    assert error.diagnostic["PROJECT_TOTAL"] == 3
+    assert error.diagnostic["PROJECT_ID"] == project_id
+
+
+def test_project_type_acquisition_diagnostics_never_include_sensitive_inputs(monkeypatch, capsys):
+    secret_text = "login=PRIVATE password=PRIVATE cookie=PRIVATE token=PRIVATE"
+    body_text = '{"client":"PRIVATE","token":"PRIVATE"'
+    with pytest.raises(ProjectTypeAcquisitionError) as caught:
+        acquire_current_types(
+            _DiagnosticSession(1, failure=TimeoutError(secret_text), response=None),
+            _DIAGNOSTIC_UNIVERSE,
+            {},
+            _DIAGNOSTIC_CATALOG,
+            delay=0,
+        )
+    assert not any(value in json.dumps(caught.value.diagnostic) for value in (secret_text, body_text, "PRIVATE"))
+
+    monkeypatch.setattr(production, "run", lambda: (_ for _ in ()).throw(caught.value))
+    assert production.main() == 1
+    output = capsys.readouterr().out
+    parsed = json.loads(output)
+    assert parsed["FAILURE_CATEGORY"] == "TRANSPORT_ERROR"
+    assert parsed["PROJECT_ID"] == "1"
+    assert not any(value in output for value in (secret_text, body_text, "PRIVATE", "Traceback"))
+
+
+def test_project_type_acquisition_rejects_non_numeric_diagnostic_id():
+    error = ProjectTypeAcquisitionError(
+        stage="PROJECT_DETAIL_REQUEST",
+        project_index=1,
+        project_total=1,
+        project_id="42?token=secret",
+        failure_category="INTERNAL_ERROR",
+        http_status="UNKNOWN",
+    )
+    assert error.diagnostic["PROJECT_ID"] == "UNKNOWN"
+
+
+def test_project_type_acquisition_error_remains_fail_closed_without_retry_or_partial_state():
+    session = _DiagnosticSession(2, failure=ConnectionError("private"), response=None)
+    with pytest.raises(ProjectTypeAcquisitionError):
+        acquire_current_types(
+            session, _DIAGNOSTIC_UNIVERSE, {"1": ("0002", "Classic")},
+            _DIAGNOSTIC_CATALOG, delay=0,
+        )
+    assert len(session.calls) == 2
+    assert [call[0] for call in session.calls] == ["/api/project/1", "/api/project/2"]
 
 
 @pytest.mark.parametrize(
