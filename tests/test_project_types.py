@@ -1,6 +1,7 @@
 import json
 from unittest.mock import patch
 from urllib.error import HTTPError
+from datetime import date
 
 import pytest
 
@@ -174,7 +175,7 @@ def test_project_type_acquisition_transport_and_internal_diagnostics(failure, ca
         "FAILURE_CATEGORY": category,
         "HTTP_STATUS": "UNKNOWN",
     }
-    assert len(session.calls) == 1
+    assert len(session.calls) == 3
 
 
 @pytest.mark.parametrize("status", [500, 403])
@@ -270,8 +271,8 @@ def test_project_type_acquisition_error_remains_fail_closed_without_retry_or_par
             session, _DIAGNOSTIC_UNIVERSE, {"1": ("0002", "Classic")},
             _DIAGNOSTIC_CATALOG, delay=0,
         )
-    assert len(session.calls) == 2
-    assert [call[0] for call in session.calls] == ["/api/project/1", "/api/project/2"]
+    assert len(session.calls) == 3
+    assert [call[0] for call in session.calls] == ["/api/project/1", "/api/project/2", "/api/project/3"]
 
 
 @pytest.mark.parametrize(
@@ -290,10 +291,11 @@ def test_period_marker_is_validated_and_normalized(name, expected):
 
 @pytest.mark.parametrize(
     ("name", "expected"),
-    [("A_0826", False), ("A_0926", True), ("A_0127", True), ("A_1326", False)],
+    [("A_0826", False), ("A_0926", True), ("A_1026", True), ("A_1126", True),
+     ("A_1226", False), ("A_0127", False), ("A_1326", False)],
 )
-def test_project_type_cutoff_is_september_2026_or_later(name, expected):
-    assert is_project_type_applicable(name) is expected
+def test_project_type_period_recognition_requires_one_valid_marker(name, expected):
+    assert is_project_type_applicable(name, today=date(2026, 10, 19)) is expected
 
 
 def test_dictionary_codes_remain_text_with_leading_zeroes():
@@ -628,16 +630,18 @@ def test_materialized_join_blanks_pre_cutoff_and_unresolved_rows():
     assert rows[2]["project_type_name"] is None
 
 
-def test_applicability_uses_one_normalized_universe_period_contract_and_canonical_name():
+def test_applicability_uses_live_names_and_three_month_calendar_window():
     universe = [
         {"project_id": "1", "project_name": "old_0826"},
-        {"project_id": "2", "project_name": "current_0926"},
-        {"project_id": "3", "project_name": "future_0127"},
+        {"project_id": "2", "project_name": "previous_0926"},
+        {"project_id": "3", "project_name": "current_1026"},
+        {"project_id": "4", "project_name": "next_1126"},
+        {"project_id": "5", "project_name": "outside_1226"},
     ]
-    assert project_type_applicable_ids(universe) == {"2", "3"}
+    assert project_type_applicable_ids(universe, today=date(2026, 10, 19)) == {"2", "3", "4"}
     rows = [{"project_id": "2", "project_name": "stale_0726"}]
-    apply_canonical_project_names(rows, universe)
-    assert rows[0]["project_name"] == "current_0926"
+    apply_canonical_project_names(rows, universe, {"2"})
+    assert rows[0]["project_name"] == "previous_0926"
 
 
 @pytest.mark.parametrize(
@@ -661,7 +665,7 @@ def test_discovered_stale_names_are_replaced_from_universe_for_7598_and_8044(
     rows = [{"project_id": project_id, "project_name": stale_name}]
     universe = [{"project_id": project_id, "project_name": canonical_name}]
     apply_canonical_project_names(rows, universe)
-    applicable = project_type_applicable_ids(universe)
+    applicable = project_type_applicable_ids(universe, today=date(2026, 9, 1))
     state = {project_id: ("0005", "Качественные исследования")}
     materialize_project_types(rows, state, applicable)
     assert rows[0]["project_name"] == canonical_name
@@ -676,15 +680,28 @@ def test_discovered_stale_names_are_replaced_from_universe_for_7598_and_8044(
         ("8044", "JP_Лаб1 &quot;ИИ образование&quot;_Q3_9026"),
     ],
 )
-def test_immutable_assignment_with_stale_period_surfaces_conflict_without_deletion(
+def test_historical_assignment_is_preserved_when_project_is_outside_active_window(
     project_id, stale_name
 ):
     state = {project_id: ("0005", "Качественные исследования")}
     rows = [{"project_id": project_id, "project_name": stale_name}]
-    with pytest.raises(ValueError, match=f"PERIOD_APPLICABILITY_CONFLICT.*{project_id}"):
-        materialize_project_types(rows, state, set())
+    materialize_project_types(rows, state, set())
     assert state == {project_id: ("0005", "Качественные исследования")}
-    assert "project_type_code" not in rows[0]
+    assert rows[0]["project_type_code"] == "0005"
+
+
+def test_canonical_rename_is_applied_only_to_selected_live_ids():
+    rows = [
+        {"project_id": "1", "project_name": "old_1026"},
+        {"project_id": "2", "project_name": "historical_old_0826"},
+    ]
+    universe = [
+        {"project_id": "1", "project_name": "renamed_1026"},
+        {"project_id": "2", "project_name": "renamed_historical_0826"},
+    ]
+    apply_canonical_project_names(rows, universe, {"1"})
+    assert rows[0]["project_name"] == "renamed_1026"
+    assert rows[1]["project_name"] == "historical_old_0826"
 
 
 class FakeSession:

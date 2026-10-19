@@ -109,7 +109,7 @@ def test_checkpoint_materialization_preflight_loads_baseline_before_merge(monkey
         return [{"project_id": "1"}]
 
     monkeypatch.setattr(production, "merge_previous", merge)
-    monkeypatch.setattr(production, "apply_canonical_project_names", lambda _rows, _universe: None)
+    monkeypatch.setattr(production, "apply_canonical_project_names", lambda _rows, _universe, _ids=None: None)
     monkeypatch.setattr(production, "materialize_project_types", lambda _rows, _state, _applicable: None)
     monkeypatch.setattr(production, "sheet_rows", lambda _rows, *, columns: [list(columns)])
     monkeypatch.setattr(
@@ -419,6 +419,7 @@ def test_full_production_dry_run_uses_candidate_path_and_never_mutates(tmp_path,
          patch("src.production.discover_universe", return_value=_universe()), \
          patch("src.production.Reader", FakeReader), \
          patch("src.production.select_scope", return_value=[]), \
+         patch("src.production.regular_scope_counts", return_value={"new": 0, "current_month": 0, "previous_month": 0, "next_month": 0, "union": 0, "unrecognized": 0, "ambiguous": 0, "quarter_warnings": 0}), \
          patch("src.production.materialize", return_value=[]), \
          patch("src.production.merge_previous", return_value=[row]), \
          patch("src.production._execute_project_type_layout") as migrate, \

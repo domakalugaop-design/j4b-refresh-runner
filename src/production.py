@@ -66,6 +66,7 @@ from .refresh import (
     summary,
     api,
     col,
+    moscow_today as get_moscow_today,
 )
 from .workflow_publication import (
     PRIMARY_ANALYTICS_COLUMNS,
@@ -355,7 +356,7 @@ def _load_bootstrap_seed(
         if pid not in target_ids:
             raise ValueError(f"bootstrap project_id missing from target: {pid}")
         if pid not in applicable_ids:
-            raise ValueError(f"bootstrap project_id is pre-cutoff or has no qualified period: {pid}")
+            raise ValueError(f"bootstrap project_id is outside the active rolling window: {pid}")
         effective_catalog = catalog
         if effective_catalog is None:
             effective_catalog = PROJECT_TYPE_DICTIONARY
@@ -381,11 +382,8 @@ def _resolve_project_type_state(
     """Use persisted state when present; bootstrap is strictly absent-state only."""
     if state_exists:
         state = validate_state_rows(persisted_rows, allow_dynamic_catalog=True)
-        applicable_ids = project_type_applicable_ids(universe)
-        if not set(state).issubset(target_ids):
-            raise ValueError("persisted project_types state references project absent from target")
-        if not set(state).issubset(applicable_ids):
-            raise ValueError("persisted project_types state includes pre-0926 or unqualified project")
+        # Persisted assignments are historical last-good state. API omission
+        # or moving outside the active window is not evidence of deletion.
         return persisted_rows, state, "PERSISTED_STATE", "NONE"
     if not seed_path or not seed_sha256:
         raise ValueError("project_types state is absent; explicit validated bootstrap artifact is required")
@@ -396,13 +394,13 @@ def _resolve_project_type_state(
 def _prune_absent_project_type_state_rows(
     rows: list[list[Any]], authoritative_ids: set[str]
 ) -> list[list[Any]]:
-    """Drop only current-state assignments for IDs absent from a complete universe."""
+    """Keep all last-good assignments; API absence alone is not a deletion signal."""
     if not rows:
         return rows
     if rows[0] != STATE_COLUMNS:
         raise ValueError("project_types header mismatch")
-    ids = {str(project_id) for project_id in authoritative_ids}
-    return [rows[0]] + [row for row in rows[1:] if row and str(row[0]) in ids]
+    validate_state_rows(rows, allow_dynamic_catalog=True)
+    return [list(row) for row in rows]
 
 
 def _validate_authoritative_universe(universe: list[dict[str, Any]]) -> set[str]:
@@ -416,8 +414,6 @@ def _validate_authoritative_universe(universe: list[dict[str, Any]]) -> set[str]
         project_id = str(item.get("project_id", ""))
         if not project_id.isdigit() or project_id in ids:
             raise RuntimeError("authoritative project universe contains invalid or duplicate project IDs")
-        if item.get("project_name") in (None, ""):
-            raise RuntimeError("authoritative project universe contains a project without a name")
         ids.add(project_id)
     return ids
 
@@ -537,9 +533,6 @@ def _validate_project_type_state_materialization(
     absent from the candidate; any assignment that is present must still match
     the immutable persisted value.
     """
-    if not applicable_ids.issuperset(state):
-        invalid = sorted(set(state) - applicable_ids, key=int)
-        raise RuntimeError(f"candidate contains pre-0926 Project Type assignment: {','.join(invalid)}")
     for row in rows:
         project_id = str(row.get("project_id", ""))
         assignment = state.get(project_id)
@@ -1205,7 +1198,6 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     previous_raw = checkpoint["previous_raw"]
     previous_state_rows = checkpoint["previous_state_rows"]
     state = {str(pid): tuple(value) for pid, value in checkpoint["state"].items()}
-    state = {pid: value for pid, value in state.items() if pid in authoritative_ids}
     source_columns = list(previous_raw[0]) if previous_raw else []
     previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
     if os.environ.get("MATERIALIZATION_PREFLIGHT", "false").strip().lower() == "true":
@@ -1217,7 +1209,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         )
         if workflow_enabled:
             validate_materialized_rows(merged)
-        apply_canonical_project_names(merged, universe)
+        apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
         materialize_project_types(merged, state, project_type_applicable_ids(universe))
         candidate = sheet_rows(merged, columns=columns)
         candidate_summary = summary(candidate)
@@ -1239,7 +1231,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         merged, authoritative_ids, acquisition_complete=True
     )
     validate_materialized_rows(merged)
-    apply_canonical_project_names(merged, universe)
+    apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
     applicable = project_type_applicable_ids(universe)
     materialize_project_types(merged, state, applicable)
     payment_publication = None
@@ -1424,6 +1416,7 @@ def run() -> dict[str, Any]:
         universe = discover_universe(session)
         authoritative_ids = _validate_authoritative_universe(universe)
         _stage(f"UNIVERSE_DISCOVERY_PASS | universe={len(universe)} | authoritative=PASS")
+        moscow_today = get_moscow_today()
 
         type_telemetry = None
         type_catalog: dict[str, str] | None = None
@@ -1455,6 +1448,7 @@ def run() -> dict[str, Any]:
                 state,
                 type_catalog,
                 float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")),
+                today=moscow_today,
             )
             _stage(
                 f"PROJECT_TYPE_ACQUISITION_PASS | applicable={type_telemetry.applicable_projects} | "
@@ -1464,24 +1458,25 @@ def run() -> dict[str, Any]:
             )
 
         backfill_scope = os.environ.get("BACKFILL_SCOPE", "").strip()
-        moscow_today = (datetime.now(timezone.utc) + timedelta(hours=3)).date()
         scope_counts: dict[str, int] | None = None
+        if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
+            raise RuntimeError("regular refresh refuses full-universe project detail acquisition")
         if workflow_enabled and backfill_scope == "2026":
-            if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
-                raise RuntimeError("2026 backfill refuses full-universe acquisition fallback")
             selected = _select_reporting_year_scope(universe, previous, 2026)
             if not 1000 <= len(selected) <= 3000:
                 raise RuntimeError(f"2026 backfill scope count outside expected order of magnitude: {len(selected)}")
             _stage(f"BACKFILL_SCOPE_GUARD_PASS | scope=2026_ONLY | projects={len(selected)} | pre2026=0")
         else:
-            if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
-                selected = sorted((dict(item) for item in universe), key=lambda row: int(row["project_id"]))
-                scope_counts = {"new": len({str(x["project_id"]) for x in universe} - {str(r[0]) for r in previous[1:] if r and r[0] not in (None, "")}), "current_month": 0, "previous_month": 0, "union": len(selected)}
-            else:
-                scope_counts = regular_scope_counts(universe, previous, moscow_today)
-                selected = select_scope(universe, previous, today=moscow_today)
-                if len(selected) != scope_counts["union"]:
-                    raise RuntimeError("regular selector summary disagrees with deduplicated selection")
+            scope_counts = regular_scope_counts(universe, previous, moscow_today)
+            selected = select_scope(universe, previous, today=moscow_today)
+            if len(selected) != scope_counts["union"]:
+                raise RuntimeError("regular selector summary disagrees with deduplicated selection")
+            _stage(
+                "SCOPE_CLASSIFICATION | "
+                f"unrecognized={scope_counts['unrecognized']} | "
+                f"ambiguous={scope_counts['ambiguous']} | "
+                f"quarter_warnings={scope_counts['quarter_warnings']}"
+            )
         _stage(f"SCOPE_SELECTION_PASS | selected={len(selected)}")
         # Budget for one full retry sequence plus one failed-project-only recovery pass.
         reader = Reader(
@@ -1614,7 +1609,7 @@ def run() -> dict[str, Any]:
         if workflow_enabled:
             validate_materialized_rows(merged)
         if project_type_enabled:
-            apply_canonical_project_names(merged, universe)
+            apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
             applicable_ids = project_type_applicable_ids(universe)
             materialize_project_types(merged, state, applicable_ids)
         candidate = sheet_rows(merged, columns=columns)
@@ -1628,8 +1623,8 @@ def run() -> dict[str, Any]:
             _validate_project_type_state_materialization(merged, state, applicable_ids)
             layout_plan["planned"] = layout_plan.get("planned", []) + (["WRITE project_types state"] if state != validate_state_rows(previous_state_rows, allow_dynamic_catalog=True) else [])
             layout_plan["planned"] = layout_plan.get("planned", []) + [f"WRITE projects_current A:{col(len(columns)-1)}"]
-        _stage(f"LIFECYCLE_RECONCILIATION_PASS | authoritative={len(authoritative_ids)} | stale_pruned={len(stale_ids)}")
-        _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
+        _stage(f"LIFECYCLE_RECONCILIATION_PASS | authoritative={len(authoritative_ids)} | absent_ids_retained={len(stale_ids)}")
+        _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | absent_ids_retained={len(stale_ids)}")
         _stage("CANDIDATE_VALIDATION_PASS")
         _stage("DIFF_VALIDATION_PASS")
 

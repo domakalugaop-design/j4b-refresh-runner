@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
 from urllib.error import HTTPError, URLError
+from datetime import date
 
 from .portal_transport import PortalTransportError
 from .technical_ids import integer_id
+from .project_period import classify_project_period, rolling_month_markers, moscow_today
 
 
 PROJECT_TYPE_COLUMNS = ["project_type_code", "project_type_name"]
@@ -23,8 +25,6 @@ PROJECT_TYPE_DICTIONARY = {
     "0007": "B2B_тайный покупатель",
     "0008": "Тестирование цифровых продуктов",
 }
-PERIOD_MARKER_RE = re.compile(r"(?<!\d)(0[1-9]|1[0-2])(\d{2})(?!\d)")
-APPLICABILITY_CUTOFF = (2026, 9)
 PROJECT_TYPE_DIRECTORY_PATH = "/admin/proj-type"
 VERIFIED_DIRECTORY_CODES = {"0002", "0003", "0004", "0005", "0007", "0008", "0009"}
 
@@ -197,28 +197,28 @@ def acquire_project_type_catalog(session: Any) -> dict[str, str]:
 
 
 def normalized_period_marker(project_name: Any) -> tuple[int, int] | None:
-    """Return the first qualified MMYY marker normalized to (YYYY, MM)."""
-    if project_name in (None, ""):
+    """Return a unique MMYY normalized to (YYYY, MM); reject ambiguity."""
+    result = classify_project_period(project_name)
+    if result.status != "VALID" or result.marker is None:
         return None
-    match = PERIOD_MARKER_RE.search(str(project_name))
-    if not match:
-        return None
-    month = int(match.group(1))
-    year = 2000 + int(match.group(2))
-    return year, month
+    return 2000 + int(result.marker[2:]), int(result.marker[:2])
 
 
-def is_project_type_applicable(project_name: Any) -> bool:
+def is_project_type_applicable(project_name: Any, today: date | None = None) -> bool:
     period = normalized_period_marker(project_name)
-    return period is not None and period >= APPLICABILITY_CUTOFF
+    return period is not None and f"{period[1]:02d}{period[0] % 100:02d}" in set(
+        rolling_month_markers(today or moscow_today())
+    )
 
 
-def project_type_applicable_ids(universe: list[dict[str, Any]]) -> set[str]:
-    """Use the current /api/project universe name as the canonical period source."""
+def project_type_applicable_ids(universe: list[dict[str, Any]], today: date | None = None) -> set[str]:
+    """Return IDs in the rolling three-month window based on current API names."""
+    window = set(rolling_month_markers(today or moscow_today()))
     return {
         str(item["project_id"])
         for item in universe
-        if is_project_type_applicable(item.get("project_name"))
+        if (period := classify_project_period(item.get("project_name"))).status == "VALID"
+        and period.marker in window
     }
 
 
@@ -232,11 +232,14 @@ def canonical_project_names(universe: list[dict[str, Any]]) -> dict[str, str]:
 
 
 def apply_canonical_project_names(
-    rows: list[dict[str, Any]], universe: list[dict[str, Any]]
+    rows: list[dict[str, Any]], universe: list[dict[str, Any]], project_ids: set[str] | None = None
 ) -> list[dict[str, Any]]:
     names = canonical_project_names(universe)
     for row in rows:
-        name = names.get(str(row.get("project_id", "")))
+        project_id = str(row.get("project_id", ""))
+        if project_ids is not None and project_id not in project_ids:
+            continue
+        name = names.get(project_id)
         if name is not None:
             row["project_name"] = name
     return rows
@@ -398,8 +401,6 @@ def materialize_project_types(
     for row in rows:
         project_id = str(row.get("project_id", ""))
         assignment = state.get(project_id)
-        if assignment and project_id not in applicable_ids:
-            raise ValueError(f"PERIOD_APPLICABILITY_CONFLICT: project_id={project_id}")
         row["project_type_code"] = assignment[0] if assignment else None
         row["project_type_name"] = assignment[1] if assignment else None
     return rows
@@ -500,6 +501,7 @@ def acquire_current_types(
     existing: dict[str, tuple[str, str]],
     catalog: dict[str, str],
     delay: float = 0.15,
+    today: date | None = None,
 ) -> tuple[dict[str, tuple[str, str]], ProjectTypeTelemetry, set[str]]:
     """Refresh every applicable project assignment against the live catalog.
 
@@ -508,7 +510,7 @@ def acquire_current_types(
     non-applicable assignments; payment data is outside this function.
     """
     catalog = validate_project_type_catalog(list(catalog.items()))
-    applicable = project_type_applicable_ids(universe)
+    applicable = project_type_applicable_ids(universe, today=today)
     telemetry = ProjectTypeTelemetry(
         applicable_projects=len(applicable),
         already_assigned=len(applicable & set(existing)),
@@ -518,20 +520,20 @@ def acquire_current_types(
     started = time.monotonic()
     ordered_project_ids = sorted(applicable, key=int)
     project_total = len(ordered_project_ids)
+    failures: list[ProjectTypeAcquisitionError] = []
     for index, project_id in enumerate(ordered_project_ids, start=1):
         safe_pid = _safe_project_id(project_id)
 
         def fail(category: str, failure_stage: str, status: int | str = "UNKNOWN") -> None:
             telemetry.request_failures += 1
-            telemetry.request_elapsed_seconds = time.monotonic() - started
-            raise ProjectTypeAcquisitionError(
+            failures.append(ProjectTypeAcquisitionError(
                 stage=failure_stage,
                 project_index=index,
                 project_total=project_total,
                 project_id=safe_pid,
                 failure_category=category,
                 http_status=status,
-            ) from None
+            ))
 
         try:
             status, _content_type, body = session.request(
@@ -541,41 +543,74 @@ def acquire_current_types(
         except Exception as exc:
             if isinstance(exc, HTTPError):
                 fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", _safe_http_status(exc.code))
-            if isinstance(exc, (PortalTransportError, TimeoutError, ConnectionError, URLError)):
+            elif isinstance(exc, (PortalTransportError, TimeoutError, ConnectionError, URLError)):
                 fail("TRANSPORT_ERROR", "PROJECT_DETAIL_REQUEST")
-            fail("INTERNAL_ERROR", "PROJECT_DETAIL_REQUEST")
+            else:
+                fail("INTERNAL_ERROR", "PROJECT_DETAIL_REQUEST")
+            if delay:
+                time.sleep(delay)
+            continue
 
         http_status = _safe_http_status(status)
         if status != 200:
             fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
 
         if not body:
             fail("UNRESOLVED_TYPE", "PROJECT_DETAIL_RESPONSE", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
 
         try:
             payload_text = body.decode("utf-8", "strict")
         except UnicodeDecodeError:
             fail("UTF8_ERROR", "PROJECT_DETAIL_UTF8", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
         except Exception:
             fail("INTERNAL_ERROR", "PROJECT_DETAIL_UTF8", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
 
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError:
             fail("JSON_ERROR", "PROJECT_DETAIL_JSON", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
         except Exception:
             fail("INTERNAL_ERROR", "PROJECT_DETAIL_JSON", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
 
         try:
             bucket, code, _name = classify_raw_type(payload, catalog)
         except Exception:
             fail("INTERNAL_ERROR", "PROJECT_DETAIL_TYPE_CLASSIFICATION", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
         if bucket != "VALID" or code is None:
             fail("UNRESOLVED_TYPE", "PROJECT_DETAIL_TYPE_CLASSIFICATION", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
         observations.append((project_id, code))
         if delay:
             time.sleep(delay)
 
+    telemetry.request_elapsed_seconds = time.monotonic() - started
+    if failures:
+        # Complete this bounded read-only pass, but fail closed before any
+        # reconciliation/publication when even one project's type is unknown.
+        raise failures[0]
     updated, counts = reconcile_project_type_assignments(
         existing,
         observations,
