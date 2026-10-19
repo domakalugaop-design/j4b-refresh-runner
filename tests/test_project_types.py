@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 import pytest
@@ -7,9 +8,11 @@ from src.project_types import (
     STATE_COLUMNS,
     apply_canonical_project_names,
     acquire_pending_types,
+    acquire_current_types,
     classify_raw_type,
     is_project_type_applicable,
     materialize_project_types,
+    parse_project_type_catalog_html,
     merge_assignment,
     normalized_period_marker,
     project_type_applicable_ids,
@@ -20,6 +23,100 @@ from src.project_types import (
     validate_state_rows,
 )
 from src.refresh import PublicationRollbackError, publish_project_type_refresh, publish_project_type_state
+
+
+DIRECTORY_HTML = b"""<!doctype html><html><body><table>
+<tr><th>ID</th><th>Code</th><th>Name</th></tr>
+<tr><td>2</td><td>0002</td><td>Classic</td></tr>
+<tr><td>3</td><td>0003</td><td>Taxi</td></tr>
+<tr><td>4</td><td>0004</td><td>Photo</td></tr>
+<tr><td>5</td><td>0005</td><td>Qualitative</td></tr>
+<tr><td>7</td><td>0007</td><td>B2B</td></tr>
+<tr><td>8</td><td>0008</td><td>Digital</td></tr>
+<tr><td>9</td><td>0009</td><td>Home Test</td></tr>
+<tr><td>10</td><td>0010</td><td>New type</td></tr>
+</table></body></html>"""
+
+
+def test_live_directory_parser_preserves_codes_and_discovers_new_types():
+    catalog = parse_project_type_catalog_html(DIRECTORY_HTML)
+    assert len(catalog) == 8
+    assert catalog["0009"] == "Home Test"
+    assert catalog["0010"] == "New type"
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        b"<html><body><table><tr><td>2</td><td>0002</td><td>x</td></tr></table></body></html>",
+        DIRECTORY_HTML.replace(b"<td>0009</td>", b"<td>0002</td>"),
+        DIRECTORY_HTML.replace(b"<td>New type</td>", b"<td></td>"),
+        DIRECTORY_HTML.replace(b"<table>", b"<table><nav class='pagination'>next</nav>"),
+        b"<html><body>PHP Parse error</body></html>",
+    ],
+)
+def test_live_directory_parser_fails_closed_on_incomplete_or_ambiguous_pages(html):
+    with pytest.raises(ValueError):
+        parse_project_type_catalog_html(html)
+
+
+def test_current_type_acquisition_updates_existing_assignments_and_type_names():
+    class Session:
+        def __init__(self):
+            self.calls = []
+
+        def request(self, path, method, accept):
+            self.calls.append((path, method, accept))
+            project_id = path.rsplit("/", 1)[-1]
+            payload = {"type": {"1": "0009", "2": "0010", "3": "0009"}[project_id]}
+            return 200, "application/json", json.dumps(payload).encode()
+
+    session = Session()
+    existing = {
+        "1": ("0002", "old label"),
+        "2": ("0003", "old type"),
+        "3": ("0009", "old name"),
+    }
+    catalog = validate_project_type_catalog([
+        ("0002", "Classic"), ("0003", "Taxi"), ("0004", "Photo"),
+        ("0005", "Qualitative"), ("0007", "B2B"), ("0008", "Digital"),
+        ("0009", "Home Test"), ("0010", "New type"),
+    ])
+    universe = [{"project_id": str(i), "project_name": f"P{i}_0926"} for i in range(1, 4)]
+    state, telemetry, applicable = acquire_current_types(session, universe, existing, catalog, delay=0)
+    assert applicable == {"1", "2", "3"}
+    assert state == {
+        "1": ("0009", "Home Test"),
+        "2": ("0010", "New type"),
+        "3": ("0009", "Home Test"),
+    }
+    assert telemetry.valid_assignments_acquired == 3
+    assert telemetry.changed_assignments == 3
+    assert telemetry.immutable_conflicts == 0
+    assert len(session.calls) == 3
+
+
+def test_current_type_acquisition_fails_closed_for_unknown_or_duplicate_project_ids():
+    class Session:
+        def __init__(self, payloads):
+            self.payloads = iter(payloads)
+
+        def request(self, *_args, **_kwargs):
+            return 200, "application/json", json.dumps(next(self.payloads)).encode()
+
+    catalog = validate_project_type_catalog([
+        (code, name) for code, name in [
+            ("0002", "A"), ("0003", "B"), ("0004", "C"), ("0005", "D"),
+            ("0007", "E"), ("0008", "F"), ("0009", "Home Test"),
+        ]
+    ])
+    universe = [{"project_id": "1", "project_name": "P_0926"}]
+    with pytest.raises(RuntimeError, match="acquisition is incomplete"):
+        acquire_current_types(Session([{"type": "0010"}]), universe, {}, catalog, delay=0)
+    with pytest.raises(ValueError, match="duplicate project type observation"):
+        reconcile_project_type_assignments(
+            {}, [("1", "0009"), ("1", "0009")], {"1"}, list(catalog.items())
+        )
 
 
 @pytest.mark.parametrize(

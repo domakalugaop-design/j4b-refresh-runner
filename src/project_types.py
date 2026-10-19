@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Any
 
 from .technical_ids import integer_id
@@ -21,6 +22,105 @@ PROJECT_TYPE_DICTIONARY = {
 }
 PERIOD_MARKER_RE = re.compile(r"(?<!\d)(0[1-9]|1[0-2])(\d{2})(?!\d)")
 APPLICABILITY_CUTOFF = (2026, 9)
+PROJECT_TYPE_DIRECTORY_PATH = "/admin/proj-type"
+VERIFIED_DIRECTORY_CODES = {"0002", "0003", "0004", "0005", "0007", "0008", "0009"}
+
+
+class _ProjectTypeDirectoryHTML(HTMLParser):
+    """Extract code/name rows from the verified three-column admin directory."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[str]]] = []
+        self._table = False
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+        self.pagination = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attrs_dict = {key.lower(): value or "" for key, value in attrs}
+        if tag == "table":
+            self._table = True
+            self.tables.append([])
+        elif tag == "tr" and self._table:
+            self._row = []
+        elif tag in {"td", "th"} and self._table and self._row is not None:
+            self._cell = []
+        elif tag == "a":
+            rel = attrs_dict.get("rel", "").lower()
+            href = attrs_dict.get("href", "").lower()
+            classes = attrs_dict.get("class", "").lower()
+            aria = attrs_dict.get("aria-label", "").lower()
+            if "next" in rel or "pagination" in classes or "page=" in href or "next" in aria:
+                self.pagination = True
+        elif tag in {"nav", "ul", "div"} and "pagination" in attrs_dict.get("class", "").lower():
+            self.pagination = True
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"td", "th"} and self._cell is not None and self._row is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None and self._table:
+            self.tables[-1].append(self._row)
+            self._row = None
+        elif tag == "table":
+            self._table = False
+
+
+def parse_project_type_catalog_html(body: bytes) -> dict[str, str]:
+    """Parse the live admin directory and reject incomplete/ambiguous pages.
+
+    The seven codes shown in the owner-provided directory and independently
+    returned by the live route are completeness sentinels. Additional rows
+    are allowed, so newly introduced types are discovered automatically.
+    """
+    try:
+        html = body.decode("utf-8", "strict")
+    except (AttributeError, UnicodeDecodeError) as exc:
+        raise ValueError("project type directory encoding is invalid") from exc
+    lowered = html.lower()
+    if "<html" not in lowered or "</html>" not in lowered or "php parse error" in lowered:
+        raise ValueError("project type directory document is incomplete")
+    parser = _ProjectTypeDirectoryHTML()
+    parser.feed(html)
+    if parser.pagination:
+        raise ValueError("project type directory pagination is not fully acquired")
+
+    candidate_tables: list[list[tuple[str, str]]] = []
+    for table in parser.tables:
+        pairs: list[tuple[str, str]] = []
+        for row in table:
+            code_cells = [index for index, cell in enumerate(row) if re.fullmatch(r"\d{4}", cell)]
+            if not code_cells:
+                continue
+            if len(code_cells) != 1 or len(row) != 3 or code_cells[0] != 1:
+                raise ValueError("project type directory row structure is ambiguous")
+            code_index = code_cells[0]
+            if not row[code_index + 1]:
+                raise ValueError("project type directory contains an empty type name")
+            pairs.append((row[code_index], row[code_index + 1]))
+        if pairs:
+            candidate_tables.append(pairs)
+    if len(candidate_tables) != 1:
+        raise ValueError("project type directory table is missing or ambiguous")
+    catalog = validate_project_type_catalog(candidate_tables[0])
+    if not VERIFIED_DIRECTORY_CODES.issubset(catalog):
+        raise ValueError("project type directory does not contain the verified complete catalog")
+    return catalog
+
+
+def acquire_project_type_catalog(session: Any) -> dict[str, str]:
+    """Read the verified Portal admin directory without mutating Portal state."""
+    status, content_type, body = session.request(
+        PROJECT_TYPE_DIRECTORY_PATH, "GET", accept="text/html"
+    )
+    if status != 200 or "text/html" not in content_type.lower():
+        raise RuntimeError("project type directory request failed")
+    return parse_project_type_catalog_html(body)
 
 
 def normalized_period_marker(project_name: Any) -> tuple[int, int] | None:
@@ -69,7 +169,9 @@ def apply_canonical_project_names(
     return rows
 
 
-def classify_raw_type(payload: Any) -> tuple[str, str | None, str | None]:
+def classify_raw_type(
+    payload: Any, catalog: dict[str, str] | None = None
+) -> tuple[str, str | None, str | None]:
     """Return (bucket, qualified code, display name) without coercing codes."""
     if not isinstance(payload, dict) or "type" not in payload:
         return "MISSING", None, None
@@ -80,12 +182,15 @@ def classify_raw_type(payload: Any) -> tuple[str, str | None, str | None]:
         return "ZERO", None, None
     if raw == "":
         return "EMPTY", None, None
-    if isinstance(raw, str) and raw in PROJECT_TYPE_DICTIONARY:
-        return "VALID", raw, PROJECT_TYPE_DICTIONARY[raw]
+    active_catalog = catalog if catalog is not None else PROJECT_TYPE_DICTIONARY
+    if isinstance(raw, str) and raw in active_catalog:
+        return "VALID", raw, active_catalog[raw]
     return "UNKNOWN_CODE", None, None
 
 
-def validate_state_rows(rows: list[list[Any]]) -> dict[str, tuple[str, str]]:
+def validate_state_rows(
+    rows: list[list[Any]], *, allow_dynamic_catalog: bool = False
+) -> dict[str, tuple[str, str]]:
     if not rows:
         return {}
     if rows[0] != STATE_COLUMNS:
@@ -99,9 +204,11 @@ def validate_state_rows(rows: list[list[Any]]) -> dict[str, tuple[str, str]]:
         code, name = (str(padded[i]) if padded[i] is not None else "" for i in (1, 2))
         if project_id in state:
             raise ValueError(f"duplicate project_types project_id: {project_id}")
-        if not code or code not in PROJECT_TYPE_DICTIONARY:
+        if not code or (allow_dynamic_catalog and not re.fullmatch(r"\d{4}", code)):
             raise ValueError(f"invalid persisted project type code for project_id {project_id}")
-        if name != PROJECT_TYPE_DICTIONARY[code]:
+        if not allow_dynamic_catalog and code not in PROJECT_TYPE_DICTIONARY:
+            raise ValueError(f"invalid persisted project type code for project_id {project_id}")
+        if not name or (not allow_dynamic_catalog and name != PROJECT_TYPE_DICTIONARY[code]):
             raise ValueError(f"project type name/dictionary mismatch for project_id {project_id}")
         state[project_id] = (code, name)
     return state
@@ -123,6 +230,8 @@ def validate_project_type_catalog(rows: list[tuple[Any, Any]]) -> dict[str, str]
         code, name = row
         if not isinstance(code, str) or not code.strip() or code != code.strip():
             raise ValueError("project type catalog code is invalid")
+        if not re.fullmatch(r"\d{4}", code):
+            raise ValueError("project type catalog code format is invalid")
         if not isinstance(name, str) or not name.strip() or name != name.strip():
             raise ValueError("project type catalog name is invalid")
         if code in catalog:
@@ -180,7 +289,9 @@ def reconcile_project_type_assignments(
 def state_rows_equivalent(left: list[list[Any]], right: list[list[Any]]) -> bool:
     """Compare persisted state semantically while validating both snapshots."""
     try:
-        return validate_state_rows(left) == validate_state_rows(right)
+        return validate_state_rows(left, allow_dynamic_catalog=True) == validate_state_rows(
+            right, allow_dynamic_catalog=True
+        )
     except Exception:
         return False
 
@@ -233,6 +344,9 @@ class ProjectTypeTelemetry:
     missing_results: int = 0
     unknown_code_results: int = 0
     immutable_conflicts: int = 0
+    added_assignments: int = 0
+    changed_assignments: int = 0
+    unchanged_assignments: int = 0
     detail_get_reused: int = 0
     detail_get_additional: int = 0
     request_failures: int = 0
@@ -305,3 +419,60 @@ def acquire_pending_types(
             time.sleep(delay)
     telemetry.request_elapsed_seconds = time.monotonic() - started
     return next_state, telemetry, applicable
+
+
+def acquire_current_types(
+    session: Any,
+    universe: list[dict[str, Any]],
+    existing: dict[str, tuple[str, str]],
+    catalog: dict[str, str],
+    delay: float = 0.15,
+) -> tuple[dict[str, tuple[str, str]], ProjectTypeTelemetry, set[str]]:
+    """Refresh every applicable project assignment against the live catalog.
+
+    Any transport, payload, type, or coverage uncertainty aborts before
+    publication. Reconciliation is keyed only by project_id and preserves
+    non-applicable assignments; payment data is outside this function.
+    """
+    catalog = validate_project_type_catalog(list(catalog.items()))
+    applicable = project_type_applicable_ids(universe)
+    telemetry = ProjectTypeTelemetry(
+        applicable_projects=len(applicable),
+        already_assigned=len(applicable & set(existing)),
+        pending_before=len(applicable - set(existing)),
+    )
+    observations: list[tuple[str, str]] = []
+    started = time.monotonic()
+    for index, project_id in enumerate(sorted(applicable, key=int), start=1):
+        try:
+            status, _content_type, body = session.request(
+                f"/api/project/{project_id}", "GET", accept="application/json"
+            )
+            telemetry.detail_get_additional += 1
+            if status != 200 or not body:
+                raise ValueError("project type detail response unavailable")
+            import json
+            payload = json.loads(body.decode("utf-8", "strict"))
+            bucket, code, _name = classify_raw_type(payload, catalog)
+            if bucket != "VALID" or code is None:
+                raise ValueError("project type detail is unresolved")
+            observations.append((project_id, code))
+        except Exception:
+            telemetry.request_failures += 1
+            telemetry.request_elapsed_seconds = time.monotonic() - started
+            raise RuntimeError("project type acquisition is incomplete") from None
+        if delay:
+            time.sleep(delay)
+
+    updated, counts = reconcile_project_type_assignments(
+        existing,
+        observations,
+        applicable,
+        list(catalog.items()),
+    )
+    telemetry.valid_assignments_acquired = counts["added"] + counts["changed"]
+    telemetry.added_assignments = counts["added"]
+    telemetry.changed_assignments = counts["changed"]
+    telemetry.unchanged_assignments = counts["unchanged"]
+    telemetry.request_elapsed_seconds = time.monotonic() - started
+    return updated, telemetry, applicable

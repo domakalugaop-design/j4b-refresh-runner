@@ -383,6 +383,15 @@ def test_full_production_dry_run_uses_candidate_path_and_never_mutates(tmp_path,
         requests = auth_get_count = auth_post_count = 0
         def login(self):
             pass
+        def request(self, path, method="GET", accept="text/html"):
+            if path == "/admin/proj-type":
+                html = """<html><body><table><tr><th>ID</th><th>Code</th><th>Name</th></tr>
+                <tr><td>2</td><td>0002</td><td>A</td></tr><tr><td>3</td><td>0003</td><td>B</td></tr>
+                <tr><td>4</td><td>0004</td><td>C</td></tr><tr><td>5</td><td>0005</td><td>Качественные исследования</td></tr>
+                <tr><td>7</td><td>0007</td><td>E</td></tr><tr><td>8</td><td>0008</td><td>F</td></tr>
+                <tr><td>9</td><td>0009</td><td>Home Test</td></tr></table></body></html>""".encode()
+                return 200, "text/html; charset=UTF-8", html
+            return 200, "application/json", b'{"type":"0005"}'
         def close(self):
             pass
 

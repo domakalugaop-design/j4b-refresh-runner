@@ -35,8 +35,9 @@ from .google_service_account import google_token
 from .project_types import (
     PROJECT_TYPE_DICTIONARY,
     STATE_COLUMNS,
+    acquire_current_types,
+    acquire_project_type_catalog,
     apply_canonical_project_names,
-    acquire_pending_types,
     materialize_project_types,
     project_type_applicable_ids,
     state_rows_equivalent,
@@ -322,7 +323,10 @@ def _rollback_project_type_layout(token: str, sid: str, plan: dict[str, Any], pr
         raise RuntimeError("schema rollback projects_current readback mismatch")
 
 
-def _load_bootstrap_seed(path: str, expected_sha256: str, target_ids: set[str], universe: list[dict[str, Any]]) -> tuple[list[list[str]], dict[str, tuple[str, str]], str]:
+def _load_bootstrap_seed(
+    path: str, expected_sha256: str, target_ids: set[str], universe: list[dict[str, Any]],
+    catalog: dict[str, str] | None = None,
+) -> tuple[list[list[str]], dict[str, tuple[str, str]], str]:
     import stat as stat_module
 
     file_stat = os.stat(path)
@@ -351,13 +355,16 @@ def _load_bootstrap_seed(path: str, expected_sha256: str, target_ids: set[str], 
             raise ValueError(f"bootstrap project_id missing from target: {pid}")
         if pid not in applicable_ids:
             raise ValueError(f"bootstrap project_id is pre-cutoff or has no qualified period: {pid}")
-        if not isinstance(code, str) or code not in PROJECT_TYPE_DICTIONARY:
+        effective_catalog = catalog
+        if effective_catalog is None:
+            effective_catalog = PROJECT_TYPE_DICTIONARY
+        if not isinstance(code, str) or code not in effective_catalog:
             raise ValueError(f"unknown bootstrap project type code for project_id {pid}")
-        if name != PROJECT_TYPE_DICTIONARY[code]:
+        if name != effective_catalog[code]:
             raise ValueError(f"bootstrap name/dictionary mismatch for project_id {pid}")
         seen.add(pid)
         rows.append([pid, code, name])
-    state = validate_state_rows(rows)
+    state = validate_state_rows(rows, allow_dynamic_catalog=catalog is not None)
     return rows, state, actual_sha256
 
 
@@ -368,10 +375,11 @@ def _resolve_project_type_state(
     seed_sha256: str,
     target_ids: set[str],
     universe: list[dict[str, Any]],
+    catalog: dict[str, str] | None = None,
 ) -> tuple[list[list[Any]], dict[str, tuple[str, str]], str, str]:
     """Use persisted state when present; bootstrap is strictly absent-state only."""
     if state_exists:
-        state = validate_state_rows(persisted_rows)
+        state = validate_state_rows(persisted_rows, allow_dynamic_catalog=True)
         applicable_ids = project_type_applicable_ids(universe)
         if not set(state).issubset(target_ids):
             raise ValueError("persisted project_types state references project absent from target")
@@ -380,7 +388,7 @@ def _resolve_project_type_state(
         return persisted_rows, state, "PERSISTED_STATE", "NONE"
     if not seed_path or not seed_sha256:
         raise ValueError("project_types state is absent; explicit validated bootstrap artifact is required")
-    rows, state, digest = _load_bootstrap_seed(seed_path, seed_sha256, target_ids, universe)
+    rows, state, digest = _load_bootstrap_seed(seed_path, seed_sha256, target_ids, universe, catalog)
     return rows, state, "LOCAL_VALIDATED_ARTIFACT", digest
 
 
@@ -693,7 +701,7 @@ def _rollback_full_refresh(
         if not state_rows_equivalent(live_state_rows, previous_state_rows):
             if previous_state_rows:
                 publish_project_type_state(
-                    token, sid, validate_state_rows(previous_state_rows), live_state_rows
+                    token, sid, validate_state_rows(previous_state_rows, allow_dynamic_catalog=True), live_state_rows
                 )
             else:
                 api(
@@ -1394,7 +1402,7 @@ def run() -> dict[str, Any]:
         _stage(f"PROJECT_TYPE_BASELINE_SCHEMA | source_columns={len(source_columns)} | rows={len(previous)-1}")
         if layout_plan["state_exists"]:
             previous_state_rows = read_project_type_state_rows(token, sid)
-            state = validate_state_rows(previous_state_rows)
+            state = validate_state_rows(previous_state_rows, allow_dynamic_catalog=True)
         else:
             previous_state_rows = []
             state = {}
@@ -1417,8 +1425,12 @@ def run() -> dict[str, Any]:
         _stage(f"UNIVERSE_DISCOVERY_PASS | universe={len(universe)} | authoritative=PASS")
 
         type_telemetry = None
+        type_catalog: dict[str, str] | None = None
         applicable_ids: set[str] = set()
         if project_type_enabled:
+            _stage("PROJECT_TYPE_CATALOG_ACQUISITION_START")
+            type_catalog = acquire_project_type_catalog(session)
+            _stage(f"PROJECT_TYPE_CATALOG_ACQUISITION_PASS | unique_codes={len(type_catalog)}")
             previous_ids = {str(r[0]) for r in previous[1:] if r and r[0] not in (None, "")}
             state_rows_for_resolution = _prune_absent_project_type_state_rows(previous_state_rows, authoritative_ids)
             resolved_state_rows, state, bootstrap_source, bootstrap_sha256 = _resolve_project_type_state(
@@ -1428,6 +1440,7 @@ def run() -> dict[str, Any]:
                 os.environ.get("PROJECT_TYPE_BOOTSTRAP_SHA256", "").strip(),
                 previous_ids,
                 universe,
+                type_catalog,
             )
             bootstrap_rows = len(resolved_state_rows) - 1 if bootstrap_source == "LOCAL_VALIDATED_ARTIFACT" else 0
             if bootstrap_source == "LOCAL_VALIDATED_ARTIFACT":
@@ -1435,16 +1448,18 @@ def run() -> dict[str, Any]:
             else:
                 _stage(f"PROJECT_TYPE_PERSISTED_STATE_AUTHORITATIVE | rows={len(state)}")
             _stage("PROJECT_TYPE_ACQUISITION_START")
-            state, type_telemetry, applicable_ids = acquire_pending_types(
+            state, type_telemetry, applicable_ids = acquire_current_types(
                 session,
                 universe,
                 state,
+                type_catalog,
                 float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")),
             )
             _stage(
                 f"PROJECT_TYPE_ACQUISITION_PASS | applicable={type_telemetry.applicable_projects} | "
                 f"assigned_before={type_telemetry.already_assigned} | pending_before={type_telemetry.pending_before} | "
-                f"valid={type_telemetry.valid_assignments_acquired} | http_additional={type_telemetry.detail_get_additional}"
+                f"updated={type_telemetry.changed_assignments} | added={type_telemetry.added_assignments} | "
+                f"unchanged={type_telemetry.unchanged_assignments} | http_additional={type_telemetry.detail_get_additional}"
             )
 
         backfill_scope = os.environ.get("BACKFILL_SCOPE", "").strip()
@@ -1610,7 +1625,7 @@ def run() -> dict[str, Any]:
         if project_type_enabled:
             candidate_ids = {str(r[0]) for r in candidate[1:] if r and r[0] not in (None, "")}
             _validate_project_type_state_materialization(merged, state, applicable_ids)
-            layout_plan["planned"] = layout_plan.get("planned", []) + (["WRITE project_types state"] if state != validate_state_rows(previous_state_rows) else [])
+            layout_plan["planned"] = layout_plan.get("planned", []) + (["WRITE project_types state"] if state != validate_state_rows(previous_state_rows, allow_dynamic_catalog=True) else [])
             layout_plan["planned"] = layout_plan.get("planned", []) + [f"WRITE projects_current A:{col(len(columns)-1)}"]
         _stage(f"LIFECYCLE_RECONCILIATION_PASS | authoritative={len(authoritative_ids)} | stale_pruned={len(stale_ids)}")
         _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
@@ -1795,6 +1810,9 @@ def run() -> dict[str, Any]:
             "PROJECT_TYPE_MISSING_RESULTS": type_telemetry.missing_results if type_telemetry else 0,
             "PROJECT_TYPE_UNKNOWN_CODE_RESULTS": type_telemetry.unknown_code_results if type_telemetry else 0,
             "PROJECT_TYPE_IMMUTABILITY_CONFLICTS": type_telemetry.immutable_conflicts if type_telemetry else 0,
+            "PROJECT_TYPE_ASSIGNMENTS_CHANGED": type_telemetry.changed_assignments if type_telemetry else 0,
+            "PROJECT_TYPE_ASSIGNMENTS_ADDED": type_telemetry.added_assignments if type_telemetry else 0,
+            "PROJECT_TYPE_ASSIGNMENTS_UNCHANGED": type_telemetry.unchanged_assignments if type_telemetry else 0,
             "TYPE_DETAIL_GET_REUSED": type_telemetry.detail_get_reused if type_telemetry else 0,
             "TYPE_DETAIL_GET_ADDITIONAL": type_telemetry.detail_get_additional if type_telemetry else 0,
             "PROJECT_TYPE_REQUEST_FAILURES": type_telemetry.request_failures if type_telemetry else 0,

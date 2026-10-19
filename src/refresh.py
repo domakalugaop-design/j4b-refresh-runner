@@ -440,7 +440,7 @@ def read_project_type_state_rows(token: str, sid: str) -> list[list[Any]]:
 
 
 def read_project_type_state(token: str, sid: str) -> dict[str, tuple[str, str]]:
-    return validate_state_rows(read_project_type_state_rows(token, sid))
+    return validate_state_rows(read_project_type_state_rows(token, sid), allow_dynamic_catalog=True)
 
 
 def _write_project_type_state_rows(token: str, sid: str, rows: list[list[Any]]) -> None:
@@ -487,8 +487,8 @@ def publish_project_type_state(
         # Missing rows, duplicates, invalid codes, wrong names, and any other
         # real state difference remain fail-closed mismatches.
         try:
-            actual_state = validate_state_rows(actual)
-            candidate_state = validate_state_rows(candidate)
+            actual_state = validate_state_rows(actual, allow_dynamic_catalog=True)
+            candidate_state = validate_state_rows(candidate, allow_dynamic_catalog=True)
         except Exception:
             raise RuntimeError("project_types readback mismatch") from None
         if actual_state != candidate_state:
