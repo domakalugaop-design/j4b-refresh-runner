@@ -426,6 +426,7 @@ class ProjectTypeTelemetry:
     request_failures: int = 0
     pending_ids: set[str] = field(default_factory=set)
     request_elapsed_seconds: float = 0.0
+    project_failures: list[ProjectTypeAcquisitionError] = field(default_factory=list)
 
 
 def acquire_pending_types(
@@ -505,9 +506,11 @@ def acquire_current_types(
 ) -> tuple[dict[str, tuple[str, str]], ProjectTypeTelemetry, set[str]]:
     """Refresh every applicable project assignment against the live catalog.
 
-    Any transport, payload, type, or coverage uncertainty aborts before
-    publication. Reconciliation is keyed only by project_id and preserves
-    non-applicable assignments; payment data is outside this function.
+    Project-scoped transport/payload/type failures are returned in telemetry
+    and leave that ID's previous assignment untouched. Catalog, universe,
+    programming, and reconciliation-integrity failures still raise globally.
+    Reconciliation is keyed only by project_id; payment data is outside this
+    function.
     """
     catalog = validate_project_type_catalog(list(catalog.items()))
     applicable = project_type_applicable_ids(universe, today=today)
@@ -520,13 +523,14 @@ def acquire_current_types(
     started = time.monotonic()
     ordered_project_ids = sorted(applicable, key=int)
     project_total = len(ordered_project_ids)
-    failures: list[ProjectTypeAcquisitionError] = []
+    failed_ids: set[str] = set()
     for index, project_id in enumerate(ordered_project_ids, start=1):
         safe_pid = _safe_project_id(project_id)
 
         def fail(category: str, failure_stage: str, status: int | str = "UNKNOWN") -> None:
             telemetry.request_failures += 1
-            failures.append(ProjectTypeAcquisitionError(
+            failed_ids.add(project_id)
+            telemetry.project_failures.append(ProjectTypeAcquisitionError(
                 stage=failure_stage,
                 project_index=index,
                 project_total=project_total,
@@ -540,17 +544,19 @@ def acquire_current_types(
                 f"/api/project/{project_id}", "GET", accept="application/json"
             )
             telemetry.detail_get_additional += 1
-        except Exception as exc:
+        except (HTTPError, PortalTransportError, TimeoutError, ConnectionError, URLError) as exc:
             if isinstance(exc, HTTPError):
+                if exc.code in {401, 403}:
+                    raise RuntimeError("Portal authentication or authorization failed") from None
                 fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", _safe_http_status(exc.code))
-            elif isinstance(exc, (PortalTransportError, TimeoutError, ConnectionError, URLError)):
-                fail("TRANSPORT_ERROR", "PROJECT_DETAIL_REQUEST")
             else:
-                fail("INTERNAL_ERROR", "PROJECT_DETAIL_REQUEST")
+                fail("TRANSPORT_ERROR", "PROJECT_DETAIL_REQUEST")
             if delay:
                 time.sleep(delay)
             continue
 
+        if status in {401, 403}:
+            raise RuntimeError("Portal authentication or authorization failed")
         http_status = _safe_http_status(status)
         if status != 200:
             fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", http_status)
@@ -571,11 +577,6 @@ def acquire_current_types(
             if delay:
                 time.sleep(delay)
             continue
-        except Exception:
-            fail("INTERNAL_ERROR", "PROJECT_DETAIL_UTF8", http_status)
-            if delay:
-                time.sleep(delay)
-            continue
 
         try:
             payload = json.loads(payload_text)
@@ -584,19 +585,8 @@ def acquire_current_types(
             if delay:
                 time.sleep(delay)
             continue
-        except Exception:
-            fail("INTERNAL_ERROR", "PROJECT_DETAIL_JSON", http_status)
-            if delay:
-                time.sleep(delay)
-            continue
 
-        try:
-            bucket, code, _name = classify_raw_type(payload, catalog)
-        except Exception:
-            fail("INTERNAL_ERROR", "PROJECT_DETAIL_TYPE_CLASSIFICATION", http_status)
-            if delay:
-                time.sleep(delay)
-            continue
+        bucket, code, _name = classify_raw_type(payload, catalog)
         if bucket != "VALID" or code is None:
             fail("UNRESOLVED_TYPE", "PROJECT_DETAIL_TYPE_CLASSIFICATION", http_status)
             if delay:
@@ -607,14 +597,14 @@ def acquire_current_types(
             time.sleep(delay)
 
     telemetry.request_elapsed_seconds = time.monotonic() - started
-    if failures:
-        # Complete this bounded read-only pass, but fail closed before any
-        # reconciliation/publication when even one project's type is unknown.
-        raise failures[0]
+    # A per-project failure is deliberately omitted from this cycle's update.
+    # Its prior assignment remains in ``existing``; the caller excludes the
+    # complete project bundle from publication and retries it next cycle.
+    successfully_observed = applicable - failed_ids
     updated, counts = reconcile_project_type_assignments(
         existing,
         observations,
-        applicable,
+        successfully_observed,
         list(catalog.items()),
     )
     telemetry.valid_assignments_acquired = counts["added"] + counts["changed"]

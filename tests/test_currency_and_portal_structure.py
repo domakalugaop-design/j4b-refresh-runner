@@ -1,5 +1,7 @@
 import html
 
+import pytest
+
 from src.acquisition import Reader, acquire_project
 from src.parsers import inspect_project_edit_structure, parse_currency_select, parse_edit
 from src.payment_materialization import PROJECT_PUBLICATION_COLUMNS, VISIT_PUBLICATION_COLUMNS
@@ -182,6 +184,10 @@ def test_edit_structure_rejects_login_error_denied_and_non_form_200():
         ("<!doctype html><html><body>arbitrary response</body></html>", "edit:PROJECT_FORM_MISSING"),
     ]
     for bad_edit, expected_reason in rejects:
+        if expected_reason in {"edit:LOGIN_PAGE", "edit:ACCESS_DENIED"}:
+            with pytest.raises(RuntimeError, match="authentication or authorization"):
+                acquired(bad_edit)
+            continue
         record, _visits, session = acquired(bad_edit)
         assert session.calls[1] == (f"/proj/{PROJECT_ID}/edit", "GET")
         assert record["acquisition_state"] == "SEMANTIC_FAILURE"
