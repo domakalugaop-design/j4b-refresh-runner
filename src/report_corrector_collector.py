@@ -40,22 +40,54 @@ FAILURE_CATEGORIES = {
     "DATE_OUT_OF_RANGE", "INTERNAL_ERROR",
 }
 SOURCE_STATUSES = {
-    "PENDING", "CURRENT", "NO_CORRECTOR", "STALE_LAST_GOOD",
-    "FETCH_FAILED_NO_HISTORY", "CORRECTOR_REMOVED",
+    "PENDING", "CURRENT", "NO_CORRECTOR", "NO_CORRECTOR_EXHAUSTED",
+    "STALE_LAST_GOOD", "FETCH_FAILED_NO_HISTORY", "CORRECTOR_REMOVED",
 }
-# Recheck policy per resolved state: a report that already has a corrector is
-# re-read daily, one that never had one is re-read weekly so a 70-report backlog
-# does not become a daily mass re-read, and a withdrawn corrector is revisited
-# weekly in case it is restored.
-DEFAULT_RECHECK = {
-    # A published corrector is stable; a weekly re-read is enough to catch a
-    # reassignment without re-reading the whole dataset daily.
-    "CURRENT": timedelta(days=7),
-    # Reports without a corrector are the ones that later gain one, so they are
-    # re-read every third day: bounded latency without a daily mass re-read.
-    "NO_CORRECTOR": timedelta(days=3),
-    "CORRECTOR_REMOVED": timedelta(days=7),
-}
+# Hard per-run budget and pacing for detail GETs. The budget is deliberately
+# below the portal's tolerance so a run can always be interrupted safely.
+MAX_DETAIL_GETS_PER_RUN = 200
+MIN_REQUEST_INTERVAL_SECONDS = 1.5
+# A report that has never had a corrector is re-read at most twice, inside a
+# seven-day window measured from its first empty read.
+NO_CORRECTOR_MAX_RECHECKS = 2
+NO_CORRECTOR_WINDOW = timedelta(days=7)
+
+
+@dataclass(frozen=True)
+class RecheckPolicy:
+    """When a resolved report is re-read on its own, without an operator.
+
+    ``CURRENT`` and ``CORRECTOR_REMOVED`` are stable by default: they are never
+    re-read on a schedule, only on an explicit manual request. A report that has
+    never had a corrector is re-read up to ``NO_CORRECTOR_MAX_RECHECKS`` times
+    inside ``NO_CORRECTOR_WINDOW`` and then becomes terminal
+    (``NO_CORRECTOR_EXHAUSTED``) instead of being retried forever.
+    """
+
+    no_corrector_delays: tuple[timedelta, ...] = (
+        timedelta(days=1), timedelta(days=2),
+    )
+    window: timedelta = NO_CORRECTOR_WINDOW
+
+    def validated(self) -> "RecheckPolicy":
+        if len(self.no_corrector_delays) > NO_CORRECTOR_MAX_RECHECKS:
+            raise CollectorError("too many no-corrector rechecks configured")
+        for delay in self.no_corrector_delays:
+            if delay.total_seconds() <= 0:
+                raise CollectorError("recheck interval must be positive")
+        if self.window.total_seconds() <= 0:
+            raise CollectorError("recheck window must be positive")
+        return self
+
+    def no_corrector_delay(self, empty_reads: int) -> timedelta | None:
+        """Delay before the next recheck, or ``None`` when the budget is spent."""
+        index = max(int(empty_reads) - 1, 0)
+        if index >= len(self.no_corrector_delays):
+            return None
+        return self.no_corrector_delays[index]
+
+
+DEFAULT_POLICY = RecheckPolicy()
 
 _REPORT_LINK = re.compile(r"/report/(\d+)(?:/|$)", re.I)
 _ACTION_LINK = re.compile(r"/action/(\d+)(?:/|$)", re.I)
@@ -232,28 +264,75 @@ def merge_candidates(state: dict[str, Any], report_ids: Iterable[str], *, discov
             "failure_count": 0,
             "next_attempt_at": None,
             "next_recheck_at": None,
+            "empty_reads": 0,
+            "first_no_corrector_at": None,
+            "last_checked_at": None,
         }
         added += 1
     return added
 
 
+def record_discovery(
+    state: dict[str, Any], report_ids: Iterable[str], *, discovered_for: str, at: datetime,
+) -> dict[str, int]:
+    """Merge a registry read and record coverage diagnostics for that day.
+
+    Registry coverage is not assumed complete: a day can yield new IDs after it
+    was first scanned (observed drift: 459 -> 412 for one October day). Those
+    late arrivals are counted per day so drifting coverage stays visible
+    instead of being silently trusted.
+    """
+    _require_state(state)
+    if at.tzinfo is None:
+        raise CollectorError("invalid discovery timestamp")
+    timestamp = at.astimezone(timezone.utc).isoformat()
+    before = {rid for rid, entry in state["reports"].items() if entry.get("discovered_for") == discovered_for}
+    added = merge_candidates(state, report_ids, discovered_for=discovered_for)
+    after = {rid for rid, entry in state["reports"].items() if entry.get("discovered_for") == discovered_for}
+    late = len(after - before) if before else 0
+    days = state.setdefault("discovery", {})
+    if not isinstance(days, dict):
+        raise CollectorError("collector state has no discovery map")
+    record = days.get(discovered_for) or {"runs": 0, "late_adds": 0}
+    record["runs"] = int(record.get("runs", 0)) + 1
+    record["late_adds"] = int(record.get("late_adds", 0)) + late
+    record["unique"] = len(after)
+    record["last_run_at"] = timestamp
+    days[discovered_for] = record
+    # Keep the diagnostic bounded: a year of daily records is not needed.
+    if len(days) > 60:
+        for stale in sorted(days)[:-60]:
+            days.pop(stale, None)
+    return {"added": added, "late_adds": late, "unique": len(after)}
+
+
+def coverage_summary(state: Mapping[str, Any]) -> dict[str, int]:
+    """Aggregate discovery coverage so a run can report it without listing IDs."""
+    _require_state(state)
+    days = state.get("discovery") or {}
+    return {
+        "days_tracked": len(days),
+        "days_with_late_ids": sum(1 for record in days.values() if int(record.get("late_adds", 0)) > 0),
+        "late_ids_total": sum(int(record.get("late_adds", 0)) for record in days.values()),
+    }
+
+
 def pending_report_ids(
     state: Mapping[str, Any], now: datetime, max_items: int, *,
-    recheck_after: timedelta | Mapping[str, timedelta],
     scope: Collection[str] | None = None,
 ) -> list[str]:
-    """Return unresolved IDs first, then entries whose recheck interval elapsed.
+    """Return unresolved IDs first, then entries whose recheck is due.
 
-    ``scope`` restricts selection to an explicit set of report IDs, which lets a
-    caller process a bounded period (a pilot window or today's new reports)
-    without touching the rest of the inventory.
+    A resolved entry is due only when it carries an explicit ``next_recheck_at``
+    in the past. ``CURRENT`` and ``CORRECTOR_REMOVED`` entries normally carry
+    none, so a stable dataset costs no requests; an operator can make a chosen
+    report due again with :func:`request_manual_recheck`.
     """
     _require_state(state)
     if max_items <= 0:
         raise CollectorError("max_items must be positive")
     if now.tzinfo is None:
         raise CollectorError("now must be timezone-aware")
-    _validate_recheck_policy(recheck_after)
     allowed = None if scope is None else {str(value) for value in scope}
     now_text = now.astimezone(timezone.utc).isoformat()
     fresh: list[str] = []
@@ -263,6 +342,8 @@ def pending_report_ids(
             continue
         if entry.get("last_attempt_status") == "DATE_OUT_OF_RANGE":
             continue
+        if entry.get("last_attempt_status") == "NO_CORRECTOR_EXHAUSTED":
+            continue
         next_attempt = entry.get("next_attempt_at")
         if next_attempt and next_attempt > now_text:
             continue
@@ -270,8 +351,8 @@ def pending_report_ids(
             fresh.append(report_id)
             continue
         recheck = entry.get("next_recheck_at")
-        if recheck is None or recheck <= now_text:
-            due.append((recheck or "", report_id))
+        if recheck is not None and recheck <= now_text:
+            due.append((recheck, report_id))
     ordered = sorted(fresh, key=int)[:max_items]
     remaining = max_items - len(ordered)
     if remaining > 0:
@@ -279,38 +360,68 @@ def pending_report_ids(
     return ordered
 
 
-def _validate_recheck_policy(policy: timedelta | Mapping[str, timedelta]) -> None:
-    if isinstance(policy, Mapping):
-        if not policy:
-            raise CollectorError("recheck policy is empty")
-        for status, delay in policy.items():
-            if status not in SOURCE_STATUSES or delay.total_seconds() <= 0:
-                raise CollectorError(f"invalid recheck policy entry: {status}")
-        return
-    if policy.total_seconds() <= 0:
-        raise CollectorError("recheck interval must be positive")
+def queue_remaining(state: Mapping[str, Any], now: datetime) -> int:
+    """Count what is still queued without fetching anything."""
+    _require_state(state)
+    if now.tzinfo is None:
+        raise CollectorError("now must be timezone-aware")
+    now_text = now.astimezone(timezone.utc).isoformat()
+    queued = 0
+    for entry in state["reports"].values():
+        if entry.get("last_attempt_status") in {"DATE_OUT_OF_RANGE", "NO_CORRECTOR_EXHAUSTED"}:
+            continue
+        next_attempt = entry.get("next_attempt_at")
+        if next_attempt and next_attempt > now_text:
+            continue
+        if entry.get("detail") is None:
+            queued += 1
+            continue
+        recheck = entry.get("next_recheck_at")
+        if recheck is not None and recheck <= now_text:
+            queued += 1
+    return queued
 
 
-def _recheck_delay(policy: timedelta | Mapping[str, timedelta], source_status: str) -> timedelta:
-    if isinstance(policy, Mapping):
-        delay = policy.get(source_status)
-        if delay is None:
-            raise CollectorError(f"recheck policy has no entry for {source_status}")
-        return delay
-    return policy
+def request_manual_recheck(state: dict[str, Any], report_ids: Iterable[str], at: datetime) -> list[str]:
+    """Make explicitly chosen reports due on the next run.
+
+    This is the only way a stable ``CURRENT`` or ``CORRECTOR_REMOVED`` entry is
+    re-read. It never bypasses the per-run budget or the request interval.
+    """
+    _require_state(state)
+    if at.tzinfo is None:
+        raise CollectorError("invalid manual recheck timestamp")
+    timestamp = at.astimezone(timezone.utc)
+    accepted: list[str] = []
+    for raw in report_ids:
+        report_id = str(raw).strip()
+        if not report_id.isdigit() or report_id not in state["reports"]:
+            raise CollectorError("manual recheck target is outside inventory")
+        entry = state["reports"][report_id]
+        if entry.get("last_attempt_status") == "DATE_OUT_OF_RANGE":
+            raise CollectorError("manual recheck target is out of scope")
+        entry.update({
+            "next_attempt_at": None,
+            "next_recheck_at": timestamp.isoformat(),
+            "manual_recheck_requested_at": timestamp.isoformat(),
+        })
+        accepted.append(report_id)
+    return accepted
 
 
 def store_detail(
     state: dict[str, Any], detail: ReportDetail, fetched_at: datetime, *,
-    recheck_after: timedelta | Mapping[str, timedelta],
+    policy: RecheckPolicy = DEFAULT_POLICY,
 ) -> None:
-    """Store a resolved read, recording an explicit corrector withdrawal.
+    """Store a resolved read and schedule the next check it actually deserves.
 
-    A report that previously had a corrector and now comes back empty is not
-    silently left as a stale publishable row: it becomes ``CORRECTOR_REMOVED``,
-    keeps the withdrawn id for audit, and drops out of the publishable set.
+    ``CURRENT`` and ``CORRECTOR_REMOVED`` are terminal by default. A report that
+    has never had a corrector is read at most ``NO_CORRECTOR_MAX_RECHECKS`` more
+    times inside a seven-day window; afterwards it becomes
+    ``NO_CORRECTOR_EXHAUSTED`` so the pool cannot produce unbounded traffic.
     """
     _require_state(state)
+    policy.validated()
     if detail.report_id not in state["reports"]:
         raise CollectorError("report id is outside inventory")
     if fetched_at.tzinfo is None:
@@ -320,16 +431,30 @@ def store_detail(
     previous = entry.get("last_good") or {}
     previous_id = previous.get("corrector_id")
 
+    empty_reads = int(entry.get("empty_reads", 0))
+    first_empty_text = entry.get("first_no_corrector_at")
+    first_empty = datetime.fromisoformat(first_empty_text) if first_empty_text else None
+    next_recheck: str | None = None
+
     if detail.corrector_state == "VALUE_PRESENT":
         source_status = "CURRENT"
+        empty_reads = 0
+        first_empty_text = None
     elif previous_id:
+        # A confirmed empty read after a real assignment: withdraw, keep history,
+        # and stop asking. A restoration is found only by a manual recheck.
         source_status = "CORRECTOR_REMOVED"
     else:
-        source_status = "NO_CORRECTOR"
-
-    delay = _recheck_delay(recheck_after, source_status)
-    if delay.total_seconds() <= 0:
-        raise CollectorError("recheck interval must be positive")
+        empty_reads += 1
+        first_empty = first_empty or timestamp
+        first_empty_text = first_empty.isoformat()
+        delay = policy.no_corrector_delay(empty_reads)
+        expired = (timestamp - first_empty) >= policy.window
+        if delay is None or expired or (timestamp + delay - first_empty) > policy.window:
+            source_status = "NO_CORRECTOR_EXHAUSTED"
+        else:
+            source_status = "NO_CORRECTOR"
+            next_recheck = (timestamp + delay).isoformat()
 
     last_good = {
         "corrector_id": detail.corrector_id,
@@ -350,7 +475,10 @@ def store_detail(
         "last_attempt_status": "PASS",
         "failure_count": 0,
         "next_attempt_at": None,
-        "next_recheck_at": (timestamp + delay).isoformat(),
+        "next_recheck_at": next_recheck,
+        "empty_reads": empty_reads,
+        "first_no_corrector_at": first_empty_text,
+        "last_checked_at": timestamp.isoformat(),
     })
 
 
@@ -389,22 +517,85 @@ def store_out_of_scope(state: dict[str, Any], report_id: str, seen_at: datetime)
     })
 
 
+_DEGRADATION = re.compile(r"HTTP (?:429|5\d\d)\b")
+
+
+def _degradation_signal(exc: BaseException) -> str | None:
+    """Return the portal degradation signal carried by an exception, if any."""
+    match = _DEGRADATION.search(str(exc))
+    return match.group(0) if match else None
+
+
+def migrate_state(state: dict[str, Any], at: datetime) -> dict[str, int]:
+    """Bring a v1 checkpoint onto the stable-assignment policy without data loss.
+
+    No history is removed. Only scheduling fields change:
+    ``CURRENT`` and ``CORRECTOR_REMOVED`` lose their scheduled recheck (they are
+    re-read only on request), and a report that has never had a corrector keeps
+    whatever part of its two-recheck budget is still unspent.
+    """
+    _require_state(state)
+    if at.tzinfo is None:
+        raise CollectorError("invalid migration timestamp")
+    timestamp = at.astimezone(timezone.utc)
+    counts = {"current_cleared": 0, "removed_cleared": 0, "no_corrector_migrated": 0}
+    for entry in state["reports"].values():
+        entry.setdefault("empty_reads", 0)
+        entry.setdefault("first_no_corrector_at", None)
+        entry.setdefault("last_checked_at", None)
+        good = entry.get("last_good") or {}
+        status = good.get("source_status")
+        if status in {"CURRENT", "CORRECTOR_REMOVED"} and entry.get("next_recheck_at"):
+            entry["next_recheck_at"] = None
+            counts["removed_cleared" if status == "CORRECTOR_REMOVED" else "current_cleared"] += 1
+        elif status == "NO_CORRECTOR":
+            before = (entry.get("empty_reads"), entry.get("first_no_corrector_at"),
+                      entry.get("next_recheck_at"))
+            reads = max(int(entry.get("empty_reads", 0)), 1)
+            entry["empty_reads"] = reads
+            if not entry.get("first_no_corrector_at"):
+                entry["first_no_corrector_at"] = good.get("last_successful_fetch") or timestamp.isoformat()
+            if not entry.get("last_checked_at"):
+                entry["last_checked_at"] = good.get("last_successful_fetch")
+            delay = DEFAULT_POLICY.no_corrector_delay(reads)
+            entry["next_recheck_at"] = None if delay is None else (
+                datetime.fromisoformat(entry["first_no_corrector_at"]) + delay
+            ).isoformat()
+            after = (entry.get("empty_reads"), entry.get("first_no_corrector_at"),
+                     entry.get("next_recheck_at"))
+            if after != before:
+                counts["no_corrector_migrated"] += 1
+    state["schema"] = 2
+    return counts
+
+
 def collect_batch(
     state: dict[str, Any], fetch_html: Callable[[str], str], now: datetime, *,
-    max_fetches: int, recheck_after: timedelta, save: Callable[[Mapping[str, Any]], None],
-    request_interval_seconds: float = 1.2, sleep: Callable[[float], None] | None = None,
+    max_fetches: int, policy: RecheckPolicy = DEFAULT_POLICY,
+    save: Callable[[Mapping[str, Any]], None],
+    request_interval_seconds: float = MIN_REQUEST_INTERVAL_SECONDS,
+    sleep: Callable[[float], None] | None = None,
     scope: Collection[str] | None = None,
 ) -> dict[str, int]:
-    """Fetch due report detail pages, persisting after every terminal result."""
+    """Fetch due report detail pages, persisting after every terminal result.
+
+    The batch stops immediately on a portal degradation signal (HTTP 429/5xx) or
+    after three consecutive failures, leaving the queue intact for the next run.
+    """
     import time as _time
 
     sleep = sleep or _time.sleep
-    if request_interval_seconds <= 0:
-        raise CollectorError("request interval must be positive")
-    selected = pending_report_ids(
-        state, now, max_fetches, recheck_after=recheck_after, scope=scope,
-    )
-    counts = {"attempted": 0, "passed": 0, "failed": 0, "below_start": 0}
+    policy.validated()
+    if not 0 < max_fetches <= MAX_DETAIL_GETS_PER_RUN:
+        raise CollectorError(f"max_fetches must be between 1 and {MAX_DETAIL_GETS_PER_RUN}")
+    if request_interval_seconds < MIN_REQUEST_INTERVAL_SECONDS:
+        raise CollectorError(f"request interval must be at least {MIN_REQUEST_INTERVAL_SECONDS}s")
+    selected = pending_report_ids(state, now, max_fetches, scope=scope)
+    counts = {
+        "attempted": 0, "passed": 0, "failed": 0, "below_start": 0,
+        "halted": 0, "remaining": 0,
+    }
+    consecutive_failures = 0
     for report_id in selected:
         if counts["attempted"]:
             sleep(request_interval_seconds)
@@ -416,19 +607,32 @@ def collect_batch(
                 store_out_of_scope(state, report_id, now)
                 counts["below_start"] += 1
             else:
-                store_detail(state, detail, now, recheck_after=recheck_after)
+                store_detail(state, detail, now, policy=policy)
                 counts["passed"] += 1
+            consecutive_failures = 0
         except CollectorError as exc:
             category = "JOIN_MISMATCH" if "join" in str(exc) else "PARSE_ERROR"
             store_failure(state, report_id, category, now)
             counts["failed"] += 1
+            consecutive_failures += 1
         except ReportCorrectorParseError:
             store_failure(state, report_id, "PARSE_ERROR", now)
             counts["failed"] += 1
-        except Exception:
-            store_failure(state, report_id, "INTERNAL_ERROR", now)
+            consecutive_failures += 1
+        except Exception as exc:
+            signal = _degradation_signal(exc)
+            store_failure(state, report_id, "HTTP_ERROR" if signal else "INTERNAL_ERROR", now)
             counts["failed"] += 1
+            consecutive_failures += 1
+            if signal:
+                counts["halted"] = 1
+                save(state)
+                break
         save(state)
+        if consecutive_failures >= 3:
+            counts["halted"] = 1
+            break
+    counts["remaining"] = queue_remaining(state, now)
     return counts
 
 
@@ -540,7 +744,7 @@ def validate_sheet_rows(rows: list[list[Any]]) -> None:
             raise CollectorError("report_reviewers report_date is invalid") from None
         if str(row[7]) not in SOURCE_STATUSES:
             raise CollectorError("report_reviewers source_status is invalid")
-        if str(row[7]) in {"NO_CORRECTOR", "CORRECTOR_REMOVED"}:
+        if str(row[7]) in {"NO_CORRECTOR", "NO_CORRECTOR_EXHAUSTED", "CORRECTOR_REMOVED"}:
             raise CollectorError("report_reviewers publishes a report without a corrector")
         if not str(row[5]).isdigit() or int(str(row[5])) <= 0:
             raise CollectorError("report_reviewers corrector_id is invalid")

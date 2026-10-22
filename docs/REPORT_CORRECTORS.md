@@ -95,22 +95,56 @@ publication reports `added=0, updated=0, removed=0`.
 
 ### Recheck policy
 
-The recheck interval depends on the last resolved state, so a report without a
-corrector does not cause a daily mass re-read:
+A corrector assignment is treated as **stable**, not as something to rediscover
+daily. Re-reading a resolved report is a deliberate act with a cost, so the
+schedule is deliberately sparse and bounded:
 
-| State | Recheck after | Reason |
+| State | Scheduled re-read | Reason |
 | --- | --- | --- |
-| `CURRENT` | 7 days | a published corrector is stable; weekly catches reassignment |
-| `NO_CORRECTOR` | 3 days | this is the pool that later gains a corrector |
-| `CORRECTOR_REMOVED` | 7 days | revisit in case the corrector is restored |
+| `CURRENT` | none | a published corrector is stable; a mass weekly re-read would spend the whole GET budget to confirm what is already known |
+| `NO_CORRECTOR` | up to 2, inside 7 days | this is the pool that later gains a corrector: 48% of pilot reports had none on filing day |
+| `NO_CORRECTOR_EXHAUSTED` | none | the two-recheck budget is spent; the row is terminal and costs nothing |
+| `CORRECTOR_REMOVED` | none | terminal; a restoration is found only by an explicit manual recheck |
 
-Newly discovered reports are fetched on the next run regardless of policy, and a
-`NO_CORRECTOR` report that gains a corrector becomes `CURRENT` on that read.
+`RecheckPolicy` holds the two delays (`no_corrector_delays`, default +1 d then
++2 d) and the window (7 days, measured from the first empty read). The third
+empty read marks the report `NO_CORRECTOR_EXHAUSTED`. A confirmed non-empty read
+resets the counter and makes the row `CURRENT`.
+
+Re-reading a stable row is an operator decision:
+
+```bash
+python3 scripts/run_report_corrector_collector.py --state ... \
+    --max-fetches 20 --recheck 671045 --recheck 671046,671047
+```
+
+A manual request clears the backoff, sets the report due, and is still subject
+to the per-run budget and the request interval. It never changes a corrector
+without a confirmed page read, and `CURRENT` rows keep their previous value in
+`last_good` until that read succeeds.
+
+### Checkpoint schema and migration
+
+`schema` is `2`. Loading a v1 checkpoint calls `migrate_state`, which is
+idempotent and never deletes history: it clears scheduled rechecks on
+`CURRENT`/`CORRECTOR_REMOVED` entries and gives a `NO_CORRECTOR` entry the
+unspent part of its two-recheck budget, anchored on its first successful read.
+A migration is reported in the run JSON as `migration`.
+
+### Discovery coverage
+
+Registry coverage is not assumed complete. `record_discovery` stores per-day
+`runs`, `unique` and `late_adds` counts, and `coverage_summary` reports how many
+discovered days gained IDs after their first scan. This keeps drift visible (a
+day that first yielded 459 IDs later yielded 412 for the same filter) instead of
+silently trusting a single pass. Discovery is idempotent, so a late arrival is
+simply a new unresolved row on a later run.
 
 ## Operation
 
 ```bash
 # incremental: re-discover the last 3 days, fetch up to 50 details
+# (hard ceiling: 200 detail GETs, minimum interval 1.5 s)
 PORTAL_CREDENTIALS_FILE=/path/portal-auth.json \
   python3 scripts/run_report_corrector_collector.py \
     --state ~/.cache/j4b-report-reviewers/state.json --max-fetches 50
@@ -130,7 +164,23 @@ back, and verifies that the five protected tabs
 rollback.
 
 The runner refuses to start inside the production refresh windows
-(09:55-10:20 and 16:55-17:20 MSK) and defaults to a 1.5 s request interval.
+(09:55-10:20 and 16:55-17:20 MSK), refuses `--max-fetches` above 200, refuses an
+interval below 1.5 s, and stops the batch immediately on HTTP 429/5xx or after
+three consecutive failures, leaving the queue and the checkpoint intact.
+
+The tab is written only by this collector. It must never be written from the
+production refresh transaction: that transaction fingerprints every non-target
+tab and rolls back on any mismatch.
+
+| Concern | Owner |
+| --- | --- |
+| `projects_current`, `project_types` | production refresh |
+| `report_reviewers` | this collector, separate job |
+| schedule | 18:15 MSK, after the 16:55-17:20 window; one job at a time |
+
+Publication is isolated end to end: its own checkpoint, backup directory,
+readback and rollback. A collector failure cannot abort or roll back the
+production refresh, and a refresh failure cannot corrupt the review dataset.
 
 ## Safety invariants
 
@@ -154,20 +204,20 @@ Recommended mode for a daily run (design only; no timer is installed):
 2. **Top-up of missed reports** — every ID already in the checkpoint but still
    unresolved is fetched, regardless of when it was discovered. Nothing is
    dropped because a previous run hit its GET cap.
-3. **Recheck of mutable rows** — resolved rows are re-read once their
-   status-specific recheck interval elapses, because a corrector is commonly
-   assigned some time after filing. In the pilot, 70 of 145 reports (48%) had no
-   corrector on the day they were filed, so rechecking is what actually fills
-   the sheet. Intervals are 3 days for `NO_CORRECTOR` and 7 days for `CURRENT`,
-   which bounds the daily load instead of re-reading the whole dataset every
-   day.
+3. **Bounded recheck of unresolved rows** — only reports that have never had a
+   corrector are re-read on a schedule, twice at most inside seven days, because
+   a corrector is commonly assigned after filing. In the pilot, 70 of 145
+   reports (48%) had no corrector on filing day, so this bounded recheck is what
+   fills the sheet — without a weekly mass re-read of the 111 already-resolved
+   reports. `CURRENT` and `CORRECTOR_REMOVED` rows cost nothing until an operator
+   asks for one with `--recheck`.
 4. **Last-good preservation** — a failed re-read keeps the previous values and
    marks the row `STALE_LAST_GOOD`; a fresh report that fails has no history and
    is marked `FETCH_FAILED_NO_HISTORY`.
-5. **Request limits** — hard cap of 300 detail GETs per run, minimum 1.5 s
+5. **Request limits** — hard cap of 200 detail GETs per run, minimum 1.5 s
    between requests, exponential backoff per report (300 s doubling to a 24 h
-   ceiling), and a wall-clock deadline after which the run stops cleanly with
-   the remainder preserved.
+   ceiling), and an immediate stop on HTTP 429/5xx. The remainder stays queued
+   and is continued by the next run.
 6. **Refresh protection** — the runner refuses to start between 09:55-10:20 and
    16:55-17:20 MSK, and also refuses when `j4b-refresh.service` is active.
 

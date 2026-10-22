@@ -4,11 +4,19 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 
 from src.report_corrector_collector import (
-    DEFAULT_RECHECK,
+    DEFAULT_POLICY,
+    MAX_DETAIL_GETS_PER_RUN,
+    MIN_REQUEST_INTERVAL_SECONDS,
     SHEET_COLUMNS,
     START_DATE,
     CollectorError,
+    RecheckPolicy,
     ReportDetail,
+    coverage_summary,
+    migrate_state,
+    queue_remaining,
+    record_discovery,
+    request_manual_recheck,
     collect_batch,
     extract_registry_report_ids,
     mark_published,
@@ -26,6 +34,7 @@ from src.report_corrector_collector import (
 
 NOW = datetime(2026, 10, 22, 9, 0, tzinfo=timezone.utc)
 RECHECK = timedelta(hours=6)
+RECHECK_POLICY = RecheckPolicy(no_corrector_delays=(RECHECK,))
 
 
 def action_html(
@@ -137,41 +146,52 @@ class InventoryStateTests(unittest.TestCase):
         with self.assertRaises(CollectorError):
             merge_candidates(state, ["abc"], discovered_for="2026-10-01")
 
-    def test_pending_prefers_unresolved_then_due_rechecks(self) -> None:
+    def test_pending_prefers_unresolved_then_manual_rechecks(self) -> None:
         state = ready_state("100", "200", "300")
-        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, recheck_after=RECHECK)
-        due = pending_report_ids(state, NOW + timedelta(hours=7), 5, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, policy=RECHECK_POLICY)
+        # A known corrector is stable: nothing is due without an explicit request.
+        self.assertEqual(pending_report_ids(state, NOW + timedelta(days=30), 5), ["200", "300"])
+        request_manual_recheck(state, ["100"], NOW + timedelta(days=30))
+        due = pending_report_ids(state, NOW + timedelta(days=30), 5)
         self.assertIn("100", due)
-        self.assertIn("200", due)
-        fresh_only = pending_report_ids(state, NOW, 5, recheck_after=RECHECK)
+        self.assertEqual(due[:2], ["200", "300"])
+        fresh_only = pending_report_ids(state, NOW, 5)
         self.assertNotIn("100", fresh_only)
         self.assertEqual(fresh_only[:2], ["200", "300"])
 
-    def test_recheck_respects_interval_and_limit(self) -> None:
+    def test_manual_recheck_respects_limit(self) -> None:
         state = ready_state("100", "200")
-        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, recheck_after=RECHECK)
-        self.assertEqual(pending_report_ids(state, NOW + timedelta(hours=1), 5, recheck_after=RECHECK), ["200"])
-        self.assertEqual(len(pending_report_ids(state, NOW, 1, recheck_after=RECHECK)), 1)
+        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, policy=RECHECK_POLICY)
+        request_manual_recheck(state, ["100"], NOW)
+        self.assertEqual(pending_report_ids(state, NOW, 5), ["200", "100"])
+        self.assertEqual(pending_report_ids(state, NOW, 1), ["200"])
 
     def test_fresh_entries_appear_once(self) -> None:
         state = ready_state("100", "200")
-        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, recheck_after=RECHECK)
-        self.assertEqual(pending_report_ids(state, NOW, 5, recheck_after=RECHECK), ["200"])
+        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, policy=RECHECK_POLICY)
+        self.assertEqual(pending_report_ids(state, NOW, 5), ["200"])
 
     def test_rejects_naive_timestamps_and_bad_intervals(self) -> None:
         state = ready_state("100")
         with self.assertRaises(CollectorError):
-            pending_report_ids(state, datetime(2026, 10, 22, 9, 0), 1, recheck_after=RECHECK)
+            pending_report_ids(state, datetime(2026, 10, 22, 9, 0), 1)
         with self.assertRaises(CollectorError):
-            pending_report_ids(state, NOW, 1, recheck_after=timedelta(0))
+            store_detail(
+                state, parse_report_detail(action_html("100"), "100"), NOW,
+                policy=RecheckPolicy(no_corrector_delays=(timedelta(0),)),
+            )
+        with self.assertRaises(CollectorError):
+            RecheckPolicy(no_corrector_delays=(timedelta(days=1),) * 3).validated()
 
     def test_detail_stores_current_status_and_recheck_time(self) -> None:
         state = ready_state("671045")
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, policy=RECHECK_POLICY)
         entry = state["reports"]["671045"]
         self.assertEqual(entry["last_good"]["source_status"], "CURRENT")
         self.assertEqual(entry["last_attempt_status"], "PASS")
-        self.assertEqual(entry["next_recheck_at"], (NOW + RECHECK).isoformat())
+        # A report with a real corrector is never re-read on a schedule.
+        self.assertIsNone(entry["next_recheck_at"])
+        self.assertEqual(entry["empty_reads"], 0)
 
     def test_empty_corrector_maps_to_no_corrector_status(self) -> None:
         state = ready_state("671045")
@@ -179,7 +199,7 @@ class InventoryStateTests(unittest.TestCase):
             action_html(staff='<select name="staff"><option value="">Нет</option></select>'),
             "671045",
         )
-        store_detail(state, detail, NOW, recheck_after=RECHECK)
+        store_detail(state, detail, NOW, policy=RECHECK_POLICY)
         self.assertEqual(state["reports"]["671045"]["last_good"]["source_status"], "NO_CORRECTOR")
 
     def test_failure_backoff_grows_and_is_capped(self) -> None:
@@ -197,34 +217,34 @@ class InventoryStateTests(unittest.TestCase):
     def test_backoff_blocks_selection_until_due(self) -> None:
         state = ready_state("671045")
         store_failure(state, "671045", "HTTP_ERROR", NOW)
-        self.assertEqual(pending_report_ids(state, NOW + timedelta(seconds=60), 5, recheck_after=RECHECK), [])
-        self.assertEqual(pending_report_ids(state, NOW + timedelta(seconds=301), 5, recheck_after=RECHECK), ["671045"])
+        self.assertEqual(pending_report_ids(state, NOW + timedelta(seconds=60), 5), [])
+        self.assertEqual(pending_report_ids(state, NOW + timedelta(seconds=301), 5), ["671045"])
 
     def test_out_of_scope_is_terminal(self) -> None:
         state = ready_state("665134")
         store_out_of_scope(state, "665134", NOW)
-        self.assertEqual(pending_report_ids(state, NOW + timedelta(days=30), 5, recheck_after=RECHECK), [])
+        self.assertEqual(pending_report_ids(state, NOW + timedelta(days=30), 5), [])
 
     def test_scope_restricts_selection_to_one_window(self) -> None:
         state = ready_state("100", "200", "300", "400")
-        scoped = pending_report_ids(state, NOW, 10, recheck_after=RECHECK, scope={"200", "400"})
+        scoped = pending_report_ids(state, NOW, 10, scope={"200", "400"})
         self.assertEqual(scoped, ["200", "400"])
 
     def test_scope_ignores_ids_outside_inventory(self) -> None:
         state = ready_state("100")
-        self.assertEqual(pending_report_ids(state, NOW, 5, recheck_after=RECHECK, scope={"999"}), [])
+        self.assertEqual(pending_report_ids(state, NOW, 5, scope={"999"}), [])
 
     def test_scope_still_respects_backoff_and_out_of_scope(self) -> None:
         state = ready_state("100", "200")
         store_failure(state, "100", "HTTP_ERROR", NOW)
         store_out_of_scope(state, "200", NOW)
-        self.assertEqual(pending_report_ids(state, NOW, 5, recheck_after=RECHECK, scope={"100", "200"}), [])
+        self.assertEqual(pending_report_ids(state, NOW, 5, scope={"100", "200"}), [])
 
     def test_scope_preserves_unresolved_first_ordering(self) -> None:
         state = ready_state("100", "200")
-        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, recheck_after=RECHECK)
-        ordered = pending_report_ids(state, NOW + timedelta(hours=7), 5,
-                                     recheck_after=RECHECK, scope={"100", "200"})
+        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, policy=RECHECK_POLICY)
+        request_manual_recheck(state, ["100"], NOW + timedelta(hours=7))
+        ordered = pending_report_ids(state, NOW + timedelta(hours=7), 5, scope={"100", "200"})
         self.assertEqual(ordered, ["200", "100"])
 
     def test_collect_batch_with_scope_touches_only_that_window(self) -> None:
@@ -236,8 +256,8 @@ class InventoryStateTests(unittest.TestCase):
             return action_html(report_id, dt="21.10.2026")
 
         counts = collect_batch(
-            state, fetch, NOW, max_fetches=10, recheck_after=RECHECK,
-            save=lambda payload: None, request_interval_seconds=1.0,
+            state, fetch, NOW, max_fetches=10, policy=RECHECK_POLICY,
+            save=lambda payload: None, request_interval_seconds=MIN_REQUEST_INTERVAL_SECONDS,
             sleep=lambda _: None, scope={"200"},
         )
         self.assertEqual(fetched, ["200"])
@@ -263,11 +283,12 @@ class BatchTests(unittest.TestCase):
         saves: list[int] = []
         sleeps: list[float] = []
         counts = collect_batch(
-            state, lambda rid: pages[rid], NOW, max_fetches=3, recheck_after=RECHECK,
+            state, lambda rid: pages[rid], NOW, max_fetches=3, policy=RECHECK_POLICY,
             save=lambda payload: saves.append(len(payload["reports"])),
             request_interval_seconds=1.5, sleep=sleeps.append,
         )
-        self.assertEqual(counts, {"attempted": 3, "passed": 2, "failed": 0, "below_start": 1})
+        self.assertEqual(counts, {"attempted": 3, "passed": 2, "failed": 0,
+                                  "below_start": 1, "halted": 0, "remaining": 0})
         self.assertEqual(len(saves), 3)
         self.assertEqual(sleeps, [1.5, 1.5])
         self.assertEqual(state["reports"]["665134"]["last_attempt_status"], "DATE_OUT_OF_RANGE")
@@ -280,8 +301,8 @@ class BatchTests(unittest.TestCase):
             raise RuntimeError("network down")
 
         counts = collect_batch(
-            state, boom, NOW, max_fetches=1, recheck_after=RECHECK,
-            save=lambda payload: None, request_interval_seconds=1.0, sleep=lambda _: None,
+            state, boom, NOW, max_fetches=1, policy=RECHECK_POLICY,
+            save=lambda payload: None, request_interval_seconds=MIN_REQUEST_INTERVAL_SECONDS, sleep=lambda _: None,
         )
         self.assertEqual(counts["failed"], 1)
         self.assertEqual(state["reports"]["671045"]["last_attempt_status"], "INTERNAL_ERROR")
@@ -289,8 +310,8 @@ class BatchTests(unittest.TestCase):
     def test_batch_respects_budget(self) -> None:
         state = ready_state("1", "2", "3", "4")
         counts = collect_batch(
-            state, lambda rid: action_html(rid), NOW, max_fetches=2, recheck_after=RECHECK,
-            save=lambda payload: None, request_interval_seconds=1.0, sleep=lambda _: None,
+            state, lambda rid: action_html(rid), NOW, max_fetches=2, policy=RECHECK_POLICY,
+            save=lambda payload: None, request_interval_seconds=MIN_REQUEST_INTERVAL_SECONDS, sleep=lambda _: None,
         )
         self.assertEqual(counts["attempted"], 2)
 
@@ -302,7 +323,7 @@ class SheetRenderingTests(unittest.TestCase):
 
     def test_publishes_only_resolved_october_rows(self) -> None:
         state = ready_state("671045", "665134", "680000")
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, policy=RECHECK_POLICY)
         store_out_of_scope(state, "665134", NOW)
         rows = render_sheet_rows(state)
         self.assertEqual([row[0] for row in rows[1:]], ["671045"])
@@ -312,7 +333,7 @@ class SheetRenderingTests(unittest.TestCase):
 
     def test_failed_refresh_marks_stale_last_good(self) -> None:
         state = ready_state("671045")
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, policy=RECHECK_POLICY)
         store_failure(state, "671045", "TRANSPORT_ERROR", NOW + timedelta(hours=7))
         rows = render_sheet_rows(state)
         self.assertEqual(rows[1][7], "STALE_LAST_GOOD")
@@ -332,8 +353,8 @@ class SheetRenderingTests(unittest.TestCase):
         state = ready_state("671045", "671046")
         empty = parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045")
         self.assertEqual(empty.corrector_state, "EMPTY")
-        store_detail(state, empty, NOW, recheck_after=RECHECK)
-        store_detail(state, parse_report_detail(action_html("671046"), "671046"), NOW, recheck_after=RECHECK)
+        store_detail(state, empty, NOW, policy=RECHECK_POLICY)
+        store_detail(state, parse_report_detail(action_html("671046"), "671046"), NOW, policy=RECHECK_POLICY)
         rows = render_sheet_rows(state)
         self.assertEqual([row[0] for row in rows[1:]], ["671046"])
         self.assertEqual(state["reports"]["671045"]["last_good"]["source_status"], "NO_CORRECTOR")
@@ -346,25 +367,38 @@ class SheetRenderingTests(unittest.TestCase):
         with self.assertRaises(CollectorError):
             validate_sheet_rows([list(SHEET_COLUMNS), row])
 
-    def test_recheck_policy_is_status_aware(self) -> None:
+    def test_recheck_policy_bounds_no_corrector_reads(self) -> None:
         state = ready_state("671045")
-        store_detail(state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"), NOW, recheck_after=DEFAULT_RECHECK)
+        empty = parse_report_detail(
+            action_html(staff='<select name="staff"><option value="0" selected>Нет</option></select>'),
+            "671045",
+        )
+        store_detail(state, empty, NOW, policy=DEFAULT_POLICY)
         entry = state["reports"]["671045"]
+        self.assertEqual(datetime.fromisoformat(entry["next_recheck_at"]), NOW + timedelta(days=1))
+        self.assertEqual(pending_report_ids(state, NOW + timedelta(hours=1), 10), [])
+        self.assertEqual(pending_report_ids(state, NOW + timedelta(days=1), 10), ["671045"])
+        # Second empty read: one more day of rope, then the budget is spent.
+        store_detail(state, empty, NOW + timedelta(days=1), policy=DEFAULT_POLICY)
         self.assertEqual(datetime.fromisoformat(entry["next_recheck_at"]), NOW + timedelta(days=3))
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=DEFAULT_RECHECK)
-        self.assertEqual(datetime.fromisoformat(entry["next_recheck_at"]), NOW + timedelta(days=7))
-        due_now = pending_report_ids(state, NOW + timedelta(days=1), 10, recheck_after=DEFAULT_RECHECK)
-        self.assertEqual(due_now, [])
-        due_later = pending_report_ids(state, NOW + timedelta(days=8), 10, recheck_after=DEFAULT_RECHECK)
-        self.assertEqual(due_later, ["671045"])
+        store_detail(state, empty, NOW + timedelta(days=3), policy=DEFAULT_POLICY)
+        self.assertEqual(entry["last_good"]["source_status"], "NO_CORRECTOR_EXHAUSTED")
+        self.assertIsNone(entry["next_recheck_at"])
+        self.assertEqual(entry["empty_reads"], 3)
+        self.assertEqual(pending_report_ids(state, NOW + timedelta(days=60), 10), [])
+        self.assertEqual(render_sheet_rows(state), [list(SHEET_COLUMNS)])
+        # A real corrector read afterwards still becomes publishable.
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW + timedelta(days=61), policy=DEFAULT_POLICY)
+        self.assertEqual(entry["last_good"]["source_status"], "CURRENT")
+        self.assertEqual(render_sheet_rows(state)[1][7], "CURRENT")
 
     def test_withdrawn_corrector_is_recorded_and_excluded(self) -> None:
         state = ready_state("671045")
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, policy=RECHECK_POLICY)
         self.assertEqual(len(render_sheet_rows(state)[1:]), 1)
         store_detail(
             state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"),
-            NOW + timedelta(days=1), recheck_after=DEFAULT_RECHECK,
+            NOW + timedelta(days=1), policy=DEFAULT_POLICY,
         )
         good = state["reports"]["671045"]["last_good"]
         self.assertEqual(good["source_status"], "CORRECTOR_REMOVED")
@@ -375,14 +409,14 @@ class SheetRenderingTests(unittest.TestCase):
 
     def test_corrector_reappearing_after_removal_becomes_current(self) -> None:
         state = ready_state("671045")
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=DEFAULT_RECHECK)
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, policy=DEFAULT_POLICY)
         store_detail(
             state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"),
-            NOW + timedelta(days=1), recheck_after=DEFAULT_RECHECK,
+            NOW + timedelta(days=1), policy=DEFAULT_POLICY,
         )
         store_detail(
             state, parse_report_detail(action_html(), "671045"),
-            NOW + timedelta(days=8), recheck_after=DEFAULT_RECHECK,
+            NOW + timedelta(days=8), policy=DEFAULT_POLICY,
         )
         good = state["reports"]["671045"]["last_good"]
         self.assertEqual(good["source_status"], "CURRENT")
@@ -394,24 +428,24 @@ class SheetRenderingTests(unittest.TestCase):
         for report_id in ("671045", "671046"):
             store_detail(
                 state, parse_report_detail(action_html(report_id), report_id), NOW,
-                recheck_after=RECHECK,
+                policy=RECHECK_POLICY,
             )
         mark_published(state, NOW)
         plan = reconcile_dataset(state)
         self.assertEqual((plan["publishable"], plan["added"], plan["updated"], plan["removed"]), (2, [], [], []))
         # A new corrector report appears, one changes reviewer, one loses it.
-        store_detail(state, parse_report_detail(action_html("671047"), "671047"), NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html("671047"), "671047"), NOW, policy=RECHECK_POLICY)
         store_detail(
             state,
             parse_report_detail(
                 action_html("671046", staff="<select name=\"staff\"><option value=\"31291\" selected>Петров П.</option></select>"),
                 "671046",
             ),
-            NOW + timedelta(days=1), recheck_after=RECHECK,
+            NOW + timedelta(days=1), policy=RECHECK_POLICY,
         )
         store_detail(
             state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"),
-            NOW + timedelta(days=1), recheck_after=DEFAULT_RECHECK,
+            NOW + timedelta(days=1), policy=DEFAULT_POLICY,
         )
         plan = reconcile_dataset(state)
         self.assertEqual(plan["added"], ["671047"])
@@ -426,7 +460,7 @@ class SheetRenderingTests(unittest.TestCase):
 
     def test_reconciliation_is_idempotent_across_repeated_runs(self) -> None:
         state = ready_state("671045")
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, policy=RECHECK_POLICY)
         mark_published(state, NOW)
         first = reconcile_dataset(state)
         second = reconcile_dataset(state)
@@ -435,7 +469,7 @@ class SheetRenderingTests(unittest.TestCase):
 
     def test_row_validation_rejects_schema_and_duplicates(self) -> None:
         state = ready_state("671045")
-        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, policy=RECHECK_POLICY)
         rows = render_sheet_rows(state)
         validate_sheet_rows(rows)
         with self.assertRaises(CollectorError):

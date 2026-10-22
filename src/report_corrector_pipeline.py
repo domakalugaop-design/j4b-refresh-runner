@@ -123,8 +123,8 @@ def due_report_ids(checkpoint: Mapping[str, Any], now: datetime, max_gets: int) 
             pending.append(rid)
         else:
             recheck = entry.get("next_recheck_at")
-            if recheck is None or recheck <= now_text:
-                due.append((recheck or "", rid))
+            if recheck is not None and recheck <= now_text:
+                due.append((recheck, rid))
     return sorted(pending, key=int)[:max_gets] + [rid for _, rid in sorted(due)[:max(0, max_gets-len(pending[:max_gets]) )]]
 
 

@@ -10,7 +10,11 @@ the production refresh windows; the checkpoint is private and outside the repo.
 
 Usage:
     python3 scripts/run_report_corrector_collector.py --state /path/state.json \
-        [--max-fetches 50] [--days-back 3] [--plan] [--publish]
+        [--max-fetches 50] [--days-back 3] [--recheck ID] [--plan] [--publish]
+
+Hard limits: at most 200 detail GETs per run and at least 1.5 s between them.
+Stable reports (a known corrector, or a removed one) are never re-read on a
+schedule; pass ``--recheck`` to re-read chosen IDs once.
 """
 
 from __future__ import annotations
@@ -28,9 +32,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.portal_transport import PortalSession  # noqa: E402
 from src.report_corrector_collector import (  # noqa: E402
-    DEFAULT_RECHECK, START_DATE, collect_batch, extract_registry_report_ids,
-    mark_published, merge_candidates, new_state, reconcile_dataset,
-    render_sheet_rows, validate_sheet_rows,
+    DEFAULT_POLICY, MAX_DETAIL_GETS_PER_RUN, MIN_REQUEST_INTERVAL_SECONDS,
+    START_DATE, collect_batch, coverage_summary, extract_registry_report_ids,
+    mark_published, migrate_state, new_state, queue_remaining, reconcile_dataset,
+    record_discovery, render_sheet_rows, request_manual_recheck, validate_sheet_rows,
 )
 
 SPREADSHEET_ID = "14PRG3HXsZaN4pVwV390PpMMqHupCW5j6RyI6HBzPQR8"
@@ -125,14 +130,26 @@ def _build_gateway():
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="collect report -> corrector rows")
     parser.add_argument("--state", required=True, help="private checkpoint path")
-    parser.add_argument("--max-fetches", type=int, default=50)
+    parser.add_argument("--max-fetches", type=int, default=50,
+                        help=f"detail GETs this run (1..{MAX_DETAIL_GETS_PER_RUN})")
     parser.add_argument("--days-back", type=int, default=3,
                         help="re-discover the last N days (0 = whole month)")
-    parser.add_argument("--interval", type=float, default=1.5)
+    parser.add_argument("--interval", type=float, default=MIN_REQUEST_INTERVAL_SECONDS,
+                        help=f"seconds between requests (>= {MIN_REQUEST_INTERVAL_SECONDS})")
+    parser.add_argument("--recheck", action="append", default=[], metavar="REPORT_ID",
+                        help="re-read this report id once (repeatable, comma separated)")
     parser.add_argument("--skip-discovery", action="store_true")
     parser.add_argument("--plan", action="store_true", help="read-only publication plan")
     parser.add_argument("--publish", action="store_true", help="publish the tab")
     args = parser.parse_args(argv)
+    if not 0 <= args.max_fetches <= MAX_DETAIL_GETS_PER_RUN:
+        print(json.dumps({"status": "REFUSED_MAX_FETCHES",
+                          "limit": MAX_DETAIL_GETS_PER_RUN}, ensure_ascii=False))
+        return 2
+    if args.interval < MIN_REQUEST_INTERVAL_SECONDS:
+        print(json.dumps({"status": "REFUSED_INTERVAL",
+                          "minimum": MIN_REQUEST_INTERVAL_SECONDS}, ensure_ascii=False))
+        return 2
 
     now_local = _moscow_now()
     if _in_refresh_window(now_local):
@@ -145,6 +162,17 @@ def main(argv: list[str] | None = None) -> int:
     state_path = Path(args.state).expanduser()
     state = _load_state(state_path)
     report: dict = {"status": "OK", "requests": 0}
+    # A v1 checkpoint is migrated in place: no history is dropped, only stale
+    # scheduled rechecks of stable reports are cleared.
+    report["migration"] = migrate_state(state, datetime.now(timezone.utc))
+    _save_state(state_path, state)
+
+    manual = [item.strip() for chunk in args.recheck for item in chunk.split(",") if item.strip()]
+    if manual:
+        report["manual_recheck"] = request_manual_recheck(
+            state, manual, datetime.now(timezone.utc),
+        )
+        _save_state(state_path, state)
 
     needs_portal = (not args.skip_discovery) or args.max_fetches > 0
     credentials_path = os.environ.get("PORTAL_CREDENTIALS_FILE", "").strip()
@@ -163,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         today = now_local.date()
         first = START_DATE if args.days_back <= 0 else max(START_DATE, today - timedelta(days=args.days_back))
         added = 0
+        late = 0
         day = first
         try:
             while day <= today:
@@ -176,13 +205,16 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if status != 200:
                     raise RuntimeError(f"registry discovery failed with HTTP {status}")
-                added += merge_candidates(
+                counts = record_discovery(
                     state, extract_registry_report_ids(body.decode("utf-8", errors="replace")),
-                    discovered_for=day.isoformat(),
+                    discovered_for=day.isoformat(), at=datetime.now(timezone.utc),
                 )
+                added += counts["added"]
+                late += counts["late_adds"]
                 day += timedelta(days=1)
             _save_state(state_path, state)
             report["discovered"] = added
+            report["late_ids"] = late
         finally:
             if session is not None:
                 session.close()
@@ -204,7 +236,7 @@ def main(argv: list[str] | None = None) -> int:
 
             report["batch"] = collect_batch(
                 state, fetch, datetime.now(timezone.utc), max_fetches=args.max_fetches,
-                recheck_after=DEFAULT_RECHECK,
+                policy=DEFAULT_POLICY,
                 save=lambda payload: _save_state(state_path, payload),
                 request_interval_seconds=args.interval,
             )
@@ -221,10 +253,20 @@ def main(argv: list[str] | None = None) -> int:
     )
     # Corrector-only accounting: everything discovered but not published stays
     # in the checkpoint for later re-discovery and is reported, never dropped.
-    report["no_corrector_excluded"] = sum(
+    def _status_count(status: str) -> int:
+        return sum(
+            1 for entry in state["reports"].values()
+            if (entry.get("last_good") or {}).get("source_status") == status
+        )
+
+    report["no_corrector_excluded"] = _status_count("NO_CORRECTOR")
+    report["no_corrector_exhausted"] = _status_count("NO_CORRECTOR_EXHAUSTED")
+    report["recheck_pending"] = sum(
         1 for entry in state["reports"].values()
-        if (entry.get("last_good") or {}).get("source_status") == "NO_CORRECTOR"
+        if entry.get("next_recheck_at")
     )
+    report["queue_remaining"] = queue_remaining(state, datetime.now(timezone.utc))
+    report["coverage"] = coverage_summary(state)
     report["corrector_removed"] = sum(
         1 for entry in state["reports"].values()
         if (entry.get("last_good") or {}).get("source_status") == "CORRECTOR_REMOVED"

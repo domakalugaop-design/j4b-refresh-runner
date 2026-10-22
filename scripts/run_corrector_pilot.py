@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.report_corrector_collector import (  # noqa: E402
-    SHEET_COLUMNS, START_DATE, collect_batch, extract_registry_report_ids,
+    SHEET_COLUMNS, START_DATE, RecheckPolicy, collect_batch, extract_registry_report_ids,
     merge_candidates, new_state, render_sheet_rows, validate_sheet_rows,
 )
 
@@ -326,7 +326,8 @@ def main(argv: list[str] | None = None) -> int:
 
         report["batch"] = collect_batch(
             state, fetch, datetime.now(timezone.utc), max_fetches=budget,
-            recheck_after=timedelta(hours=6),
+            policy=RecheckPolicy(no_corrector_delays=(timedelta(hours=6),)),
+            
             save=lambda payload: save_state(state_path, payload),
             request_interval_seconds=args.interval, sleep=time.sleep, scope=scope,
         )
@@ -351,8 +352,7 @@ def main(argv: list[str] | None = None) -> int:
     hash_after = state_hash(state)
     from src.report_corrector_collector import pending_report_ids
 
-    still_pending = pending_report_ids(state, datetime.now(timezone.utc), 10_000,
-                                       recheck_after=timedelta(hours=6), scope=scope)
+    still_pending = pending_report_ids(state, datetime.now(timezone.utc), 10_000, scope=scope)
     report["idempotency"] = {
         "replay_added": replayed,
         "state_unchanged": hash_before == hash_after,
