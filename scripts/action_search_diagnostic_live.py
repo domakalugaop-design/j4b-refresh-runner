@@ -22,8 +22,9 @@ if _SPEC is None or _SPEC.loader is None:
 _DIAGNOSTIC = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _DIAGNOSTIC
 _SPEC.loader.exec_module(_DIAGNOSTIC)
+analyze_action_response = _DIAGNOSTIC.analyze_action_response
 render_comparison = _DIAGNOSTIC.render_comparison
-summarize_action_response = _DIAGNOSTIC.summarize_action_response
+render_single = _DIAGNOSTIC.render_single
 
 
 def _quiet_login(session: PortalSession) -> None:
@@ -61,24 +62,24 @@ def main() -> int:
             "send": "send",
         }
         base_payload.update({f"state[{code}]": "on" for code in STATES})
-        summaries = []
+        analyses = []
         for day in ("2026-10-01", "2026-10-02"):
             payload = {**base_payload, "dt1": day, "dt2": day}
             status, content_type, body = session.request(
                 "/action", "POST", payload, accept="text/html", follow_redirects=True
             )
-            summary = summarize_action_response(
+            analysis = analyze_action_response(
                 http_status=status, content_type=content_type, body=body,
                 final_url=session.last_effective_url, expected_host="lk.j4b.ru", limit=10000,
             )
-            summaries.append(summary)
+            analyses.append(analysis)
             body = b""
-            if summary.failure_category != "NONE" or not summary.html_parsed:
+            if analysis.summary.failure_category != "NONE" or not analysis.summary.html_parsed:
                 break
-        if len(summaries) == 2:
-            print(render_comparison(summaries[0], summaries[1]), flush=True)
+        if len(analyses) == 2:
+            print(render_comparison(analyses[0], analyses[1]), flush=True)
         else:
-            print(render_comparison(summaries[0], summaries[0]), flush=True)
+            print(render_single(analyses[0]), flush=True)
         return 0
     except PortalTransportError as exc:
         # PortalTransportError.failure_class is an allowlisted internal code.

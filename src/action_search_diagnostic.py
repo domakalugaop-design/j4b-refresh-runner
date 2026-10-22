@@ -51,6 +51,18 @@ class ActionSearchSummary:
     failure_category: str
 
 
+@dataclass(frozen=True)
+class ActionSearchAnalysis:
+    summary: ActionSearchSummary
+    action_fingerprints: frozenset[str]
+    visit_fingerprints: frozenset[str]
+    project_fingerprints: frozenset[str]
+
+
+def _id_fingerprints(kind: str, values: set[str]) -> frozenset[str]:
+    return frozenset(hashlib.sha256(f"{kind}:{value}".encode("ascii")).hexdigest() for value in values)
+
+
 def _digest(values: set[str]) -> str:
     canonical = "\n".join(sorted(values, key=lambda value: (len(value), value)))
     return hashlib.sha256(canonical.encode("ascii")).hexdigest() if values else "EMPTY"
@@ -191,10 +203,10 @@ class _ActionDOM(HTMLParser):
             self.parse_error = True
 
 
-def summarize_action_response(
+def analyze_action_response(
     *, http_status: int, content_type: str, body: bytes, final_url: str | None,
     expected_host: str, limit: int = 10000,
-) -> ActionSearchSummary:
+) -> ActionSearchAnalysis:
     parsed_url = urlparse(final_url or "")
     host = (parsed_url.hostname or "").lower()
     path = parsed_url.path.rstrip("/") or "/"
@@ -218,34 +230,37 @@ def summarize_action_response(
         failure_category="NONE",
     )
     if url_failure != "NONE":
-        return _replace(empty, failure_category=url_failure)
+        return _analysis(_replace(empty, failure_category=url_failure))
     if int(http_status) != 200:
-        return _replace(empty, failure_category="HTTP_ERROR")
+        return _analysis(_replace(empty, failure_category="HTTP_ERROR"))
     if not body:
-        return _replace(empty, failure_category="EMPTY_RESPONSE")
+        return _analysis(_replace(empty, failure_category="EMPTY_RESPONSE"))
     if "html" not in content_type.lower():
-        return _replace(empty, failure_category="NON_HTML_RESPONSE")
+        return _analysis(_replace(empty, failure_category="NON_HTML_RESPONSE"))
     try:
         parser = _ActionDOM()
         parser.feed(body.decode("utf-8"))
         parser.close()
     except Exception:
-        return _replace(empty, failure_category="HTML_PARSE_ERROR")
+        return _analysis(_replace(empty, failure_category="HTML_PARSE_ERROR"))
     if parser.parse_error:
-        return _replace(empty, failure_category="HTML_PARSE_ERROR")
+        return _analysis(_replace(empty, failure_category="HTML_PARSE_ERROR"))
     date_semantics = next(iter(parser._date_meanings)) if len(parser._date_meanings) == 1 else "UNCONFIRMED"
     date_min = min(parser._dates).isoformat(sep=" ") if parser._dates and date_semantics != "UNCONFIRMED" else "UNKNOWN"
     date_max = max(parser._dates).isoformat(sep=" ") if parser._dates and date_semantics != "UNCONFIRMED" else "UNKNOWN"
     rows = parser.result_rows
-    return ActionSearchSummary(
+    action_fingerprints = _id_fingerprints("action", parser.ids["action"])
+    visit_fingerprints = _id_fingerprints("visit", parser.ids["visit"])
+    project_fingerprints = _id_fingerprints("project", parser.ids["proj"])
+    summary = ActionSearchSummary(
         **{
             **asdict(empty), "html_parsed": True, "result_tables": parser.table_count,
             "result_rows": rows, "distinct_action_ids": len(parser.ids["action"]),
             "distinct_visit_ids": len(parser.ids["visit"]),
             "distinct_project_ids": len(parser.ids["proj"]), "report_links": len(parser.ids["report"]),
-            "action_ids_sha256": _digest(parser.ids["action"]),
-            "visit_ids_sha256": _digest(parser.ids["visit"]),
-            "project_ids_sha256": _digest(parser.ids["proj"]),
+            "action_ids_sha256": _digest(set(action_fingerprints)),
+            "visit_ids_sha256": _digest(set(visit_fingerprints)),
+            "project_ids_sha256": _digest(set(project_fingerprints)),
             "date_columns": tuple(sorted(name[:64] for name in parser._date_columns)[:6]),
             "date_data_types": tuple(sorted(parser._date_types)),
             "date_min": date_min, "date_max": date_max, "date_semantics": date_semantics,
@@ -255,20 +270,64 @@ def summarize_action_response(
             "limit_reached": bool(limit and rows >= limit),
         }
     )
+    return ActionSearchAnalysis(summary, action_fingerprints, visit_fingerprints, project_fingerprints)
+
+
+def summarize_action_response(**kwargs) -> ActionSearchSummary:
+    """Compatibility wrapper that returns only aggregate summary fields."""
+    return analyze_action_response(**kwargs).summary
+
+
+def _analysis(summary: ActionSearchSummary) -> ActionSearchAnalysis:
+    return ActionSearchAnalysis(summary, frozenset(), frozenset(), frozenset())
 
 
 def render_diagnostic(summary: ActionSearchSummary) -> str:
-    return _bounded_json(asdict(summary))
+    return _bounded_json(_summary_payload(summary))
 
 
-def render_comparison(first: ActionSearchSummary, second: ActionSearchSummary) -> str:
+def render_comparison(first: ActionSearchAnalysis, second: ActionSearchAnalysis) -> str:
+    action_intersection = first.action_fingerprints & second.action_fingerprints
+    action_union = first.action_fingerprints | second.action_fingerprints
+    visit_intersection = first.visit_fingerprints & second.visit_fingerprints
+    if first.action_fingerprints == second.action_fingerprints:
+        subset_relation = "EQUAL"
+        behavior = "EQUAL_SETS"
+    elif first.action_fingerprints <= second.action_fingerprints:
+        subset_relation = "DAY1_SUBSET_OF_DAY2"
+        behavior = "CUMULATIVE_NESTED"
+    elif second.action_fingerprints <= first.action_fingerprints:
+        subset_relation = "DAY2_SUBSET_OF_DAY1"
+        behavior = "CUMULATIVE_NESTED"
+    elif not action_intersection:
+        subset_relation = "DISJOINT"
+        behavior = "DISJOINT_DAILY_SLICES"
+    else:
+        subset_relation = "OVERLAPPING_NON_NESTED"
+        behavior = "OVERLAPPING_NON_NESTED"
     result = {
-        "day1": asdict(first), "day2": asdict(second),
-        "action_id_sets_equal": first.action_ids_sha256 == second.action_ids_sha256,
-        "visit_id_sets_equal": first.visit_ids_sha256 == second.visit_ids_sha256,
-        "project_id_sets_equal": first.project_ids_sha256 == second.project_ids_sha256,
+        "day1": _summary_payload(first.summary), "day2": _summary_payload(second.summary),
+        "action_intersection": len(action_intersection),
+        "action_only_day1": len(first.action_fingerprints - second.action_fingerprints),
+        "action_only_day2": len(second.action_fingerprints - first.action_fingerprints),
+        "action_subset_relation": subset_relation,
+        "action_jaccard": round(len(action_intersection) / len(action_union), 6) if action_union else 1.0,
+        "visit_intersection": len(visit_intersection),
+        "date_filter_behavior": behavior,
     }
     return _bounded_json(result)
+
+
+def render_single(analysis: ActionSearchAnalysis) -> str:
+    return _bounded_json({"day1": _summary_payload(analysis.summary), "failure_category": analysis.summary.failure_category})
+
+
+def _summary_payload(summary: ActionSearchSummary) -> dict:
+    values = asdict(summary)
+    # Whole-set fingerprints stay internal too; only overlap counts are reported.
+    for key in ("action_ids_sha256", "visit_ids_sha256", "project_ids_sha256"):
+        values.pop(key, None)
+    return values
 
 
 def _bounded_json(value: dict) -> str:

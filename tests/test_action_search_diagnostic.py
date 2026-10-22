@@ -1,4 +1,9 @@
-from src.action_search_diagnostic import render_comparison, render_diagnostic, summarize_action_response
+from src.action_search_diagnostic import (
+    analyze_action_response,
+    render_comparison,
+    render_diagnostic,
+    summarize_action_response,
+)
 
 
 def _summary(body: bytes, *, limit: int = 10_000):
@@ -69,18 +74,39 @@ def test_limit_and_pagination_indicators_are_detected():
     assert summary.explicit_total_count == 25_000
 
 
-def test_comparison_uses_hashes_not_raw_identifiers():
-    first = _summary(b'<table><tr><td><a href="/action/12345">x</a></td></tr></table>')
-    second = _summary(b'<table><tr><td><a href="/action/12345">y</a></td></tr></table>')
-    third = _summary(b'<table><tr><td><a href="/action/99999">y</a></td></tr></table>')
+def _analysis(rows: tuple[tuple[str, str], ...]):
+    markup = "<table>" + "".join(
+        f'<tr><td><a href="/action/{action}">a</a>'
+        f'<a href="/visit/{visit}">v</a><a href="/proj/77">p</a></td></tr>'
+        for action, visit in rows
+    ) + "</table>"
+    return analyze_action_response(
+        http_status=200, content_type="text/html", body=markup.encode(),
+        final_url="https://lk.j4b.ru/action", expected_host="lk.j4b.ru",
+    )
 
-    same = render_comparison(first, second)
-    different = render_comparison(first, third)
-    assert '"action_id_sets_equal":true' in same
-    assert '"action_id_sets_equal":false' in different
-    assert "12345" not in same + different
-    assert "99999" not in different
-    assert len(same) <= 2_000
+
+def test_comparison_calculates_overlap_from_private_id_fingerprints():
+    first = _analysis((("123456", "111111"), ("234567", "222222")))
+    second = _analysis((("234567", "222222"), ("345678", "333333")))
+    rendered = render_comparison(first, second)
+    assert '"action_intersection":1' in rendered
+    assert '"action_only_day1":1' in rendered
+    assert '"action_only_day2":1' in rendered
+    assert '"action_subset_relation":"OVERLAPPING_NON_NESTED"' in rendered
+    assert '"action_jaccard":0.333333' in rendered
+    assert '"visit_intersection":1' in rendered
+    assert "123456" not in rendered and "234567" not in rendered
+    assert "111111" not in rendered and "222222" not in rendered
+    assert len(rendered) <= 2_000
+
+
+def test_comparison_detects_subset_and_disjoint_daily_shapes():
+    day1 = _analysis((("123456", "111111"),))
+    superset = _analysis((("123456", "111111"), ("234567", "222222")))
+    disjoint = _analysis((("999999", "888888"),))
+    assert '"action_subset_relation":"DAY1_SUBSET_OF_DAY2"' in render_comparison(day1, superset)
+    assert '"date_filter_behavior":"DISJOINT_DAILY_SLICES"' in render_comparison(day1, disjoint)
 
 
 def test_date_visit_semantics_does_not_claim_report_date():
