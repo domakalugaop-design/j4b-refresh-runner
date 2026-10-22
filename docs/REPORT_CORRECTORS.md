@@ -63,15 +63,54 @@ that residual ~0.1% risk plus day-to-day registry variance.
   the empty first row (verified on a real report: 87 options, `value="0"`
   selected, no label). A zero or blank id is therefore "not assigned", not a
   malformed control.
-- `source_status` — `CURRENT` (fresh read), `NO_CORRECTOR`, `STALE_LAST_GOOD`
-  (refresh failed, previous values kept), `FETCH_FAILED_NO_HISTORY` (failed, no
-  previous values), `PENDING`.
+- `source_status` — `CURRENT` (fresh read with a corrector), `NO_CORRECTOR`
+  (fresh read, nothing assigned), `CORRECTOR_REMOVED` (a corrector that was
+  previously recorded is no longer selected), `STALE_LAST_GOOD` (refresh
+  failed, previous values kept), `FETCH_FAILED_NO_HISTORY` (failed, no previous
+  values), `PENDING`.
 - `last_successful_fetch` — UTC ISO-8601 timestamp of the last successful read.
+
+## Corrector-only dataset
+
+The published tab contains only reports with a real corrector: a positive
+numeric `corrector_id`. Everything discovered is retained in the checkpoint, so
+nothing is lost, but `NO_CORRECTOR` and `CORRECTOR_REMOVED` reports are never
+written to the sheet. This is enforced at three points, not by convention:
+
+1. `render_sheet_rows` skips any row without a positive corrector id;
+2. `validate_sheet_rows` rejects a published row whose `corrector_id` is not a
+   positive integer or whose status is `NO_CORRECTOR`/`CORRECTOR_REMOVED`;
+3. the sheet is replaced from that rendered set, so a row that loses its
+   corrector disappears from the tab instead of remaining as a stale entry.
+
+### Reconciliation
+
+`reconcile_dataset` compares the current publishable set with what the tab last
+received (recorded by `mark_published` after a verified publication) and returns
+`added`, `updated`, `removed` and `unchanged`. `removed` is the explicit
+reconciliation signal for a corrector that disappeared: the report leaves the
+target set, keeps its withdrawn id and timestamp in the checkpoint for audit, and
+is reported in the run JSON. Repeated runs converge — the second run after a
+publication reports `added=0, updated=0, removed=0`.
+
+### Recheck policy
+
+The recheck interval depends on the last resolved state, so a report without a
+corrector does not cause a daily mass re-read:
+
+| State | Recheck after | Reason |
+| --- | --- | --- |
+| `CURRENT` | 7 days | a published corrector is stable; weekly catches reassignment |
+| `NO_CORRECTOR` | 3 days | this is the pool that later gains a corrector |
+| `CORRECTOR_REMOVED` | 7 days | revisit in case the corrector is restored |
+
+Newly discovered reports are fetched on the next run regardless of policy, and a
+`NO_CORRECTOR` report that gains a corrector becomes `CURRENT` on that read.
 
 ## Operation
 
 ```bash
-# incremental: re-discover the last 7 days, fetch up to 50 details
+# incremental: re-discover the last 3 days, fetch up to 50 details
 PORTAL_CREDENTIALS_FILE=/path/portal-auth.json \
   python3 scripts/run_report_corrector_collector.py \
     --state ~/.cache/j4b-report-reviewers/state.json --max-fetches 50
@@ -115,10 +154,13 @@ Recommended mode for a daily run (design only; no timer is installed):
 2. **Top-up of missed reports** — every ID already in the checkpoint but still
    unresolved is fetched, regardless of when it was discovered. Nothing is
    dropped because a previous run hit its GET cap.
-3. **Recheck of mutable rows** — resolved rows are re-read once their recheck
-   interval elapses, because a corrector is commonly assigned some time after
-   filing. In the pilot, 70 of 145 reports (48%) had no corrector on the day
-   they were filed, so rechecking is what actually fills the sheet.
+3. **Recheck of mutable rows** — resolved rows are re-read once their
+   status-specific recheck interval elapses, because a corrector is commonly
+   assigned some time after filing. In the pilot, 70 of 145 reports (48%) had no
+   corrector on the day they were filed, so rechecking is what actually fills
+   the sheet. Intervals are 3 days for `NO_CORRECTOR` and 7 days for `CURRENT`,
+   which bounds the daily load instead of re-reading the whole dataset every
+   day.
 4. **Last-good preservation** — a failed re-read keeps the previous values and
    marks the row `STALE_LAST_GOOD`; a fresh report that fails has no history and
    is marked `FETCH_FAILED_NO_HISTORY`.
@@ -138,8 +180,40 @@ Recommended mode for a daily run (design only; no timer is installed):
 
 The primary run is deliberately placed 75 minutes after the 17:00 refresh: the
 2026-10-16 incident showed that publish phase can run past 17:15, and the guard
-alone only covers the window, not an overrunning job. Expected steady-state
-load is ~150-200 GETs (about 6-8 minutes) because the 3-day window rotates.
+alone only covers the window, not an overrunning job.
+
+Measured pilot rate is 2.1 s per report (1.5 s interval plus request latency).
+Expected daily load, using the October average of ~166 reports filed per day:
+~166 new-report reads, plus the recheck queues (≈48% of the inventory without a
+corrector re-read every 3 days, and every published row every 7 days). On a
+one-month inventory that is roughly 800-1,200 detail GETs, i.e. 30-45 minutes at
+the measured rate — an evening job, not a per-hour one.
+
+### Integration with the production refresh (read-only study)
+
+Integrating the corrector collection *inside* `src.production.run()` is
+technically possible but materially risky, and is not done:
+
+- `target_tabs` is exactly `{"projects_current", "project_types"}`
+  (`src/production.py:1083`, `:1408`, `:1876`). Every other worksheet is hashed
+  by `_fingerprint_non_target_tabs` (`:1097`) before and after publication, and
+  any difference raises `RuntimeError` (`:1453-1455`), which runs
+  `_rollback_full_refresh` (`:1456-1470`). Creating or writing
+  `report_reviewers` during that window would therefore abort and roll back the
+  whole five-tab publication — the same failure class as 2026-10-16.
+- Making the corrector tab a target would require changing the protected set,
+  the rollback contract, and the persistent backup coverage: a production change
+  well outside a collector task.
+- Data reuse is negligible. The refresh does already fetch the per-project
+  `/action` listing for the whole year (`src/acquisition.py:372-383`), but
+  `parse_action_table` keeps only visit/action ids and workflow states
+  (`src/parsers.py:421-429`) — it has no date and no corrector, so no detail GET
+  is saved and October rows cannot be isolated from it reliably.
+
+Conclusion: run the collector as a separate post-refresh process (18:15 MSK).
+It shares credentials, the venv and the spreadsheet contract, but owns its tab,
+its transaction and its checkpoint, so a corrector failure can never touch the
+five production tabs.
 
 Do not schedule at 10:00 or 17:00, and do not run the pilot's full-month
 discovery as a daily job: the daily mode needs only the 3-day window.

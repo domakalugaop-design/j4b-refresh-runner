@@ -4,16 +4,19 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 
 from src.report_corrector_collector import (
+    DEFAULT_RECHECK,
     SHEET_COLUMNS,
     START_DATE,
     CollectorError,
     ReportDetail,
     collect_batch,
     extract_registry_report_ids,
+    mark_published,
     merge_candidates,
     new_state,
     parse_report_detail,
     pending_report_ids,
+    reconcile_dataset,
     render_sheet_rows,
     store_detail,
     store_failure,
@@ -315,14 +318,120 @@ class SheetRenderingTests(unittest.TestCase):
         self.assertEqual(rows[1][7], "STALE_LAST_GOOD")
         self.assertEqual(rows[1][5], "56770")
 
-    def test_failure_without_history_is_marked(self) -> None:
+    def test_failure_without_history_is_audited_but_not_published(self) -> None:
         state = ready_state("671045")
         state["reports"]["671045"].update({
             "detail": {"report_id": "671045", "report_date": "2026-10-05", "visit_id": "1", "project_id": "2"},
         })
         store_failure(state, "671045", "TRANSPORT_ERROR", NOW)
+        self.assertEqual(render_sheet_rows(state), [list(SHEET_COLUMNS)])
+        audit = render_sheet_rows(state, require_corrector=False)
+        self.assertEqual(audit[1][7], "FETCH_FAILED_NO_HISTORY")
+
+    def test_rows_without_corrector_are_never_published(self) -> None:
+        state = ready_state("671045", "671046")
+        empty = parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045")
+        self.assertEqual(empty.corrector_state, "EMPTY")
+        store_detail(state, empty, NOW, recheck_after=RECHECK)
+        store_detail(state, parse_report_detail(action_html("671046"), "671046"), NOW, recheck_after=RECHECK)
         rows = render_sheet_rows(state)
-        self.assertEqual(rows[1][7], "FETCH_FAILED_NO_HISTORY")
+        self.assertEqual([row[0] for row in rows[1:]], ["671046"])
+        self.assertEqual(state["reports"]["671045"]["last_good"]["source_status"], "NO_CORRECTOR")
+
+    def test_publication_rejects_rows_without_a_real_corrector(self) -> None:
+        row = ["671045", "671045", "763369", "7986", "2026-10-01", "", "", "NO_CORRECTOR", ""]
+        with self.assertRaises(CollectorError):
+            validate_sheet_rows([list(SHEET_COLUMNS), row])
+        row[5], row[7] = "0", "CURRENT"
+        with self.assertRaises(CollectorError):
+            validate_sheet_rows([list(SHEET_COLUMNS), row])
+
+    def test_recheck_policy_is_status_aware(self) -> None:
+        state = ready_state("671045")
+        store_detail(state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"), NOW, recheck_after=DEFAULT_RECHECK)
+        entry = state["reports"]["671045"]
+        self.assertEqual(datetime.fromisoformat(entry["next_recheck_at"]), NOW + timedelta(days=3))
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=DEFAULT_RECHECK)
+        self.assertEqual(datetime.fromisoformat(entry["next_recheck_at"]), NOW + timedelta(days=7))
+        due_now = pending_report_ids(state, NOW + timedelta(days=1), 10, recheck_after=DEFAULT_RECHECK)
+        self.assertEqual(due_now, [])
+        due_later = pending_report_ids(state, NOW + timedelta(days=8), 10, recheck_after=DEFAULT_RECHECK)
+        self.assertEqual(due_later, ["671045"])
+
+    def test_withdrawn_corrector_is_recorded_and_excluded(self) -> None:
+        state = ready_state("671045")
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        self.assertEqual(len(render_sheet_rows(state)[1:]), 1)
+        store_detail(
+            state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"),
+            NOW + timedelta(days=1), recheck_after=DEFAULT_RECHECK,
+        )
+        good = state["reports"]["671045"]["last_good"]
+        self.assertEqual(good["source_status"], "CORRECTOR_REMOVED")
+        self.assertEqual(good["withdrawn_corrector_id"], "56770")
+        self.assertEqual(render_sheet_rows(state), [list(SHEET_COLUMNS)])
+        self.assertEqual(state["reports"]["671045"]["discovered_for"], "2026-10-01")
+        self.assertEqual(state["reports"]["671045"]["detail"]["report_date"], "2026-10-01")
+
+    def test_corrector_reappearing_after_removal_becomes_current(self) -> None:
+        state = ready_state("671045")
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=DEFAULT_RECHECK)
+        store_detail(
+            state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"),
+            NOW + timedelta(days=1), recheck_after=DEFAULT_RECHECK,
+        )
+        store_detail(
+            state, parse_report_detail(action_html(), "671045"),
+            NOW + timedelta(days=8), recheck_after=DEFAULT_RECHECK,
+        )
+        good = state["reports"]["671045"]["last_good"]
+        self.assertEqual(good["source_status"], "CURRENT")
+        self.assertNotIn("withdrawn_corrector_id", good)
+        self.assertEqual(render_sheet_rows(state)[1][7], "CURRENT")
+
+    def test_reconciliation_plans_add_update_remove(self) -> None:
+        state = ready_state("671045", "671046", "671047")
+        for report_id in ("671045", "671046"):
+            store_detail(
+                state, parse_report_detail(action_html(report_id), report_id), NOW,
+                recheck_after=RECHECK,
+            )
+        mark_published(state, NOW)
+        plan = reconcile_dataset(state)
+        self.assertEqual((plan["publishable"], plan["added"], plan["updated"], plan["removed"]), (2, [], [], []))
+        # A new corrector report appears, one changes reviewer, one loses it.
+        store_detail(state, parse_report_detail(action_html("671047"), "671047"), NOW, recheck_after=RECHECK)
+        store_detail(
+            state,
+            parse_report_detail(
+                action_html("671046", staff="<select name=\"staff\"><option value=\"31291\" selected>Петров П.</option></select>"),
+                "671046",
+            ),
+            NOW + timedelta(days=1), recheck_after=RECHECK,
+        )
+        store_detail(
+            state, parse_report_detail(action_html(staff="<select name=\"staff\"><option value=\"0\" selected>Нет</option></select>"), "671045"),
+            NOW + timedelta(days=1), recheck_after=DEFAULT_RECHECK,
+        )
+        plan = reconcile_dataset(state)
+        self.assertEqual(plan["added"], ["671047"])
+        self.assertEqual(plan["updated"], ["671046"])
+        self.assertEqual(plan["removed"], ["671045"])
+        self.assertEqual(plan["publishable"], 2)
+        mark_published(state, NOW + timedelta(days=1))
+        self.assertEqual(reconcile_dataset(state)["removed"], [])
+        withdrawn = state["reports"]["671045"]["published"]
+        self.assertIsNone(withdrawn["corrector_id"])
+        self.assertEqual(withdrawn["withdrawn_corrector_id"], "56770")
+
+    def test_reconciliation_is_idempotent_across_repeated_runs(self) -> None:
+        state = ready_state("671045")
+        store_detail(state, parse_report_detail(action_html(), "671045"), NOW, recheck_after=RECHECK)
+        mark_published(state, NOW)
+        first = reconcile_dataset(state)
+        second = reconcile_dataset(state)
+        self.assertEqual(first, second)
+        self.assertEqual((first["added"], first["updated"], first["removed"]), ([], [], []))
 
     def test_row_validation_rejects_schema_and_duplicates(self) -> None:
         state = ready_state("671045")

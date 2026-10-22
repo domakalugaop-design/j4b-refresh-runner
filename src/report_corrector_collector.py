@@ -39,7 +39,23 @@ FAILURE_CATEGORIES = {
     "TRANSPORT_ERROR", "HTTP_ERROR", "PARSE_ERROR", "JOIN_MISMATCH",
     "DATE_OUT_OF_RANGE", "INTERNAL_ERROR",
 }
-SOURCE_STATUSES = {"PENDING", "CURRENT", "NO_CORRECTOR", "STALE_LAST_GOOD", "FETCH_FAILED_NO_HISTORY"}
+SOURCE_STATUSES = {
+    "PENDING", "CURRENT", "NO_CORRECTOR", "STALE_LAST_GOOD",
+    "FETCH_FAILED_NO_HISTORY", "CORRECTOR_REMOVED",
+}
+# Recheck policy per resolved state: a report that already has a corrector is
+# re-read daily, one that never had one is re-read weekly so a 70-report backlog
+# does not become a daily mass re-read, and a withdrawn corrector is revisited
+# weekly in case it is restored.
+DEFAULT_RECHECK = {
+    # A published corrector is stable; a weekly re-read is enough to catch a
+    # reassignment without re-reading the whole dataset daily.
+    "CURRENT": timedelta(days=7),
+    # Reports without a corrector are the ones that later gain one, so they are
+    # re-read every third day: bounded latency without a daily mass re-read.
+    "NO_CORRECTOR": timedelta(days=3),
+    "CORRECTOR_REMOVED": timedelta(days=7),
+}
 
 _REPORT_LINK = re.compile(r"/report/(\d+)(?:/|$)", re.I)
 _ACTION_LINK = re.compile(r"/action/(\d+)(?:/|$)", re.I)
@@ -223,7 +239,8 @@ def merge_candidates(state: dict[str, Any], report_ids: Iterable[str], *, discov
 
 def pending_report_ids(
     state: Mapping[str, Any], now: datetime, max_items: int, *,
-    recheck_after: timedelta, scope: Collection[str] | None = None,
+    recheck_after: timedelta | Mapping[str, timedelta],
+    scope: Collection[str] | None = None,
 ) -> list[str]:
     """Return unresolved IDs first, then entries whose recheck interval elapsed.
 
@@ -236,8 +253,7 @@ def pending_report_ids(
         raise CollectorError("max_items must be positive")
     if now.tzinfo is None:
         raise CollectorError("now must be timezone-aware")
-    if recheck_after.total_seconds() <= 0:
-        raise CollectorError("recheck interval must be positive")
+    _validate_recheck_policy(recheck_after)
     allowed = None if scope is None else {str(value) for value in scope}
     now_text = now.astimezone(timezone.utc).isoformat()
     fresh: list[str] = []
@@ -263,28 +279,78 @@ def pending_report_ids(
     return ordered
 
 
-def store_detail(state: dict[str, Any], detail: ReportDetail, fetched_at: datetime, *, recheck_after: timedelta) -> None:
+def _validate_recheck_policy(policy: timedelta | Mapping[str, timedelta]) -> None:
+    if isinstance(policy, Mapping):
+        if not policy:
+            raise CollectorError("recheck policy is empty")
+        for status, delay in policy.items():
+            if status not in SOURCE_STATUSES or delay.total_seconds() <= 0:
+                raise CollectorError(f"invalid recheck policy entry: {status}")
+        return
+    if policy.total_seconds() <= 0:
+        raise CollectorError("recheck interval must be positive")
+
+
+def _recheck_delay(policy: timedelta | Mapping[str, timedelta], source_status: str) -> timedelta:
+    if isinstance(policy, Mapping):
+        delay = policy.get(source_status)
+        if delay is None:
+            raise CollectorError(f"recheck policy has no entry for {source_status}")
+        return delay
+    return policy
+
+
+def store_detail(
+    state: dict[str, Any], detail: ReportDetail, fetched_at: datetime, *,
+    recheck_after: timedelta | Mapping[str, timedelta],
+) -> None:
+    """Store a resolved read, recording an explicit corrector withdrawal.
+
+    A report that previously had a corrector and now comes back empty is not
+    silently left as a stale publishable row: it becomes ``CORRECTOR_REMOVED``,
+    keeps the withdrawn id for audit, and drops out of the publishable set.
+    """
     _require_state(state)
     if detail.report_id not in state["reports"]:
         raise CollectorError("report id is outside inventory")
-    if fetched_at.tzinfo is None or recheck_after.total_seconds() <= 0:
-        raise CollectorError("invalid fetch time or recheck interval")
+    if fetched_at.tzinfo is None:
+        raise CollectorError("invalid fetch time")
     timestamp = fetched_at.astimezone(timezone.utc)
-    source_status = "CURRENT" if detail.corrector_state == "VALUE_PRESENT" else "NO_CORRECTOR"
     entry = state["reports"][detail.report_id]
+    previous = entry.get("last_good") or {}
+    previous_id = previous.get("corrector_id")
+
+    if detail.corrector_state == "VALUE_PRESENT":
+        source_status = "CURRENT"
+    elif previous_id:
+        source_status = "CORRECTOR_REMOVED"
+    else:
+        source_status = "NO_CORRECTOR"
+
+    delay = _recheck_delay(recheck_after, source_status)
+    if delay.total_seconds() <= 0:
+        raise CollectorError("recheck interval must be positive")
+
+    last_good = {
+        "corrector_id": detail.corrector_id,
+        "corrector_fio": detail.corrector_fio,
+        "source_status": source_status,
+        "last_successful_fetch": timestamp.isoformat(),
+    }
+    if source_status == "CORRECTOR_REMOVED":
+        last_good["withdrawn_corrector_id"] = previous_id
+        last_good["withdrawn_fio"] = previous.get("corrector_fio")
+        last_good["withdrawn_at"] = timestamp.isoformat()
+        last_good["withdrawn_seen_from"] = previous.get("last_successful_fetch")
+
     entry.update({
         "detail": asdict(detail),
-        "last_good": {
-            "corrector_id": detail.corrector_id,
-            "corrector_fio": detail.corrector_fio,
-            "source_status": source_status,
-            "last_successful_fetch": timestamp.isoformat(),
-        },
+        "last_good": last_good,
         "last_attempt_at": timestamp.isoformat(),
         "last_attempt_status": "PASS",
         "failure_count": 0,
         "next_attempt_at": None,
-        "next_recheck_at": (timestamp + recheck_after).isoformat(),
+        "next_recheck_at": (timestamp + delay).isoformat(),
     })
 
 
@@ -366,8 +432,14 @@ def collect_batch(
     return counts
 
 
-def render_sheet_rows(state: Mapping[str, Any]) -> list[list[Any]]:
-    """Render publishable rows: October-and-later reports with a resolved detail."""
+def render_sheet_rows(state: Mapping[str, Any], *, require_corrector: bool = True) -> list[list[Any]]:
+    """Render publishable rows.
+
+    The published dataset is corrector-only: a report must carry a real
+    ``corrector_id`` (a positive portal staff id). Reports without a corrector
+    stay in the checkpoint for later re-discovery but are never published, so
+    ``NO_CORRECTOR`` and ``CORRECTOR_REMOVED`` reports cannot appear in the tab.
+    """
     _require_state(state)
     rows: list[list[Any]] = [list(SHEET_COLUMNS)]
     for report_id, entry in sorted(state["reports"].items(), key=lambda pair: int(pair[0])):
@@ -382,13 +454,72 @@ def render_sheet_rows(state: Mapping[str, Any]) -> list[list[Any]]:
             source_status = good["source_status"] if passed else "STALE_LAST_GOOD"
         else:
             source_status = "FETCH_FAILED_NO_HISTORY"
+        corrector_id = str(good.get("corrector_id") or "")
+        if require_corrector and (not corrector_id.isdigit() or int(corrector_id) <= 0):
+            continue
         rows.append([
             detail["report_id"], detail["report_id"], detail["visit_id"],
             detail["project_id"], detail["report_date"],
-            good.get("corrector_id") or "", good.get("corrector_fio") or "",
+            corrector_id, good.get("corrector_fio") or "",
             source_status, good.get("last_successful_fetch") or "",
         ])
     return rows
+
+
+def reconcile_dataset(state: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare the current publishable set with what the tab already holds.
+
+    Publication is incremental: the tab is the union of every corrector-bearing
+    report, so an add/update/remove plan is what keeps it idempotent instead of
+    rewritten. A report that lost its corrector appears in ``removed`` and must
+    be deleted from the tab rather than left behind as a stale row.
+    """
+    _require_state(state)
+    current = {row[0]: str(row[5]) for row in render_sheet_rows(state)[1:]}
+    published: dict[str, str] = {}
+    for report_id, entry in state["reports"].items():
+        record = entry.get("published") or {}
+        if record.get("corrector_id"):
+            published[report_id] = str(record["corrector_id"])
+    added = sorted((rid for rid in current if rid not in published), key=int)
+    updated = sorted(
+        (rid for rid in current if rid in published and published[rid] != current[rid]), key=int
+    )
+    removed = sorted((rid for rid in published if rid not in current), key=int)
+    return {
+        "publishable": len(current),
+        "added": added,
+        "updated": updated,
+        "removed": removed,
+        "unchanged": len(current) - len(added) - len(updated),
+    }
+
+
+def mark_published(state: dict[str, Any], published_at: datetime) -> None:
+    """Record the tab's new content after a successful publication."""
+    _require_state(state)
+    if published_at.tzinfo is None:
+        raise CollectorError("invalid publication time")
+    timestamp = published_at.astimezone(timezone.utc).isoformat()
+    rows = render_sheet_rows(state)
+    live = {row[0] for row in rows[1:]}
+    for row in rows[1:]:
+        state["reports"][row[0]]["published"] = {
+            "corrector_id": str(row[5]),
+            "corrector_fio": row[6],
+            "published_at": timestamp,
+        }
+    for report_id, entry in state["reports"].items():
+        record = entry.get("published") or {}
+        if record.get("corrector_id") and report_id not in live:
+            entry["published"] = {
+                "corrector_id": None,
+                "corrector_fio": None,
+                "withdrawn_corrector_id": record["corrector_id"],
+                "withdrawn_fio": record.get("corrector_fio"),
+                "withdrawn_at": timestamp,
+                "published_at": record.get("published_at"),
+            }
 
 
 def validate_sheet_rows(rows: list[list[Any]]) -> None:
@@ -409,6 +540,10 @@ def validate_sheet_rows(rows: list[list[Any]]) -> None:
             raise CollectorError("report_reviewers report_date is invalid") from None
         if str(row[7]) not in SOURCE_STATUSES:
             raise CollectorError("report_reviewers source_status is invalid")
+        if str(row[7]) in {"NO_CORRECTOR", "CORRECTOR_REMOVED"}:
+            raise CollectorError("report_reviewers publishes a report without a corrector")
+        if not str(row[5]).isdigit() or int(str(row[5])) <= 0:
+            raise CollectorError("report_reviewers corrector_id is invalid")
         if row[8]:
             try:
                 datetime.fromisoformat(str(row[8]))

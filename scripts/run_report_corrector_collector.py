@@ -10,7 +10,7 @@ the production refresh windows; the checkpoint is private and outside the repo.
 
 Usage:
     python3 scripts/run_report_corrector_collector.py --state /path/state.json \
-        [--max-fetches 50] [--days-back 7] [--plan] [--publish]
+        [--max-fetches 50] [--days-back 3] [--plan] [--publish]
 """
 
 from __future__ import annotations
@@ -28,8 +28,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.portal_transport import PortalSession  # noqa: E402
 from src.report_corrector_collector import (  # noqa: E402
-    START_DATE, collect_batch, extract_registry_report_ids, merge_candidates,
-    new_state, render_sheet_rows, validate_sheet_rows,
+    DEFAULT_RECHECK, START_DATE, collect_batch, extract_registry_report_ids,
+    mark_published, merge_candidates, new_state, reconcile_dataset,
+    render_sheet_rows, validate_sheet_rows,
 )
 
 SPREADSHEET_ID = "14PRG3HXsZaN4pVwV390PpMMqHupCW5j6RyI6HBzPQR8"
@@ -125,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="collect report -> corrector rows")
     parser.add_argument("--state", required=True, help="private checkpoint path")
     parser.add_argument("--max-fetches", type=int, default=50)
-    parser.add_argument("--days-back", type=int, default=7,
+    parser.add_argument("--days-back", type=int, default=3,
                         help="re-discover the last N days (0 = whole month)")
     parser.add_argument("--interval", type=float, default=1.5)
     parser.add_argument("--skip-discovery", action="store_true")
@@ -203,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
 
             report["batch"] = collect_batch(
                 state, fetch, datetime.now(timezone.utc), max_fetches=args.max_fetches,
-                recheck_after=timedelta(hours=6),
+                recheck_after=DEFAULT_RECHECK,
                 save=lambda payload: _save_state(state_path, payload),
                 request_interval_seconds=args.interval,
             )
@@ -218,6 +219,20 @@ def main(argv: list[str] | None = None) -> int:
         1 for entry in state["reports"].values()
         if entry.get("detail") is None and entry.get("last_attempt_status") != "DATE_OUT_OF_RANGE"
     )
+    # Corrector-only accounting: everything discovered but not published stays
+    # in the checkpoint for later re-discovery and is reported, never dropped.
+    report["no_corrector_excluded"] = sum(
+        1 for entry in state["reports"].values()
+        if (entry.get("last_good") or {}).get("source_status") == "NO_CORRECTOR"
+    )
+    report["corrector_removed"] = sum(
+        1 for entry in state["reports"].values()
+        if (entry.get("last_good") or {}).get("source_status") == "CORRECTOR_REMOVED"
+    )
+    report["reconciliation"] = {
+        key: value if isinstance(value, int) else len(value)
+        for key, value in reconcile_dataset(state).items()
+    }
 
     if args.plan or args.publish:
         from src.report_corrector_sheet import plan as plan_publication
@@ -234,6 +249,8 @@ def main(argv: list[str] | None = None) -> int:
             report["publication"] = publish(
                 rows, gateway, backup_dir=str(state_path.parent / "backups"),
             )
+            mark_published(state, datetime.now(timezone.utc))
+            _save_state(state_path, state)
 
     print(json.dumps(report, ensure_ascii=False, separators=(",", ":")))
     return 0
