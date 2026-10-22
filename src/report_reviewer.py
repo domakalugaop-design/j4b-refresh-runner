@@ -1,10 +1,9 @@
 """Safe, report-scoped extraction of the selected ``staff`` field.
 
-The Portal labels this field "Проверил".  That label is not sufficient to
-assert the business role "corrector", so the public names intentionally use
-reviewer rather than corrector.  This parser is not wired into acquisition or
-publication until report-level cardinality and the business meaning are
-approved.
+The owner confirmed that the report's "Проверил" field is the corrector.
+This parser returns the approved corrector fields but is not wired into
+acquisition or publication until report inventory and request budget are
+qualified.
 """
 
 from __future__ import annotations
@@ -15,18 +14,18 @@ import re
 from typing import Literal
 
 
-ReviewerState = Literal["VALUE_PRESENT", "EMPTY", "FIELD_NOT_EXPOSED"]
+CorrectorState = Literal["VALUE_PRESENT", "EMPTY", "FIELD_NOT_EXPOSED"]
 
 
-class ReportReviewerParseError(ValueError):
+class ReportCorrectorParseError(ValueError):
     """A structural or validation error with no portal text in the message."""
 
 
 @dataclass(frozen=True)
-class ReportReviewer:
-    state: ReviewerState
-    reviewer_id: str | None = None
-    reviewer_fio: str | None = None
+class ReportCorrector:
+    state: CorrectorState
+    corrector_id: str | None = None
+    corrector_fio: str | None = None
 
 
 @dataclass
@@ -58,7 +57,7 @@ class _StaffSelectParser(HTMLParser):
 
         if tag == "select":
             if self._in_staff_select:
-                raise ReportReviewerParseError("malformed staff select structure")
+                raise ReportCorrectorParseError("malformed staff select structure")
             if (attributes.get("name") or "").casefold() == "staff":
                 self.select_count += 1
                 self._in_staff_select = True
@@ -91,50 +90,50 @@ def _normalized_text(parts: list[str]) -> str:
     return " ".join("".join(parts).split())
 
 
-def parse_report_reviewer(html: str) -> ReportReviewer:
-    """Parse the report's selected reviewer without logging source values.
+def parse_report_corrector(html: str) -> ReportCorrector:
+    """Parse the report's selected corrector without logging source values.
 
     A missing field or an explicitly blank/no selection is represented as a
     state. Ambiguous controls, malformed target markup, nonnumeric IDs, and
     selected options without display text fail closed.
     """
     if not isinstance(html, str) or not html.strip():
-        raise ReportReviewerParseError("report reviewer HTML is empty")
+        raise ReportCorrectorParseError("report corrector HTML is empty")
 
     parser = _StaffSelectParser()
     try:
         parser.feed(html)
         parser.close()
-    except ReportReviewerParseError:
+    except ReportCorrectorParseError:
         raise
     except Exception:
-        raise ReportReviewerParseError("report reviewer HTML is malformed") from None
+        raise ReportCorrectorParseError("report corrector HTML is malformed") from None
 
     if parser._in_staff_select or not parser.select_closed:
-        raise ReportReviewerParseError("staff select is not closed")
+        raise ReportCorrectorParseError("staff select is not closed")
     if parser.select_count > 1:
-        raise ReportReviewerParseError("multiple staff selects are ambiguous")
+        raise ReportCorrectorParseError("multiple staff selects are ambiguous")
     if parser.select_count == 0:
-        return ReportReviewer("FIELD_NOT_EXPOSED")
+        return ReportCorrector("FIELD_NOT_EXPOSED")
 
     selected = [option for option in parser.options if option.selected]
     if len(selected) > 1:
-        raise ReportReviewerParseError("multiple selected staff options are ambiguous")
+        raise ReportCorrectorParseError("multiple selected staff options are ambiguous")
     if not selected:
-        return ReportReviewer("EMPTY")
+        return ReportCorrector("EMPTY")
 
     option = selected[0]
     employee_id = (option.value or "").strip()
     display_name = _normalized_text(option.text_parts)
     if not employee_id:
-        return ReportReviewer("EMPTY")
+        return ReportCorrector("EMPTY")
     if not re.fullmatch(r"[0-9]+", employee_id):
-        raise ReportReviewerParseError("selected staff ID is not numeric")
+        raise ReportCorrectorParseError("selected staff ID is not numeric")
     if not display_name:
-        raise ReportReviewerParseError("selected staff display text is missing")
+        raise ReportCorrectorParseError("selected staff display text is missing")
 
-    return ReportReviewer(
+    return ReportCorrector(
         state="VALUE_PRESENT",
-        reviewer_id=employee_id,
-        reviewer_fio=display_name,
+        corrector_id=employee_id,
+        corrector_fio=display_name,
     )
