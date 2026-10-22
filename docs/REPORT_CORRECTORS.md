@@ -58,8 +58,11 @@ that residual ~0.1% risk plus day-to-day registry variance.
 - `report_date` — the action page's `dt`, i.e. the date the portal files the
   report under. It is **not** the visit date and **not** a corrector timestamp.
 - `corrector_id` / `corrector_fio` — the selected `staff` option, only when the
-  selection is present. `NO_CORRECTOR` means the field exists but nothing is
-  selected (or the selection has an empty value).
+  selection is present. `NO_CORRECTOR` means the report carries no corrector:
+  the portal marks that with the same `value="0"` placeholder option used for
+  the empty first row (verified on a real report: 87 options, `value="0"`
+  selected, no label). A zero or blank id is therefore "not assigned", not a
+  malformed control.
 - `source_status` — `CURRENT` (fresh read), `NO_CORRECTOR`, `STALE_LAST_GOOD`
   (refresh failed, previous values kept), `FETCH_FAILED_NO_HISTORY` (failed, no
   previous values), `PENDING`.
@@ -100,3 +103,43 @@ The runner refuses to start inside the production refresh windows
   a 0700 directory with 0600 file permissions.
 - Pre-cutover reports are recorded as out-of-scope and neither retried nor
   published.
+
+## Daily operation
+
+Recommended mode for a daily run (design only; no timer is installed):
+
+1. **Discovery window** — the last 3 calendar days, re-queried every run. A
+   report filed late, or one the registry omitted on the day it was filed,
+   appears in a later pass because discovery is idempotent and the window is
+   wider than one day.
+2. **Top-up of missed reports** — every ID already in the checkpoint but still
+   unresolved is fetched, regardless of when it was discovered. Nothing is
+   dropped because a previous run hit its GET cap.
+3. **Recheck of mutable rows** — resolved rows are re-read once their recheck
+   interval elapses, because a corrector is commonly assigned some time after
+   filing. In the pilot, 70 of 145 reports (48%) had no corrector on the day
+   they were filed, so rechecking is what actually fills the sheet.
+4. **Last-good preservation** — a failed re-read keeps the previous values and
+   marks the row `STALE_LAST_GOOD`; a fresh report that fails has no history and
+   is marked `FETCH_FAILED_NO_HISTORY`.
+5. **Request limits** — hard cap of 300 detail GETs per run, minimum 1.5 s
+   between requests, exponential backoff per report (300 s doubling to a 24 h
+   ceiling), and a wall-clock deadline after which the run stops cleanly with
+   the remainder preserved.
+6. **Refresh protection** — the runner refuses to start between 09:55-10:20 and
+   16:55-17:20 MSK, and also refuses when `j4b-refresh.service` is active.
+
+### Recommended schedule
+
+| Run | Time (MSK) | Purpose | Cap |
+| --- | --- | --- | --- |
+| Primary | 18:15 daily | full day's reports after the 17:00 refresh finishes | 300 GETs |
+| Optional catch-up | 09:30 daily | late-evening filings before the 10:00 refresh | 100 GETs |
+
+The primary run is deliberately placed 75 minutes after the 17:00 refresh: the
+2026-10-16 incident showed that publish phase can run past 17:15, and the guard
+alone only covers the window, not an overrunning job. Expected steady-state
+load is ~150-200 GETs (about 6-8 minutes) because the 3-day window rotates.
+
+Do not schedule at 10:00 or 17:00, and do not run the pilot's full-month
+discovery as a daily job: the daily mode needs only the 3-day window.

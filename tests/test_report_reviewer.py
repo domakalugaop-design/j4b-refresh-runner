@@ -73,3 +73,23 @@ def test_duplicate_staff_controls_are_ambiguous():
 def test_missing_selected_display_text_fails_closed():
     with pytest.raises(ReportCorrectorParseError, match="display text is missing"):
         parse_report_corrector('<select name="staff"><option value="17" selected></option></select>')
+
+def test_zero_placeholder_means_not_assigned():
+    result = parse_report_corrector(
+        '<select name="staff"><option value="0"></option>'
+        '<option value="0" selected></option>'
+        '<option value="149804">Synthetic Reviewer</option></select>'
+    )
+    assert result.state == "EMPTY"
+    assert result.corrector_id is None
+    assert result.corrector_fio is None
+
+
+def test_zero_padded_placeholder_means_not_assigned():
+    result = parse_report_corrector('<select name="staff"><option value="000" selected>—</option></select>')
+    assert result.state == "EMPTY"
+
+
+def test_selected_zero_with_text_is_still_not_assigned():
+    result = parse_report_corrector('<select name="staff"><option value="0" selected>не выбрано</option></select>')
+    assert result.state == "EMPTY"

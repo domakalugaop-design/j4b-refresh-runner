@@ -125,7 +125,10 @@ def parse_report_corrector(html: str) -> ReportCorrector:
     option = selected[0]
     employee_id = (option.value or "").strip()
     display_name = _normalized_text(option.text_parts)
-    if not employee_id:
+    # The portal renders "not selected" as the placeholder option value="0"
+    # with an empty label; it is the same value as the first option, so a
+    # zero/blank id means no corrector was assigned, not a malformed control.
+    if not employee_id.strip("0"):
         return ReportCorrector("EMPTY")
     if not re.fullmatch(r"[0-9]+", employee_id):
         raise ReportCorrectorParseError("selected staff ID is not numeric")

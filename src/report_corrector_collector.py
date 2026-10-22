@@ -23,7 +23,7 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from html.parser import HTMLParser
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Collection, Iterable, Mapping
 
 from .report_reviewer import ReportCorrectorParseError, parse_report_corrector
 
@@ -223,9 +223,14 @@ def merge_candidates(state: dict[str, Any], report_ids: Iterable[str], *, discov
 
 def pending_report_ids(
     state: Mapping[str, Any], now: datetime, max_items: int, *,
-    recheck_after: timedelta,
+    recheck_after: timedelta, scope: Collection[str] | None = None,
 ) -> list[str]:
-    """Return unresolved IDs first, then entries whose recheck interval elapsed."""
+    """Return unresolved IDs first, then entries whose recheck interval elapsed.
+
+    ``scope`` restricts selection to an explicit set of report IDs, which lets a
+    caller process a bounded period (a pilot window or today's new reports)
+    without touching the rest of the inventory.
+    """
     _require_state(state)
     if max_items <= 0:
         raise CollectorError("max_items must be positive")
@@ -233,10 +238,13 @@ def pending_report_ids(
         raise CollectorError("now must be timezone-aware")
     if recheck_after.total_seconds() <= 0:
         raise CollectorError("recheck interval must be positive")
+    allowed = None if scope is None else {str(value) for value in scope}
     now_text = now.astimezone(timezone.utc).isoformat()
     fresh: list[str] = []
     due: list[tuple[str, str]] = []
     for report_id, entry in state["reports"].items():
+        if allowed is not None and report_id not in allowed:
+            continue
         if entry.get("last_attempt_status") == "DATE_OUT_OF_RANGE":
             continue
         next_attempt = entry.get("next_attempt_at")
@@ -319,6 +327,7 @@ def collect_batch(
     state: dict[str, Any], fetch_html: Callable[[str], str], now: datetime, *,
     max_fetches: int, recheck_after: timedelta, save: Callable[[Mapping[str, Any]], None],
     request_interval_seconds: float = 1.2, sleep: Callable[[float], None] | None = None,
+    scope: Collection[str] | None = None,
 ) -> dict[str, int]:
     """Fetch due report detail pages, persisting after every terminal result."""
     import time as _time
@@ -326,7 +335,9 @@ def collect_batch(
     sleep = sleep or _time.sleep
     if request_interval_seconds <= 0:
         raise CollectorError("request interval must be positive")
-    selected = pending_report_ids(state, now, max_fetches, recheck_after=recheck_after)
+    selected = pending_report_ids(
+        state, now, max_fetches, recheck_after=recheck_after, scope=scope,
+    )
     counts = {"attempted": 0, "passed": 0, "failed": 0, "below_start": 0}
     for report_id in selected:
         if counts["attempted"]:

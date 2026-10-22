@@ -202,6 +202,46 @@ class InventoryStateTests(unittest.TestCase):
         store_out_of_scope(state, "665134", NOW)
         self.assertEqual(pending_report_ids(state, NOW + timedelta(days=30), 5, recheck_after=RECHECK), [])
 
+    def test_scope_restricts_selection_to_one_window(self) -> None:
+        state = ready_state("100", "200", "300", "400")
+        scoped = pending_report_ids(state, NOW, 10, recheck_after=RECHECK, scope={"200", "400"})
+        self.assertEqual(scoped, ["200", "400"])
+
+    def test_scope_ignores_ids_outside_inventory(self) -> None:
+        state = ready_state("100")
+        self.assertEqual(pending_report_ids(state, NOW, 5, recheck_after=RECHECK, scope={"999"}), [])
+
+    def test_scope_still_respects_backoff_and_out_of_scope(self) -> None:
+        state = ready_state("100", "200")
+        store_failure(state, "100", "HTTP_ERROR", NOW)
+        store_out_of_scope(state, "200", NOW)
+        self.assertEqual(pending_report_ids(state, NOW, 5, recheck_after=RECHECK, scope={"100", "200"}), [])
+
+    def test_scope_preserves_unresolved_first_ordering(self) -> None:
+        state = ready_state("100", "200")
+        store_detail(state, parse_report_detail(action_html("100"), "100"), NOW, recheck_after=RECHECK)
+        ordered = pending_report_ids(state, NOW + timedelta(hours=7), 5,
+                                     recheck_after=RECHECK, scope={"100", "200"})
+        self.assertEqual(ordered, ["200", "100"])
+
+    def test_collect_batch_with_scope_touches_only_that_window(self) -> None:
+        state = ready_state("100", "200", "300")
+        fetched: list[str] = []
+
+        def fetch(report_id: str) -> str:
+            fetched.append(report_id)
+            return action_html(report_id, dt="21.10.2026")
+
+        counts = collect_batch(
+            state, fetch, NOW, max_fetches=10, recheck_after=RECHECK,
+            save=lambda payload: None, request_interval_seconds=1.0,
+            sleep=lambda _: None, scope={"200"},
+        )
+        self.assertEqual(fetched, ["200"])
+        self.assertEqual(counts["passed"], 1)
+        self.assertIsNone(state["reports"]["100"]["detail"])
+        self.assertIsNone(state["reports"]["300"]["detail"])
+
     def test_merge_rejects_unknown_state_version(self) -> None:
         state = new_state()
         state["version"] = 2
