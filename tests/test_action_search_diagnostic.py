@@ -126,6 +126,16 @@ def test_auth_redirect_is_classified_and_not_parsed_as_search_result():
     assert summary.result_rows == 0
 
 
+def test_non_200_response_stops_before_html_parse():
+    summary = summarize_action_response(
+        http_status=500, content_type="text/html", body=b"<table><tr><td>x</td></tr></table>",
+        final_url="https://lk.j4b.ru/action", expected_host="lk.j4b.ru",
+    )
+    assert summary.failure_category == "HTTP_ERROR"
+    assert not summary.html_parsed
+    assert summary.result_rows == 0
+
+
 def test_diagnostic_emits_no_stdout_or_stderr(capsys):
     render_diagnostic(_summary(b"<table><tr><td>PRIVATE-FIO</td></tr></table>"))
     captured = capsys.readouterr()

@@ -84,7 +84,6 @@ class _ActionDOM(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.table_stack: list[dict] = []
         self.table_count = 0
-        self.completed_rows = 0
         self.result_rows = 0
         self.ids = {kind: set() for kind in ("action", "visit", "proj", "report")}
         self.pagination = False
@@ -148,7 +147,6 @@ class _ActionDOM(HTMLParser):
             if cells and all(kind == "th" for kind, _ in cells):
                 self._headers = [value[:120] for _, value in cells]
             elif cells:
-                self.completed_rows += 1
                 if self._row_link_kinds.intersection({"action", "visit", "proj"}):
                     self.result_rows += 1
                 for index, (_, value) in enumerate(cells):
@@ -221,6 +219,8 @@ def summarize_action_response(
     )
     if url_failure != "NONE":
         return _replace(empty, failure_category=url_failure)
+    if int(http_status) != 200:
+        return _replace(empty, failure_category="HTTP_ERROR")
     if not body:
         return _replace(empty, failure_category="EMPTY_RESPONSE")
     if "html" not in content_type.lower():
@@ -236,7 +236,7 @@ def summarize_action_response(
     date_semantics = next(iter(parser._date_meanings)) if len(parser._date_meanings) == 1 else "UNCONFIRMED"
     date_min = min(parser._dates).isoformat(sep=" ") if parser._dates and date_semantics != "UNCONFIRMED" else "UNKNOWN"
     date_max = max(parser._dates).isoformat(sep=" ") if parser._dates and date_semantics != "UNCONFIRMED" else "UNKNOWN"
-    rows = parser.result_rows or parser.completed_rows
+    rows = parser.result_rows
     return ActionSearchSummary(
         **{
             **asdict(empty), "html_parsed": True, "result_tables": parser.table_count,
