@@ -243,6 +243,33 @@ def test_status_39_rate_is_null_when_no_known_status_denominator_exists():
     assert controller["status_39_visit_share"] is None
 
 
+@pytest.mark.parametrize(("visit_total", "status_39_total", "expected_share"), [
+    (500, 5, 0.01),
+    (50, 5, 0.10),
+])
+def test_visit_claim_share_uses_same_distinct_visit_denominator(
+    visit_total, status_39_total, expected_share,
+):
+    reports = [
+        report(str(i + 1), visit_id=str(i + 1), project_id="10")
+        for i in range(visit_total)
+    ]
+    actions = [
+        action(visit=str(i + 1), action_id=str(i + 1), codes=[39] if i < status_39_total else [])
+        for i in range(visit_total)
+    ]
+    candidate = build_candidate(
+        reports, actions, queried_project_ids={"10"},
+        generation_id="9" * 32, source_snapshot_at=NOW.isoformat(),
+    )
+
+    result = summarize_observed_metrics(candidate)["overall"]
+
+    assert result["eligible_visits"] == visit_total
+    assert result["status_39_visits"] == status_39_total
+    assert result["status_39_visit_share"] == pytest.approx(expected_share)
+
+
 def test_collector_failure_blocks_but_success_with_no_new_rows_is_accepted():
     zero = {**COLLECTOR, "collector_result": "SUCCESS_NO_NEW_RECORDS"}
     assert validate_collector_success(zero, now=NOW) == "SUCCESS_NO_NEW_RECORDS"

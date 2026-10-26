@@ -127,3 +127,11 @@
 ### Fixture/регрессионная проверка метрик
 
 `src.controller_quality_mart.summarize_observed_metrics` проверяет агрегаты на одном candidate generation и не делает сетевых запросов. Тестовый fixture включает status 39, known absence, полностью unknown status, повторные report rows одного composite visit и одного визита, связанного с разными контролёрами. Проверяются distinct grains, same-grain denominators, неаддитивность grouped visits и сохранение `NULL` при нулевом знаменателе. Эти synthetic fixtures являются только unit tests; они не являются опубликованными наблюдениями.
+
+## Тестовая публикация и dashboard — уточнение 2026-10-26
+
+Ранее в документе описан feasibility review до создания тестовой витрины. После owner-approved historical backfill TEST workbook содержит реальные accumulated records; private DataLens connection, два датасета и отдельный TEST dashboard созданы и проверены. Это не изменяет ограничение полноты source: 722 уникальных отчёта/визита за `report_date` 2026-10-01—2026-10-25, 22 контролёра и 57 проектов — наблюдаемая выборка, а не полная совокупность Portal.
+
+В этой генерации текущая status-39 membership = 0 из 719 composite visits с известной membership; 3 визита имеют `UNKNOWN` и не считаются отсутствием статуса. Наблюдаемая доля = 0/719. Значение не является Portal-wide долей претензий: ранее обнаруженный реальный report с code 39 отсутствовал в source/checkpoint. Dashboard использует только report filing date как дату фильтра; это не дата визита, review или претензии. Четыре `last_successful_fetch` значения — provenance строк, а не четыре независимых дневных снимка. Status trend, baseline/moving average и среднее по интервалу остаются `NOT_AVAILABLE`.
+
+Regression fixtures теперь также фиксируют однозначные примеры для одной и той же формулы: 5 status-39 visits / 500 eligible visits = 1%, и 5 / 50 = 10%. Это искусственные unit-test inputs и не входят в опубликованный workbook.
