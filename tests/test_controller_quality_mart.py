@@ -52,6 +52,13 @@ def test_exact_schemas_and_source_id_normalization():
     assert tuple(candidate["metric_dictionary"][0]) == METRIC_DICTIONARY_COLUMNS
     assert any(row[2] == "status_39_reports" and "не ошибка контролёра" in row[7]
                for row in candidate["metric_dictionary"][1:])
+    dictionary = {row[2]: row for row in candidate["metric_dictionary"][1:]}
+    assert dictionary["status_39_avg_per_project"][6] == "AVAILABLE_IN_OBSERVED_SNAPSHOT"
+    assert dictionary["status_39_avg_per_controller_association"][6] == "AVAILABLE_IN_OBSERVED_SNAPSHOT"
+    for metric in ("status_39_avg_per_calendar_interval", "status_39_mean_rate_by_period",
+                   "status_39_period_change_pp", "status_39_moving_average",
+                   "project_name", "visit_date"):
+        assert dictionary[metric][6] == "NOT_AVAILABLE"
     assert set(candidate) == set(TAB_SCHEMAS)
     assert candidate["controller_report_snapshot"][1][13] == "OBSERVED_PRESENT"
 
@@ -211,11 +218,18 @@ def test_observed_workload_and_status_39_metrics_use_correct_grains_and_denomina
         "eligible_visits": 2,
         "status_39_visits": 1,
         "status_39_visit_share": pytest.approx(1 / 2),
+        "projects_with_known_status": 2,
+        "status_39_visits_per_project_avg": pytest.approx(1 / 2),
+        "controllers_with_known_status": 2,
+        "status_39_visit_controller_associations": 1,
+        "status_39_visit_associations_per_controller_avg": pytest.approx(1 / 2),
     }
     assert result["by_controller"]["42"]["status_39_reports"] == 1
     assert result["by_controller"]["42"]["status_39_report_share"] == pytest.approx(1 / 2)
     assert result["by_controller"]["43"]["eligible_reports"] == 1
     assert result["by_controller"]["43"]["status_39_report_share"] == 0
+    assert result["by_project"]["10"]["status_39_visits_per_project_avg"] == pytest.approx(1)
+    assert result["by_project"]["11"]["status_39_visits_per_project_avg"] == 0
     # The same visit is associated with both controllers, so grouped distinct
     # visit totals overlap and must not be summed into an overall total.
     assert result["by_controller"]["42"]["observed_visits"] == 2
@@ -241,6 +255,8 @@ def test_status_39_rate_is_null_when_no_known_status_denominator_exists():
     assert controller["eligible_visits"] == 0
     assert controller["status_39_visits"] is None
     assert controller["status_39_visit_share"] is None
+    assert controller["status_39_visits_per_project_avg"] is None
+    assert result["overall"]["status_39_visit_associations_per_controller_avg"] is None
 
 
 @pytest.mark.parametrize(("visit_total", "status_39_total", "expected_share"), [

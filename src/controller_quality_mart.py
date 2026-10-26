@@ -62,6 +62,14 @@ METRIC_DICTIONARY = (
     ("status_39_by_project", "Статус 39 по проектам", "Distinct observed reports and visit keys with status_39 grouped by project_id", "controller_report_snapshot.project_id,status_39,report_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Наблюдаемый snapshot; не полный клиентский claim register"),
     ("status_39_rate_by_controller", "Доля статуса 39 по контролёру", "Status-39 eligible report or visit entities divided by same-grain known-status entities for the associated corrector", "controller_report_snapshot.corrector_id,status_39", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Не рейтинг качества; NULL при нулевом знаменателе; UNKNOWN не превращается в 0"),
     ("status_39_rate_by_project", "Доля статуса 39 по проекту", "Status-39 eligible report or visit entities divided by same-grain known-status entities in the project", "controller_report_snapshot.project_id,status_39", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Не полный claim rate Portal; NULL при нулевом знаменателе"),
+    ("status_39_avg_per_project", "Среднее число визитов со статусом 39 на представленный проект", "Distinct current status-39 composite visits / represented projects with at least one known-status visit", "controller_report_snapshot.status_39,project_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Среднее по представленным проектам с известным статусом; не полная совокупность Portal; NULL при пустом знаменателе"),
+    ("status_39_avg_per_controller_association", "Среднее число ассоциаций визитов со статусом 39 на контролёра", "Sum of per-controller distinct status-39 composite visit associations / controllers with at least one known-status visit", "controller_report_snapshot.corrector_id,status_39,project_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Ассоциативный показатель: один визит у нескольких контролёров учитывается в каждой их группе, но не суммируется как уникальная претензия компании"),
+    ("status_39_avg_per_calendar_interval", "Среднее число визитов со статусом 39 за календарный интервал", "Requires dated status snapshots and known complete interval coverage", "NOT_AVAILABLE", "NOT_AVAILABLE", "Имеются текущая membership и дата подачи отчёта, но нет независимых датированных снимков/полноты по дням или месяцам"),
+    ("status_39_mean_rate_by_period", "Средняя доля статуса 39 за период", "Requires one independently captured same-grain status rate per complete interval", "NOT_AVAILABLE", "NOT_AVAILABLE", "Не усреднять статусы текущего снимка по report_date: это не дата визита или возникновения претензии"),
+    ("status_39_period_change_pp", "Изменение доли статуса 39 к предыдущему периоду, п.п.", "Current-period rate minus comparable prior-period rate from independent snapshots", "NOT_AVAILABLE", "NOT_AVAILABLE", "Нет подтверждённых сопоставимых исторических снимков"),
+    ("status_39_moving_average", "Скользящая доля статуса 39", "Requires at least 7 complete daily or 3 complete monthly independent status snapshots", "NOT_AVAILABLE", "NOT_AVAILABLE", "Недостаточно исторических снимков и подтверждения календарной полноты"),
+    ("project_name", "Название проекта", "No qualified project-name field is populated in this mart source", "NOT_AVAILABLE", "NOT_AVAILABLE", "Использовать project_id; не подтягивать неподтверждённое имя"),
+    ("visit_date", "Дата визита", "No qualified visit business-date field is present in the source", "NOT_AVAILABLE", "NOT_AVAILABLE", "report_date is the report filing date, not visit_date"),
     ("unusually_high_claim_rate", "Необычно высокая доля претензий", "No approved threshold, minimum sample size, or complete project population", "NOT_AVAILABLE", "NOT_AVAILABLE", "Не ранжировать и не присваивать риск по неполному наблюдаемому snapshot"),
     ("individual_client_claim_count", "Количество отдельных претензий клиентов", "Workflow status membership does not count separate claim records", "NOT_AVAILABLE", "NOT_AVAILABLE", "Одна сущность/визит может иметь более одной претензии; отдельный claim ID/source отсутствует"),
     ("controller_remarks", "Замечания контролёров к отчётам", "No verified mechanism is available and this subject is out of scope", "NOT_AVAILABLE", "NOT_AVAILABLE", "Не выводить из workflow status"),
@@ -409,6 +417,9 @@ def summarize_observed_metrics(candidate: Mapping[str, list[list[Any]]]) -> dict
             key for key, members in visits.items()
             if any(row[status_index] == "OBSERVED_PRESENT" for row in members)
         }
+        projects_with_known_status = {
+            str(row[project_index]) for row in rows if row[status_index] in known
+        }
         return {
             "observed_reports": len(reports),
             "observed_visits": len(visits),
@@ -422,6 +433,11 @@ def summarize_observed_metrics(candidate: Mapping[str, list[list[Any]]]) -> dict
             "status_39_visit_share": (
                 len(status39_visits) / len(eligible_visits) if eligible_visits else None
             ),
+            "projects_with_known_status": len(projects_with_known_status),
+            "status_39_visits_per_project_avg": (
+                len(status39_visits) / len(projects_with_known_status)
+                if projects_with_known_status else None
+            ),
         }
 
     by_controller_rows: dict[str, list[list[Any]]] = defaultdict(list)
@@ -432,12 +448,28 @@ def summarize_observed_metrics(candidate: Mapping[str, list[list[Any]]]) -> dict
             by_controller_rows[controller_id].append(row)
         by_project_rows[str(row[project_index])].append(row)
 
+    by_controller = {key: bucket(value) for key, value in sorted(by_controller_rows.items())}
+    controllers_with_known_status = sum(
+        1 for metrics in by_controller.values() if metrics["eligible_visits"]
+    )
+    controller_status39_associations = sum(
+        metrics["status_39_visits"] or 0 for metrics in by_controller.values()
+    )
+    overall = bucket(report_rows)
+    overall["controllers_with_known_status"] = controllers_with_known_status
+    overall["status_39_visit_controller_associations"] = (
+        controller_status39_associations if controllers_with_known_status else None
+    )
+    overall["status_39_visit_associations_per_controller_avg"] = (
+        controller_status39_associations / controllers_with_known_status
+        if controllers_with_known_status else None
+    )
     return {
         "coverage": "OBSERVED_CORRECTOR_SNAPSHOT_ONLY",
         "controllers_count": len(by_controller_rows),
         "projects_count": len(by_project_rows),
-        "overall": bucket(report_rows),
-        "by_controller": {key: bucket(value) for key, value in sorted(by_controller_rows.items())},
+        "overall": overall,
+        "by_controller": by_controller,
         "by_project": {key: bucket(value) for key, value in sorted(by_project_rows.items())},
         "controller_visit_totals_additive": False,
         "controller_project_totals_additive": False,
