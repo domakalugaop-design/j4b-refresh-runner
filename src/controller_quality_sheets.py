@@ -80,6 +80,23 @@ class GoogleSheetsGateway:
         )
         self._request("PUT", url, {"values": [list(row) for row in rows]})
 
+    def add_sheet(self, title: str) -> None:
+        """Create a new tab; refuse when an equivalent tab already exists."""
+        if title in self.titles():
+            raise MartError(f"tab already exists: {title}")
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}"
+            ":batchUpdate"
+        )
+        self._request("POST", url, {"requests": [{"addSheet": {"properties": {"title": title}}}]})
+
+    def ensure_headers(self, title: str, header: list[str]) -> None:
+        """Write the header row only when the tab is empty."""
+        existing = self.read_range(title, "A1:Z1")
+        if existing and existing[0]:
+            raise MartError(f"tab is not empty: {title}")
+        self.update(title, "A1", [header])
+
 
 def read_report_reviewer_source(gateway: GoogleSheetsGateway) -> list[dict[str, str]]:
     """Read the source tab and enforce its exact header before mapping rows."""
