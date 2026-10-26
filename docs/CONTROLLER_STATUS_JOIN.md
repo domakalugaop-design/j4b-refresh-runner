@@ -20,30 +20,45 @@ Spreadsheet `14PRG3HXsZaN4pVwV390PpMMqHupCW5j6RyI6HBzPQR8`, лист `report_rev
 | Checkpoint schema / published IDs | schema 2 / 722 |
 | Совпадение множества report_id sheet ↔ checkpoint | полное; sheet-only=0, checkpoint-only=0 |
 | Максимальный `last_successful_fetch` | 2026-10-25 15:15:11.582 UTC (18:15:11 MSK) |
+| Проекты отчётов, присутствующие в `projects_current` / `Статусы проектов` | 57/57 |
+| Эти проекты с mapping в `project_types` | 56/57 |
 
 Колонки подтверждены заголовком листа: `report_id, action_id, visit_id, project_id, report_date, corrector_id, corrector_fio, source_status, last_successful_fetch`.
 
 ### Ограничение покрытия
 
-722/722 — покрытие только строк, которые попали в опубликованный corrector-only набор. Код сборщика намеренно исключает записи без положительного corrector_id. Поэтому это **не** доля назначений контролёров среди всех portal reports и не доля действительно завершённых проверок. Отчёты без контролёра нельзя посчитать по опубликованной вкладке.
+722/722 — покрытие только строк, которые попали в опубликованный corrector-only набор. Код сборщика намеренно исключает записи без положительного corrector_id. Ограниченный portal GET по report_id из checkpoint с `NO_CORRECTOR` вернул `staff=EMPTY`, и такой report отсутствует в `report_reviewers` по конструкции. Поэтому это **не** доля назначений контролёров среди всех portal reports и не доля действительно завершённых проверок. Отчёты без контролёра нельзя посчитать по опубликованной вкладке.
 
-## Карта JOIN
+## Карта JOIN и проверенная cardinality
 
 ```text
-report_reviewers.report_id  -- verified 722/722 equal --> report_reviewers.action_id
-       |                                                       |
-       | report_id/action_id                                   | action action row
-       |                                                       v
-       +----------------------------------------------> portal /action/{id}
+report_reviewers.report_id == report_reviewers.action_id
        |
-       +--> visit_id --> portal visit/workflow membership (1:1 only in observed sheet)
-       +--> project_id --> project dimension
+       +-- exact action key --> portal action row (limited samples validated)
+       |                            \
+       |                             +-- workflow memberships (multiple per action possible)
+       |
+       +-- project_id + visit_id --> payment visit aggregate (720/722 match)
+       |                                (no action_id; may combine multiple actions)
+       +-- project_id --> project dimension / project-level status aggregates
 ```
 
-- **CONFIRMED:** на текущих 722 опубликованных строках report_id/action_id совпадают, каждый visit_id уникален в этой конкретной выборке.
-- **PARTIAL:** `docs/REPORT_CORRECTORS.md` описывает `/action/{id}` как detail route, который связывает тот же report ID, project и visit; `/report/{id}` направляет обратно в listing. Это основано на прежних ограниченных live checks, а не на новых portal requests этого исследования.
-- **UNKNOWN:** на уровне всего портала связь 1:1 report↔visit/action, включая записи без текущего контролёра, не доказана.
-- **Важно:** tab `Статусы проектов` содержит агрегаты по project_id; его нельзя напрямую JOIN-ить к 722 строкам report_reviewers и трактовать как report status. Переход к visit-level membership требует отдельного набора и проверки grain.
+- **CONFIRMED:** на текущих 722 строках `report_id==action_id`; ограниченные live samples для кодов 35, 38, 39, 40 подтвердили detail route, который связывает report/action с одним visit и project.
+- **CONFIRMED:** отдельный no-corrector checkpoint sample вернул `staff=EMPTY`; отсутствие записи на corrector-only листе ожидаемо, но сам лист не измеряет их количество.
+- **CONFIRMED:** JOIN по `(project_id, visit_id)` к `Выплаты по визитам` даёт 720/722 matches, 2 unmatched, 0 multiple matches на этих строках. В payment tab все 88,864 composite keys уникальны; 5 `visit_id` повторяются между разными project_id.
+- **CONFIRMED:** оба unmatched report visits присутствуют в portal action search. Для одного visit обнаружены две action/report записи: старый report/action с code 15 и report_date 2026-09-24 (action_id отличается от current report_id) и отдельный current report/action с code 50 и report_date 2026-10-01 (совпадает с sheet). У второго unmatched visit найден current report/action с code 50. Оба current reports имеют corrector.
+- **UNKNOWN:** точная причина отсутствия двух visit keys в `Выплаты по визитам`. По коду этот лист формируется только из payment assignments с qualified visit mapping; это вероятный класс причины, но не доказательство по каждой записи.
+- **CONFIRMED:** все 57 проектов из `report_reviewers` присутствуют в `projects_current` и `Статусы проектов`; 56 имеют `project_types` mapping.
+- **Важно:** у одного visit может быть несколько action/report records. JOIN по одному `visit_id` к action-level statuses может размножить строки и приписать code 15 старому report current report. Для report-level metrics нужен action/report ID; для бизнес-агрегации одной операции используйте distinct `(project_id, visit_id)` после явного выбора report/version.
+- **Важно:** `Статусы проектов` — project aggregate. `Выплаты по визитам` — payment-scoped visit aggregate без action_id. Ни одну из них нельзя напрямую считать полной report-level status table.
+
+## Статусные membership counts в текущем corrector sample
+
+Среди 720 report-reviewer keys, совпавших с payment visit table, current `workflow_state_codes` дают: code 35 — 7; 38 — 1; 39 — 0; 37 — 0; 40 — 696; 50 — 139. Counts пересекаются и не складываются. Все 720 matched visits имеют как минимум один код из {37,40,50}; это согласуется с кодовой формулой `finished_visits`, но не доказывает completed review именно контролёром. Два unmatched reports в ограниченном portal check имеют current code 50.
+
+Есть зафиксированный пробел покрытия: найденный live report/action с code 39, датой 2026-10-17 и выбранным corrector отсутствует в checkpoint и `report_reviewers`; date-filtered registry read тем же DMY форматом не вернул его (144 других IDs за день). Поэтому 722-строчная вкладка не полна по отношению к порталу.
+
+Sum code 39 в nonblank project aggregate rows `projects_current` и `Статусы проектов` = 32; workflow fields заполнены только для 617/8,088 projects, поэтому это не complete portal total. `Выплаты по визитам` содержит code39 membership на 50 visit keys в payment-scoped population. Эти populations/grains не совпадают. Ни одно значение нельзя использовать как окончательный report-level numerator без reconciliation.
 
 ## Поля контролёра и временная атрибуция
 
@@ -56,7 +71,7 @@ report_reviewers.report_id  -- verified 722/722 equal --> report_reviewers.actio
 
 ## Дедупликация и безопасность JOIN
 
-На наблюдённой вкладке ключ `report_id` уникален. Но workflow membership допускает несколько разных `workflow_state_code` на один visit (ключ членства включает код). Поэтому при JOIN событий к отчётам одна строка отчёта может размножиться на несколько состояний. Для count metrics потребуется `COUNT(DISTINCT report_id)` на конкретном статусе либо отдельная event fact; суммы обычных строк без дедупликации запрещены.
+На наблюдённой вкладке `report_id` уникален. Но у одной report/action row может быть несколько workflow membership codes одновременно; live sample показал 35+40 для одной записи и 38+40 для другой. Также один visit может иметь несколько action/report IDs. При JOIN по visit ID строки могут размножиться/смешать версии; счётчики строить по точному report/action ID, а бизнес-агрегацию — через `COUNT(DISTINCT project_id, visit_id)` после определения выбранной версии. Membership codes не являются transition rows.
 
 Canonical ID при объединении: нормализованный decimal string (`str(report_id)`), с проверкой только цифр и сохранением исходного значения для readback. Не выполнять нестрогий join по display name.
 

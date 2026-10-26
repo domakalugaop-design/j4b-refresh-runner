@@ -4,7 +4,7 @@
 
 ## Результат feasibility
 
-На текущих данных нельзя надёжно посчитать ни число **завершённых** контролёром проверок, ни долю претензий/возвратов от проверенных отчётов. Доступна актуальная связь report → выбранный corrector для 722 опубликованных записей, но факт завершения и report-level статусы/история не подтверждены.
+На текущих данных можно подтвердить текущую связь report/action → выбранный corrector для 722 опубликованных строк и найти workflow memberships на уровне action/visit. Но числитель/знаменатель для полного дашборда **не готовы**: report registry пропустил как минимум один реальный October report с code 39 и выбранным контролёром; `Выплаты по визитам` не покрывает 2 из 722 current report/visit keys; status aggregation различается между вкладками; review timestamp и history transitions отсутствуют.
 
 `source_status=CURRENT` в `report_reviewers` — статус получения/свежести corrector field, а не исходный статус отчёта. Использовать его как «отчёт проверен» нельзя.
 
@@ -12,16 +12,17 @@
 
 | Показатель | Предлагаемое определение | Необходимые данные | Feasibility / полнота | Риск интерпретации |
 |---|---|---|---|---|
-| Проверено контролёром | DISTINCT report_id с подтверждённым event/result завершения проверки, атрибутированным corrector_id на момент завершения | completion event/status + corrector_id + `reviewed_at` | **UNKNOWN / пока не считается**; current «Проверил» field может быть назначением | Выдать назначенные отчёты за завершённые проверки |
-| Отчёты со статусом 39 | DISTINCT report_id, связанный с подтверждённым report status 39 по заранее выбранному временному окну | report_id ↔ report status; event history для `EVER_HAD_STATUS` | **NOT FEASIBLE сейчас**; обнаружен workflow code 39 «Есть претензия» на другом grain | Смешать visit-level predicate с report status; принять наличие претензии за ошибку контролёра |
-| Возврат ТП на замечания | DISTINCT report_id с подтверждённым status/event возврата ТП | точный status_id/label, report_id, время перехода | **UNKNOWN**; 38 «Вопрос координатору» не подходит по имени, 35 «Анкета отклонена» не подтверждён как возврат ТП | Присвоить статусу смысл по похожему названию |
-| Повторные проверки/возвраты | число подтверждённых событий возврата/повторной проверки на report_id | append-only transitions с event_id, status before/after, timestamp | **NOT FEASIBLE** без истории | Текущий статус не позволяет восстановить повторные переходы |
-| Доля претензий/возвратов | числитель distinct report_id с указанным событием / знаменатель завершённых проверок в сопоставимой когорте | валидные status events + completed reviews + одна дата-база | **NOT FEASIBLE** пока нет обеих частей | Смешать дату визита, filing, review и claim; искусственно увеличить долю за счёт нескольких событий |
-| Список отчётов для каждого показателя | drilldown distinct report_id + статус/event + дата + проверенная source URL | report_id, source event, timestamp, `/action/{id}` | report/corrector link **PARTIAL**; status/event list **BLOCKED** | Ссылка ведёт на action detail, а не доказывает статус/завершение |
+| Проверено контролёром | DISTINCT business operation key с подтверждённым review completion; attribution corrector на action/report к моменту review | review event/result + report/action + corrector_id + `reviewed_at` | **PARTIAL:** existing `finished_visits` predicate = any `{37,40,50}` доступен в project aggregates; в current controller sample 720/720 payment-matched rows имеют один из этих кодов, а два unmatched live reports имеют 50. Это не подтверждает время/actor завершения. | Не подменять confirmed review event текущим selected `staff` или payment/approval state |
+| Reports with current code 39 | DISTINCT operation/report key с code39 membership в текущем action snapshot | action_id/report_id, visit/project, status membership snapshot time | **PARTIAL:** один live report/action sample с `Есть претензия`, выбранным corrector и report date 2026-10-17 подтверждён; он отсутствует в checkpoint, sheet и date-filtered report registry. В 720 matched current rows code39=0; в 2 unmatched report rows live status50. | Coverage gap делает sheet numerator неполным; code39 не доказывает ошибку корректора |
+| Reports that ever had 39 | DISTINCT report/business operation with retained code39 history | complete event history / guaranteed historical status set | **UNKNOWN / NOT COMPUTABLE:** current memberships have no transition timestamps or completeness guarantee | Не трактовать current membership как `EVER_HAD_STATUS` |
+| Shopper remarks / returned to shopper | DISTINCT report/action with a validated return-to-shopper status/event | approved status ID/label, report/action key, event timestamp/reason | **BLOCKED:** code35=`Анкета отклонена` (7 matched current report rows), code38=`Вопрос координатору` (1); live samples confirm IDs and corrector link, но это не подтверждает shopper-return semantics | Нельзя переименовывать по похожему смыслу без SME/portal evidence |
+| Repeat returns / rechecks | count of distinct validated return/recheck transitions | immutable event ID, previous/new status, changed_at, report_id | **NOT FEASIBLE** без transition log | Observed one visit with two distinct report/action records (old status15 / later status50) is not itself a repeated transition |
+| Share of claims/returns | distinct operations with validated numerator / completed reviews in the same cohort | accepted status semantics + complete report coverage + completion event/date | **BLOCKED** | source-date mismatch and registry miss make a polished percentage false precision |
+| Report drilldown | exact report_id/action_id + relevant membership/event + source link | report/action link and membership/event source | **PARTIAL:** `/action/{id}` works for sampled links; specific report can be absent from corrector sheet/registry | Link existence does not prove event history or full coverage |
 
 ## `CURRENT_STATUS`, `EVER_HAD_STATUS`, `STATUS_TRANSITION_COUNT`
 
-- `CURRENT_STATUS` должен приходить из актуального report-level status field/endpoint с `as_of_at`. В наличии текущая workflow агрегатная витрина и corrector snapshot; report current status не найден.
+- `CURRENT_STATUS` сейчас корректнее представлять как **набор workflow membership codes на action/report row с `as_of_at`**, не single exclusive status: live samples показали одновременные code sets `{35,40}` и `{38,40}`. Report-level status field отдельно не найден.
 - `EVER_HAD_STATUS` требует непрерывной истории или гарантии, что текущая запись содержит весь период. Такой контракт не подтверждён.
 - `STATUS_TRANSITION_COUNT` требует одного события на переход, устойчивого event ID и временной сортировки. В текущих источниках этого нет.
 
@@ -29,7 +30,7 @@
 
 ## Знаменатель и когортирование
 
-Базовый знаменатель должен быть **completed reviews**, а не число строк с corrector_id. Текущее поле может означать выбранного/назначенного сотрудника; отдельный marker завершения и дата review пока неизвестны.
+Базовый знаменатель должен быть **completed reviews/business operations**, а не число строк с corrector_id. Текущее поле `staff` («Проверил») само по себе может быть assignment. Кодовая формула существующей project metric `finished_visits` — DISTINCT visits с любым из {37,40,50}; её можно показать как `workflow-finished`, но attribution завершения контролёру и дата review отдельно не зафиксированы.
 
 Нельзя смешивать периоды:
 
@@ -57,11 +58,11 @@
 | Поле/метрика | Приоритетный источник | Почему/ограничение |
 |---|---|---|
 | report_id, action_id, visit_id, project_id, report_date, текущий corrector_id/FIO | `report_reviewers` как материализованный snapshot | Текущая readback-проверка: 722 уникальных ID, 0 дублей, report_id=action_id, schema содержит `last_successful_fetch`; это не completion history |
-| актуальная workflow membership | portal `/action` read-only response, после разрешённой GET-only auth проверки | Код разбирает action rows; нужен отдельный ограниченный sample и связь до report_id. Не считать агрегированную Google вкладку деталями отчётов |
+| актуальная workflow membership | существующий filter POST `/action` (read-only search), только project-scoped; output должен сохранять action_id | Ограниченные live samples подтвердили membership и `action_id==report_id` для выбранных current reports. Одно visit может иметь разные action IDs; join по одному visit может размножить/перепутать статусы |
 | project-level workflow totals | Google Sheets `Статусы проектов` | Быстрый контроль агрегатов по визитам; непригоден для report-level drilldown |
-| report status history / actor / timestamps | PostgreSQL только если будет найден подтверждённый read-only schema/table | В текущем окружении connection/schema не обнаружены; подтверждение от владельца доступа необходимо |
+| report status history / actor / timestamps | В шести вкладках и refresh outputs отсутствуют; sampled action detail не показал transition table | PostgreSQL на этом этапе не нужен и не использовался; если history станет обязательной, сначала квалифицировать отдельный approved read-only source |
 | report URL | портал `https://lk.j4b.ru/action/{report_id}` | Так указано в существующей ограниченной квалификации; перепроверять при переходе к dataset |
 
 ## Статус валидации примеров
 
-В этом исследовании не получены фактические report-level примеры со статусом 39, замечаниями ТП, повторными переходами, отсутствием контролёра и статусом завершения. Их нельзя синтезировать из project-level counters. Текущая опубликованная вкладка содержит только записи с corrector_id; отсутствие контролёра на ней проверить невозможно.
+Ограниченная валидация проведена без вывода ID/FIO: code39 report/action с корректно выбранным контролёром найден напрямую, но отсутствовал в registry/checkpoint/sheet; code35, 38, 40 verified на report-linked action rows; no-corrector checkpoint sample дал portal `staff=EMPTY`; status40/50 reports имеют report links. Это не массовая completeness validation. В опубликованной вкладке нет строк без corrector; отсутствие контролёра в общем portal population по ней не измеряется.
