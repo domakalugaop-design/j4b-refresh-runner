@@ -1,0 +1,23 @@
+[Unit]
+Description=J4B controller-quality mart refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=maxis
+Group=maxis
+WorkingDirectory=/home/maxis/j4b-controller-quality/repo
+EnvironmentFile=/etc/j4b/controller-quality.env
+ExecStart=/home/maxis/j4b-controller-quality/venv/bin/python /home/maxis/j4b-controller-quality/repo/scripts/run_controller_quality_mart.py --publish
+TimeoutStartSec=3600
+Restart=no
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/home/maxis/j4b-refresh-deployment/locks/production.lock

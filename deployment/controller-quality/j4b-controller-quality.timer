@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily J4B controller-quality mart refresh after corrector collection
+
+[Timer]
+OnCalendar=*-*-* 18:30:00 Europe/Moscow
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=j4b-controller-quality.service
+
+[Install]
+WantedBy=timers.target
