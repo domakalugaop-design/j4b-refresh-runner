@@ -183,3 +183,17 @@ claims) and the production collector extension still requiring separate
 owner approval.
 
 This file is the technical pipeline status index; the existing management initiative register remains authoritative.
+
+## 2026-10-26 claims mart stage
+
+The historical claims mart (status-39 episodes from the MariaDB `log` audit
+trail, 90-day window, single consistent snapshot) was built, validated and
+published to the TEST workbook: 10,097 entry events reconciled with the
+discovery baseline, 7,576 in-window episodes, cohort claim rate 20.97% on a
+31,147-visit completed cohort; new TEST tabs `claims_mart_90d` and
+`claims_mart_manifest` with gated, idempotent, read-back-verified
+publication. Full evidence in
+[CLAIMS_MART_90D_ACCEPTANCE_2026-10-26.md](CLAIMS_MART_90D_ACCEPTANCE_2026-10-26.md);
+research contract in
+[STATUS_39_HISTORY_DISCOVERY_2026-10-26.md](STATUS_39_HISTORY_DISCOVERY_2026-10-26.md).
+No production writes or deployment.
