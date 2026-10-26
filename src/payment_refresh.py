@@ -529,7 +529,12 @@ def _payment_write_chunks(requests: list[dict[str, Any]], max_bytes: int) -> lis
                     "range": {**base_range, "startRowIndex": start, "endRowIndex": start + count},
                     "rows": [],
                 }
-                base_size = len(serialize_sheet_payload({"requests": [chunk_request]}).encode("utf-8")) - 2
+                # Keep the empty ``rows: []`` brackets in the base size. The
+                # replacement row payload goes inside those brackets, so the
+                # exact size is base + row bytes + inter-row commas. Dropping
+                # the brackets undercounted every chunk by two bytes and could
+                # admit a request larger than Google's payload limit.
+                base_size = len(serialize_sheet_payload({"requests": [chunk_request]}).encode("utf-8"))
                 estimated_size = base_size + encoded_rows_size + row_size + len(selected)
                 if estimated_size > max_bytes:
                     if not selected:
@@ -544,8 +549,17 @@ def _payment_write_chunks(requests: list[dict[str, Any]], max_bytes: int) -> lis
                 "rows": selected,
             }
             actual_size = len(serialize_sheet_payload({"requests": [result]}).encode("utf-8"))
+            # The estimate is exact for supported RowData, but keep a hard
+            # boundary check and split again if a future serializer change
+            # makes it conservative. Never truncate or mutate an oversized
+            # individual row; fail closed before the first API write.
+            while actual_size > max_bytes and len(selected) > 1:
+                selected.pop()
+                result["updateCells"]["range"]["endRowIndex"] -= 1
+                result["updateCells"]["rows"] = selected
+                actual_size = len(serialize_sheet_payload({"requests": [result]}).encode("utf-8"))
             if actual_size > max_bytes:
-                raise AssertionError("payment chunk byte estimator exceeded configured limit")
+                raise ValueError("single payment row exceeds chunk byte limit")
             chunks.append(result)
             cursor += len(selected)
     return chunks

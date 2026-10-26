@@ -271,6 +271,41 @@ def test_82530_row_visit_payload_is_chunked_under_serialized_size_limit():
                for a, b in zip(chunks, chunks[1:]))
 
 
+def test_chunker_uses_exact_serialized_size_at_two_byte_boundary():
+    from src.payment_refresh import _payment_write_chunks
+    from src.payment_materialization import serialize_sheet_payload
+
+    rows = [{"values": [{"userEnteredValue": {"stringValue": value}}]} for value in ("a", "b")]
+    request = {"updateCells": {
+        "range": {"sheetId": 10, "startRowIndex": 0, "endRowIndex": 2,
+                  "startColumnIndex": 0, "endColumnIndex": 1},
+        "rows": rows, "fields": "userEnteredValue",
+    }}
+    exact_size = len(serialize_sheet_payload({"requests": [request]}).encode("utf-8"))
+
+    chunks = _payment_write_chunks([request], exact_size - 1)
+
+    assert len(chunks) == 2
+    assert all(len(serialize_sheet_payload({"requests": [chunk]}).encode("utf-8")) <= exact_size - 1
+               for chunk in chunks)
+    assert [row for chunk in chunks for row in chunk["updateCells"]["rows"]] == rows
+
+
+def test_oversized_individual_payment_row_fails_before_any_sheet_write():
+    previous = {"visits": [["id", "value"], ["old", "ok"]], "projects": [["id"], ["old"]]}
+    candidate = {"visits": [["id", "value"], ["new", "x" * 500]], "projects": [["id"], ["new"]]}
+    writes = []
+
+    with pytest.raises(ValueError, match="single payment row exceeds chunk byte limit"):
+        publish_payment_pair(
+            sheet_ids={"visits": 1, "projects": 2}, previous=previous, candidate=candidate,
+            write_batch=lambda requests: writes.append(requests),
+            read_tab=lambda tab: previous[tab], max_request_bytes=250,
+        )
+
+    assert writes == []
+
+
 @pytest.mark.parametrize("target_count", [5, 1])
 def test_chunked_publication_larger_and_smaller_than_old_sheet_clears_stale_tail(target_count):
     previous = {"visits": [["id", "amount"], ["old1", 1], ["old2", 2], ["old3", 3]],

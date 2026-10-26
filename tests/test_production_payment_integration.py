@@ -52,17 +52,19 @@ def test_missing_selected_record_blocks_complete_acquisition_gate():
 def test_full_refresh_rollback_restores_core_after_a_later_stage_failure():
     before = [list(production.PROJECT_TYPE_SCHEMA), ["1", "Old"] + [""] * (len(production.PROJECT_TYPE_SCHEMA) - 2)]
     changed = [list(production.PROJECT_TYPE_SCHEMA), ["1", "New"] + [""] * (len(production.PROJECT_TYPE_SCHEMA) - 2)]
-    with patch("src.production.read_sheet", return_value=changed), \
+    with patch("src.production.read_sheet", side_effect=[changed, before]), \
          patch("src.production.read_project_type_state_rows", return_value=[]), \
          patch("src.production.publish") as restore_core:
         production._rollback_full_refresh(
             "opaque", "sheet", columns=list(production.PROJECT_TYPE_SCHEMA),
             previous=before, previous_raw=before, previous_state_rows=[],
             workflow_backup=None, payment_publication=None,
-            layout_plan={"planned": []},
+            layout_plan={"planned": []}, failed_candidate=changed,
         )
-    restore_core.assert_called_once_with("opaque", "sheet", before, changed,
-                                         columns=list(production.PROJECT_TYPE_SCHEMA))
+    restore_core.assert_called_once_with(
+        "opaque", "sheet", before, changed,
+        columns=list(production.PROJECT_TYPE_SCHEMA), authoritative_stale_ids=set(),
+    )
 
 
 def test_full_refresh_rollback_clears_project_types_when_previous_state_was_empty():

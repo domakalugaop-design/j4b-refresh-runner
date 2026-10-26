@@ -3,7 +3,8 @@ from urllib.parse import unquote
 
 import pytest
 
-from src import refresh
+from src import production, refresh
+from src.payment_refresh import publish_payment_pair
 from src.project_types import STATE_COLUMNS
 
 
@@ -359,3 +360,92 @@ def test_candidate_duplicate_and_shrink_guards_fail_before_any_sheet_mutation(em
         refresh.publish("token", "isolated-test-sheet", emulator.previous_current, emulator.candidate_current)
 
     assert emulator.events == []
+
+
+def _run_full_refresh_rollback(emulator, previous, candidate, *, trigger_payment_failure=False):
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(refresh, "api", emulator.call)
+        patcher.setattr(refresh, "api_get", emulator.get)
+        patcher.setattr(production, "read_sheet", lambda *_args, **_kwargs: deepcopy(emulator.current))
+        patcher.setattr(production, "read_project_type_state_rows", lambda *_args: [])
+        refresh.publish("token", "isolated-test-sheet", candidate, previous)
+        if trigger_payment_failure:
+            payment_previous = {
+                "visits": [["id", "value"], ["old", "ok"]],
+                "projects": [["id"], ["old"]],
+            }
+            payment_candidate = {
+                "visits": [["id", "value"], ["new", "x" * 500]],
+                "projects": [["id"], ["new"]],
+            }
+            payment_writes = []
+            with pytest.raises(ValueError, match="single payment row exceeds chunk byte limit"):
+                publish_payment_pair(
+                    sheet_ids={"visits": 20, "projects": 21},
+                    previous=payment_previous,
+                    candidate=payment_candidate,
+                    write_batch=lambda requests: payment_writes.append(requests),
+                    read_tab=lambda tab: payment_previous[tab],
+                    max_request_bytes=250,
+                )
+            assert payment_writes == []
+        production._rollback_full_refresh(
+            "token", "isolated-test-sheet", columns=list(refresh.COLUMNS),
+            previous=previous, previous_raw=previous, previous_state_rows=[],
+            workflow_backup=None, payment_publication=None, layout_plan={"planned": []},
+            failed_candidate=candidate,
+        )
+
+
+def test_full_refresh_payment_failure_rolls_back_new_project_8406_exactly():
+    previous = [refresh.COLUMNS, SheetsEmulator.row(10)]
+    candidate = [refresh.COLUMNS, SheetsEmulator.row(10), SheetsEmulator.row(8406)]
+    emulator = SheetsEmulator()
+    emulator.previous_current = deepcopy(previous)
+    emulator.candidate_current = deepcopy(candidate)
+    emulator.current = deepcopy(previous)
+
+    _run_full_refresh_rollback(emulator, previous, candidate, trigger_payment_failure=True)
+
+    assert emulator.current == previous
+    assert [row[0] for row in emulator.current[1:]] == [10]
+    assert "clear_projects_current" in emulator.events
+    assert emulator.events.count("write_projects_current") == 2
+    assert production._projects_current_fingerprint(emulator.current, list(refresh.COLUMNS)) == production._projects_current_fingerprint(previous, list(refresh.COLUMNS))
+
+
+def test_full_refresh_rollback_fails_closed_on_readback_mismatch():
+    previous = [refresh.COLUMNS, SheetsEmulator.row(10)]
+    candidate = [refresh.COLUMNS, SheetsEmulator.row(10), SheetsEmulator.row(8406)]
+    emulator = SheetsEmulator()
+    emulator.previous_current = deepcopy(previous)
+    emulator.candidate_current = deepcopy(candidate)
+    emulator.current = deepcopy(previous)
+    emulator.current_restore_mutation = lambda rows: [rows[0], [999, *rows[1][1:]]]
+
+    with pytest.raises(RuntimeError, match="full refresh rollback incomplete"):
+        _run_full_refresh_rollback(emulator, previous, candidate)
+
+    assert emulator.current != previous
+
+
+def test_full_refresh_rollback_does_not_remove_id_outside_failed_candidate():
+    previous = [refresh.COLUMNS, SheetsEmulator.row(10)]
+    candidate = [refresh.COLUMNS, SheetsEmulator.row(10), SheetsEmulator.row(8406)]
+    emulator = SheetsEmulator()
+    emulator.previous_current = deepcopy(previous)
+    emulator.candidate_current = deepcopy(candidate)
+    emulator.current = [refresh.COLUMNS, SheetsEmulator.row(10), SheetsEmulator.row(999)]
+
+    with pytest.raises(RuntimeError, match="full refresh rollback incomplete"):
+        with pytest.MonkeyPatch.context() as patcher:
+            patcher.setattr(production, "read_sheet", lambda *_args, **_kwargs: deepcopy(emulator.current))
+            patcher.setattr(production, "read_project_type_state_rows", lambda *_args: [])
+            production._rollback_full_refresh(
+                "token", "isolated-test-sheet", columns=list(refresh.COLUMNS),
+                previous=previous, previous_raw=previous, previous_state_rows=[],
+                workflow_backup=None, payment_publication=None, layout_plan={"planned": []},
+                failed_candidate=candidate,
+            )
+
+    assert not any(event.startswith("clear_projects_current") for event in emulator.events)
