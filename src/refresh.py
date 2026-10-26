@@ -4,7 +4,6 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import tempfile
 import time
 import urllib.parse
@@ -20,6 +19,7 @@ from .portal_transport import PortalSession
 from .project_types import STATE_COLUMNS, serialize_state, state_rows_equivalent, validate_state_rows
 from .workflow_analytics import project_workflow_metrics
 from .technical_ids import integer_id
+from .project_period import MMYY_RE as PERIOD_MARKER_RE, classify_project_period, rolling_month_markers, moscow_today
 
 SHEET_NAME = os.environ.get("GOOGLE_WORKSHEET", "projects_current")
 BASE_COLUMNS = ["project_id","project_name","period","plan","plan_value","plan_status","created","completed","unassigned","execution_pct","plan_missing_with_activity","has_period_marker","project_start","project_end","elapsed_pct","lag","risk_status","risk_reason","validation_state","last_refreshed","client","primary_manager","coordinators","date_from","date_to","scope","manager_payment","wave","assigned","questionnaire_filled","rejected"]
@@ -33,7 +33,6 @@ CURRENCY_PROJECT_COLUMNS = PROJECT_TYPE_COLUMNS + CURRENCY_COLUMNS
 # explicit for validating and upgrading legacy 31-column baselines.
 COLUMNS = CURRENCY_PROJECT_COLUMNS
 PUBLICATION_DIAGNOSTIC_ATTRIBUTE = "_j4b_publication_diagnostic"
-PERIOD_MARKER_RE = re.compile(r"(?:^|[^0-9])(0[1-9]|1[0-2])(\d{2})(?!\d)")
 UNMAPPED_PRESERVE_COLUMNS = [
     "period", "unassigned", "has_period_marker", "project_start", "project_end", "elapsed_pct", "lag",
     "project_type_code", "project_type_name",
@@ -212,52 +211,48 @@ def col(index: int) -> str:
 
 
 def select_scope(catalogue: list[dict[str, Any]], current_rows: list[list[Any]], today: date | None = None) -> list[dict[str, Any]]:
-    today = today or datetime.now(timezone.utc).date()
-    cur = f"{today.month:02d}{today.year % 100:02d}"
-    prev_year = today.year if today.month > 1 else today.year - 1
-    prev_month = (today.month - 2) % 12 + 1
-    prev = f"{prev_month:02d}{prev_year % 100:02d}"
-    baseline = {str(r[0]): r for r in current_rows[1:] if r and r[0] != ""}
-    baseline_ids = set(baseline)
-    catalogue_ids = {str(row["project_id"]) for row in catalogue}
-    new_ids = catalogue_ids - baseline_ids
+    """Select only projects whose *current API name* unambiguously falls in the window."""
+    today = today or moscow_today()
+    window = set(rolling_month_markers(today))
     selected: dict[str, dict[str, Any]] = {}
     for item in catalogue:
         pid = str(item["project_id"])
-        old = baseline.get(pid)
-        name = str(old[1] if old and len(old) > 1 else item.get("project_name") or "")
-        markers = {match.group(1) + match.group(2) for match in PERIOD_MARKER_RE.finditer(name)}
-        active = bool(markers & {cur, prev})
-        if pid in new_ids or active:
+        period = classify_project_period(item.get("project_name"))
+        if period.status == "VALID" and period.marker in window:
             selected[pid] = dict(item)
     return sorted(selected.values(), key=lambda row: int(row["project_id"]))
 
 
 def regular_scope_counts(catalogue: list[dict[str, Any]], current_rows: list[list[Any]], today: date) -> dict[str, int]:
-    """Report the regular new/current-period/previous-period scope before deduplication."""
+    """Summarize window selection from current API names, never prior published names."""
     baseline = {str(r[0]): r for r in current_rows[1:] if r and r[0] not in (None, "")}
-    catalogue_ids = {str(row["project_id"]) for row in catalogue}
-    new_ids = catalogue_ids - set(baseline)
-    current_marker = f"{today.month:02d}{today.year % 100:02d}"
-    previous_year = today.year if today.month > 1 else today.year - 1
-    previous_month = (today.month - 2) % 12 + 1
-    previous_marker = f"{previous_month:02d}{previous_year % 100:02d}"
-    current_ids: set[str] = set()
-    previous_ids: set[str] = set()
+    markers = rolling_month_markers(today)
+    ids_by_marker: dict[str, set[str]] = {marker: set() for marker in markers}
+    unrecognized: set[str] = set()
+    ambiguous: set[str] = set()
+    quarter_warnings: set[str] = set()
     for item in catalogue:
         pid = str(item["project_id"])
-        old = baseline.get(pid)
-        name = str(old[1] if old and len(old) > 1 else item.get("project_name") or "")
-        markers = {match.group(1) + match.group(2) for match in PERIOD_MARKER_RE.finditer(name)}
-        if current_marker in markers:
-            current_ids.add(pid)
-        if previous_marker in markers:
-            previous_ids.add(pid)
+        period = classify_project_period(item.get("project_name"))
+        if period.status == "UNRECOGNIZED_PERIOD":
+            unrecognized.add(pid)
+        elif period.status == "AMBIGUOUS_PERIOD":
+            ambiguous.add(pid)
+        elif period.marker in ids_by_marker:
+            ids_by_marker[period.marker].add(pid)
+        if period.quarter_mismatch:
+            quarter_warnings.add(pid)
+    selected_ids = set().union(*ids_by_marker.values())
+    current_marker = f"{today.month:02d}{today.year % 100:02d}"
     return {
-        "new": len(new_ids),
-        "current_month": len(current_ids),
-        "previous_month": len(previous_ids),
-        "union": len(new_ids | current_ids | previous_ids),
+        "new": len(selected_ids - set(baseline)),
+        "current_month": len(ids_by_marker.get(current_marker, set())),
+        "previous_month": len(ids_by_marker[markers[0]]),
+        "next_month": len(ids_by_marker[markers[2]]),
+        "union": len(selected_ids),
+        "unrecognized": len(unrecognized),
+        "ambiguous": len(ambiguous),
+        "quarter_warnings": len(quarter_warnings),
     }
 
 
@@ -369,7 +364,6 @@ def merge_previous(rows: list[dict[str, Any]], previous: list[list[Any]], select
         prior = old.get(pid)
         if row.get("_acquisition_state") in {"FAILED", "SEMANTIC_FAILURE"} and prior:
             carried = {c: prior[i] for i, c in enumerate(columns)}
-            carried["last_refreshed"] = timestamp
             carried["_acquisition_state"] = row["_acquisition_state"]
             carried["_acquisition_failure_reasons"] = row.get("_acquisition_failure_reasons", [])
             merged[pid] = carried
@@ -382,7 +376,6 @@ def merge_previous(rows: list[dict[str, Any]], previous: list[list[Any]], select
     for pid, prior in old.items():
         if pid not in selected_ids:
             carried = {c: prior[i] for i, c in enumerate(columns)}
-            carried["last_refreshed"] = timestamp
             merged[pid] = carried
     return [merged[k] for k in sorted(merged, key=int)]
 
@@ -392,13 +385,11 @@ def reconcile_current_rows(
     authoritative_ids: set[str],
     *,
     acquisition_complete: bool,
-    max_stale_ids: int = 50,
 ) -> tuple[list[dict[str, Any]], set[str]]:
-    """Reconcile current-state rows against a complete Portal universe.
+    """Validate IDs against the Portal universe without inferring deletions.
 
-    Current-state pruning is deliberately fail-closed: an incomplete or
-    malformed universe must never be interpreted as a deletion signal.  The
-    returned stale set is evidence/telemetry; historical data is not touched.
+    An incomplete/malformed universe still fails closed. The returned absent
+    set is telemetry only; last-good rows are retained in the candidate.
     """
     if not acquisition_complete:
         raise RuntimeError("authoritative universe acquisition incomplete; stale pruning blocked")
@@ -413,15 +404,11 @@ def reconcile_current_rows(
         if not project_id.isdigit() or project_id in seen:
             raise RuntimeError("current candidate contains invalid or duplicate project IDs")
         seen.add(project_id)
-        if project_id in normalized:
-            kept.append(row)
-        else:
+        kept.append(row)
+        if project_id not in normalized:
             stale.add(project_id)
-    if len(stale) > max_stale_ids:
-        raise RuntimeError(
-            "authoritative universe implies suspicious stale-project count: "
-            f"stale={len(stale)} limit={max_stale_ids}"
-        )
+    # Absence from a list endpoint is not proof of deletion. Preserve these
+    # last-good rows and expose the IDs as telemetry; never prune them here.
     return kept, stale
 
 

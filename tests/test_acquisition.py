@@ -1,3 +1,5 @@
+import pytest
+
 from src.acquisition import Reader, acquire_project, recover_retryable_failed_projects
 from src.refresh import BASE_COLUMNS, merge_previous, materialize
 
@@ -227,10 +229,8 @@ def test_retryable_transport_failure_exhausts_bounded_budget():
 
 def test_non_retryable_4xx_does_not_retry():
     session = FakeSession([response("private body", status=403), response("should not be consumed")])
-    result = _reader(session).get("/proj/42", project_id="42", stage="project")
-    assert result["state"] == "REQUEST_FAILED"
-    assert result["failure"]["failure_class"] == "HTTP_403"
-    assert result["failure"]["retryable"] == "NO"
+    with pytest.raises(RuntimeError, match="authentication or authorization"):
+        _reader(session).get("/proj/42", project_id="42", stage="project")
     assert len(session.calls) == 1
 
 

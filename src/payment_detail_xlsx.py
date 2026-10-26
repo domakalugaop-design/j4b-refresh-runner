@@ -67,6 +67,10 @@ class PaymentWorkbookError(ValueError):
 class PaymentTransportError(RuntimeError):
     """The payment export endpoint did not return a successful response."""
 
+    def __init__(self, message: str, *, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
 
 class PaymentFeatureDisabled(RuntimeError):
     """Raised when the explicitly opt-in acquisition path is not enabled."""
@@ -470,7 +474,7 @@ def acquire_project_payment_assignments(
             duration_ms=elapsed,
         )
         if status != 200:
-            raise PaymentTransportError(f"payment export request failed (HTTP {status})")
+            raise PaymentTransportError("payment export request failed", status=status)
         if not body:
             raise PaymentWorkbookError("payment export response body is empty", failure_code="EMPTY_RESPONSE", failure_stage="response_validation")
         if content_type != XLSX_MIME:

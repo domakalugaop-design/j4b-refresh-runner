@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
 import re
 import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any
+from urllib.error import HTTPError, URLError
+from datetime import date
 
+from .portal_transport import PortalTransportError
 from .technical_ids import integer_id
+from .project_period import classify_project_period, rolling_month_markers, moscow_today
 
 
 PROJECT_TYPE_COLUMNS = ["project_type_code", "project_type_name"]
@@ -20,10 +25,78 @@ PROJECT_TYPE_DICTIONARY = {
     "0007": "B2B_тайный покупатель",
     "0008": "Тестирование цифровых продуктов",
 }
-PERIOD_MARKER_RE = re.compile(r"(?<!\d)(0[1-9]|1[0-2])(\d{2})(?!\d)")
-APPLICABILITY_CUTOFF = (2026, 9)
 PROJECT_TYPE_DIRECTORY_PATH = "/admin/proj-type"
 VERIFIED_DIRECTORY_CODES = {"0002", "0003", "0004", "0005", "0007", "0008", "0009"}
+
+
+class ProjectTypeAcquisitionError(RuntimeError):
+    """Fail-closed acquisition error carrying only allowlisted diagnostics."""
+
+    _STAGES = {
+        "PROJECT_DETAIL_REQUEST",
+        "PROJECT_DETAIL_HTTP_STATUS",
+        "PROJECT_DETAIL_RESPONSE",
+        "PROJECT_DETAIL_UTF8",
+        "PROJECT_DETAIL_JSON",
+        "PROJECT_DETAIL_TYPE_CLASSIFICATION",
+    }
+    _CATEGORIES = {
+        "TRANSPORT_ERROR", "HTTP_ERROR", "UTF8_ERROR", "JSON_ERROR",
+        "UNRESOLVED_TYPE", "INTERNAL_ERROR",
+    }
+
+    def __init__(
+        self,
+        *,
+        stage: str,
+        project_index: int | str,
+        project_total: int | str,
+        project_id: Any,
+        failure_category: str,
+        http_status: int | str,
+    ) -> None:
+        super().__init__("project type acquisition is incomplete")
+        if type(project_index) is not int or project_index < 1:
+            project_index = "UNKNOWN"
+        if type(project_total) is not int or project_total < 1:
+            project_total = "UNKNOWN"
+        if project_index != "UNKNOWN" and project_total != "UNKNOWN" and project_index > project_total:
+            project_index = "UNKNOWN"
+        if stage not in self._STAGES:
+            stage = "PROJECT_DETAIL_REQUEST"
+        if failure_category not in self._CATEGORIES:
+            failure_category = "INTERNAL_ERROR"
+        self._stage = stage
+        self._project_index = project_index
+        self._project_total = project_total
+        self._project_id = _safe_project_id(project_id)
+        self._failure_category = failure_category
+        self._http_status = _safe_http_status(http_status)
+
+    @property
+    def diagnostic(self) -> dict[str, Any]:
+        return {
+            "STAGE": self._stage,
+            "PROJECT_INDEX": self._project_index,
+            "PROJECT_TOTAL": self._project_total,
+            "PROJECT_ID": self._project_id,
+            "FAILURE_CATEGORY": self._failure_category,
+            "HTTP_STATUS": self._http_status,
+        }
+
+
+def _safe_project_id(project_id: Any) -> str:
+    if type(project_id) is int and project_id >= 0:
+        return str(project_id)
+    if type(project_id) is str and re.fullmatch(r"\d+", project_id):
+        return project_id
+    return "UNKNOWN"
+
+
+def _safe_http_status(status: Any) -> int | str:
+    if type(status) is int and 100 <= status <= 599:
+        return status
+    return "UNKNOWN"
 
 
 class _ProjectTypeDirectoryHTML(HTMLParser):
@@ -124,28 +197,28 @@ def acquire_project_type_catalog(session: Any) -> dict[str, str]:
 
 
 def normalized_period_marker(project_name: Any) -> tuple[int, int] | None:
-    """Return the first qualified MMYY marker normalized to (YYYY, MM)."""
-    if project_name in (None, ""):
+    """Return a unique MMYY normalized to (YYYY, MM); reject ambiguity."""
+    result = classify_project_period(project_name)
+    if result.status != "VALID" or result.marker is None:
         return None
-    match = PERIOD_MARKER_RE.search(str(project_name))
-    if not match:
-        return None
-    month = int(match.group(1))
-    year = 2000 + int(match.group(2))
-    return year, month
+    return 2000 + int(result.marker[2:]), int(result.marker[:2])
 
 
-def is_project_type_applicable(project_name: Any) -> bool:
+def is_project_type_applicable(project_name: Any, today: date | None = None) -> bool:
     period = normalized_period_marker(project_name)
-    return period is not None and period >= APPLICABILITY_CUTOFF
+    return period is not None and f"{period[1]:02d}{period[0] % 100:02d}" in set(
+        rolling_month_markers(today or moscow_today())
+    )
 
 
-def project_type_applicable_ids(universe: list[dict[str, Any]]) -> set[str]:
-    """Use the current /api/project universe name as the canonical period source."""
+def project_type_applicable_ids(universe: list[dict[str, Any]], today: date | None = None) -> set[str]:
+    """Return IDs in the rolling three-month window based on current API names."""
+    window = set(rolling_month_markers(today or moscow_today()))
     return {
         str(item["project_id"])
         for item in universe
-        if is_project_type_applicable(item.get("project_name"))
+        if (period := classify_project_period(item.get("project_name"))).status == "VALID"
+        and period.marker in window
     }
 
 
@@ -159,11 +232,14 @@ def canonical_project_names(universe: list[dict[str, Any]]) -> dict[str, str]:
 
 
 def apply_canonical_project_names(
-    rows: list[dict[str, Any]], universe: list[dict[str, Any]]
+    rows: list[dict[str, Any]], universe: list[dict[str, Any]], project_ids: set[str] | None = None
 ) -> list[dict[str, Any]]:
     names = canonical_project_names(universe)
     for row in rows:
-        name = names.get(str(row.get("project_id", "")))
+        project_id = str(row.get("project_id", ""))
+        if project_ids is not None and project_id not in project_ids:
+            continue
+        name = names.get(project_id)
         if name is not None:
             row["project_name"] = name
     return rows
@@ -325,8 +401,6 @@ def materialize_project_types(
     for row in rows:
         project_id = str(row.get("project_id", ""))
         assignment = state.get(project_id)
-        if assignment and project_id not in applicable_ids:
-            raise ValueError(f"PERIOD_APPLICABILITY_CONFLICT: project_id={project_id}")
         row["project_type_code"] = assignment[0] if assignment else None
         row["project_type_name"] = assignment[1] if assignment else None
     return rows
@@ -352,6 +426,7 @@ class ProjectTypeTelemetry:
     request_failures: int = 0
     pending_ids: set[str] = field(default_factory=set)
     request_elapsed_seconds: float = 0.0
+    project_failures: list[ProjectTypeAcquisitionError] = field(default_factory=list)
 
 
 def acquire_pending_types(
@@ -427,15 +502,18 @@ def acquire_current_types(
     existing: dict[str, tuple[str, str]],
     catalog: dict[str, str],
     delay: float = 0.15,
+    today: date | None = None,
 ) -> tuple[dict[str, tuple[str, str]], ProjectTypeTelemetry, set[str]]:
     """Refresh every applicable project assignment against the live catalog.
 
-    Any transport, payload, type, or coverage uncertainty aborts before
-    publication. Reconciliation is keyed only by project_id and preserves
-    non-applicable assignments; payment data is outside this function.
+    Project-scoped transport/payload/type failures are returned in telemetry
+    and leave that ID's previous assignment untouched. Catalog, universe,
+    programming, and reconciliation-integrity failures still raise globally.
+    Reconciliation is keyed only by project_id; payment data is outside this
+    function.
     """
     catalog = validate_project_type_catalog(list(catalog.items()))
-    applicable = project_type_applicable_ids(universe)
+    applicable = project_type_applicable_ids(universe, today=today)
     telemetry = ProjectTypeTelemetry(
         applicable_projects=len(applicable),
         already_assigned=len(applicable & set(existing)),
@@ -443,31 +521,90 @@ def acquire_current_types(
     )
     observations: list[tuple[str, str]] = []
     started = time.monotonic()
-    for index, project_id in enumerate(sorted(applicable, key=int), start=1):
+    ordered_project_ids = sorted(applicable, key=int)
+    project_total = len(ordered_project_ids)
+    failed_ids: set[str] = set()
+    for index, project_id in enumerate(ordered_project_ids, start=1):
+        safe_pid = _safe_project_id(project_id)
+
+        def fail(category: str, failure_stage: str, status: int | str = "UNKNOWN") -> None:
+            telemetry.request_failures += 1
+            failed_ids.add(project_id)
+            telemetry.project_failures.append(ProjectTypeAcquisitionError(
+                stage=failure_stage,
+                project_index=index,
+                project_total=project_total,
+                project_id=safe_pid,
+                failure_category=category,
+                http_status=status,
+            ))
+
         try:
             status, _content_type, body = session.request(
                 f"/api/project/{project_id}", "GET", accept="application/json"
             )
             telemetry.detail_get_additional += 1
-            if status != 200 or not body:
-                raise ValueError("project type detail response unavailable")
-            import json
-            payload = json.loads(body.decode("utf-8", "strict"))
-            bucket, code, _name = classify_raw_type(payload, catalog)
-            if bucket != "VALID" or code is None:
-                raise ValueError("project type detail is unresolved")
-            observations.append((project_id, code))
-        except Exception:
-            telemetry.request_failures += 1
-            telemetry.request_elapsed_seconds = time.monotonic() - started
-            raise RuntimeError("project type acquisition is incomplete") from None
+        except (HTTPError, PortalTransportError, TimeoutError, ConnectionError, URLError) as exc:
+            if isinstance(exc, HTTPError):
+                if exc.code in {401, 403}:
+                    raise RuntimeError("Portal authentication or authorization failed") from None
+                fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", _safe_http_status(exc.code))
+            else:
+                fail("TRANSPORT_ERROR", "PROJECT_DETAIL_REQUEST")
+            if delay:
+                time.sleep(delay)
+            continue
+
+        if status in {401, 403}:
+            raise RuntimeError("Portal authentication or authorization failed")
+        http_status = _safe_http_status(status)
+        if status != 200:
+            fail("HTTP_ERROR", "PROJECT_DETAIL_HTTP_STATUS", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
+
+        if not body:
+            fail("UNRESOLVED_TYPE", "PROJECT_DETAIL_RESPONSE", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
+
+        try:
+            payload_text = body.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            fail("UTF8_ERROR", "PROJECT_DETAIL_UTF8", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
+
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            fail("JSON_ERROR", "PROJECT_DETAIL_JSON", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
+
+        bucket, code, _name = classify_raw_type(payload, catalog)
+        if bucket != "VALID" or code is None:
+            fail("UNRESOLVED_TYPE", "PROJECT_DETAIL_TYPE_CLASSIFICATION", http_status)
+            if delay:
+                time.sleep(delay)
+            continue
+        observations.append((project_id, code))
         if delay:
             time.sleep(delay)
 
+    telemetry.request_elapsed_seconds = time.monotonic() - started
+    # A per-project failure is deliberately omitted from this cycle's update.
+    # Its prior assignment remains in ``existing``; the caller excludes the
+    # complete project bundle from publication and retries it next cycle.
+    successfully_observed = applicable - failed_ids
     updated, counts = reconcile_project_type_assignments(
         existing,
         observations,
-        applicable,
+        successfully_observed,
         list(catalog.items()),
     )
     telemetry.valid_assignments_acquired = counts["added"] + counts["changed"]

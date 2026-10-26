@@ -12,7 +12,7 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 from .acquisition import (
     MAX_REQUEST_RETRIES,
@@ -22,6 +22,7 @@ from .acquisition import (
     recover_retryable_failed_projects,
 )
 from .payment_detail_xlsx import acquire_project_payment_assignments
+from .payment_detail_xlsx import PaymentTransportError, PaymentWorkbookError
 from .payment_materialization import (
     PROJECT_PUBLICATION_COLUMNS,
     VISIT_PUBLICATION_COLUMNS,
@@ -30,10 +31,11 @@ from .payment_materialization import (
     serialize_sheet_payload,
 )
 from .payment_refresh import normalize_payment_sheet_values, publish_payment_pair, replace_by_project
-from .portal_transport import PortalSession
+from .portal_transport import PortalSession, PortalTransportError
 from .google_service_account import google_token
 from .project_types import (
     PROJECT_TYPE_DICTIONARY,
+    ProjectTypeAcquisitionError,
     STATE_COLUMNS,
     acquire_current_types,
     acquire_project_type_catalog,
@@ -42,6 +44,14 @@ from .project_types import (
     project_type_applicable_ids,
     state_rows_equivalent,
     validate_state_rows,
+)
+from .project_failure_isolation import (
+    ProjectFailure,
+    append_project_error_journal,
+    last_successful_timestamp,
+    partition_project_results,
+    project_failure_record,
+    reconcile_failed_project_bundles,
 )
 from .refresh import (
     COLUMNS,
@@ -65,6 +75,7 @@ from .refresh import (
     summary,
     api,
     col,
+    moscow_today as get_moscow_today,
 )
 from .workflow_publication import (
     PRIMARY_ANALYTICS_COLUMNS,
@@ -117,8 +128,8 @@ def _prepare_regular_payment_publication(
     session: PortalSession,
     selected: list[dict[str, Any]],
     acquired_projects: list[dict[str, Any]],
-) -> tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]]:
-    """Acquire complete selected scope and prepare both replacement payloads before writes."""
+) -> tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int], list[ProjectFailure]]:
+    """Prepare payment replacements, changing only successfully acquired IDs."""
     sheet_ids = {
         props.get("title"): props.get("sheetId")
         for sheet in meta.get("sheets", [])
@@ -141,36 +152,61 @@ def _prepare_regular_payment_publication(
     }
     projects_by_id = {str(row["project_id"]): row for row in acquired_projects}
     selected_ids = [str(row["project_id"]) for row in selected]
-    if len(selected_ids) != len(set(selected_ids)) or set(selected_ids) != set(projects_by_id):
+    if (len(selected_ids) != len(set(selected_ids)) or len(projects_by_id) != len(acquired_projects)
+            or set(selected_ids) != set(projects_by_id)):
         raise RuntimeError("payment selected/acquired project set mismatch")
     failed = [pid for pid, row in projects_by_id.items() if row.get("acquisition_state") != "ACQUIRED"]
     if failed:
         raise RuntimeError(f"payment acquisition blocked by incomplete operational project set: {len(failed)}")
     visit_rows: list[list[Any]] = []
     project_rows: list[list[Any]] = []
+    failures: list[ProjectFailure] = []
+    payment_success_ids: list[str] = []
     for index, pid in enumerate(selected_ids, start=1):
-        payment_rows, status = acquire_project_payment_assignments(
-            pid,
-            session,
-            feature_enabled=True,
-            timeout=60,
-            ordinal=index,
-            total=len(selected_ids),
-            telemetry=_payment_telemetry,
-        )
-        if status != 200:
-            raise RuntimeError("payment XLSX acquisition returned non-200 status")
-        record = projects_by_id[pid]
-        materialized = materialize_payment_data(pid, record, payment_rows, record.get("workflow_memberships", []))
-        if not all(materialized["invariants"].values()):
-            raise RuntimeError(f"payment materialization invariant failure for project_id={pid}")
+        try:
+            payment_rows, status = acquire_project_payment_assignments(
+                pid,
+                session,
+                feature_enabled=True,
+                timeout=60,
+                ordinal=index,
+                total=len(selected_ids),
+                telemetry=_payment_telemetry,
+            )
+            if status != 200:
+                failures.append(ProjectFailure(pid, "/pay/detail", "HTTP_ERROR", "PAYMENT_EXPORT_FAILURE"))
+                continue
+            record = projects_by_id[pid]
+            materialized = materialize_payment_data(pid, record, payment_rows, record.get("workflow_memberships", []))
+            if not all(materialized["invariants"].values()):
+                failures.append(ProjectFailure(pid, "/pay/detail", "SEMANTIC_ERROR", "PAYMENT_MATERIALIZATION_INVALID"))
+                continue
+        except PaymentWorkbookError:
+            failures.append(ProjectFailure(pid, "/pay/detail", "SCHEMA_ERROR", "PAYMENT_EXPORT_SCHEMA_INVALID"))
+            continue
+        except PaymentTransportError as exc:
+            if exc.status in {401, 403}:
+                raise RuntimeError("Portal authentication or authorization failed") from None
+            failures.append(ProjectFailure(pid, "/pay/detail", "PAYMENT_ERROR", "PAYMENT_EXPORT_FAILURE"))
+            continue
+        except HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise RuntimeError("Portal authentication or authorization failed") from None
+            failures.append(ProjectFailure(pid, "/pay/detail", "PAYMENT_ERROR", "PAYMENT_EXPORT_FAILURE"))
+            continue
+        except (PortalTransportError, URLError, TimeoutError, ConnectionError):
+            failures.append(ProjectFailure(pid, "/pay/detail", "PAYMENT_ERROR", "PAYMENT_EXPORT_FAILURE"))
+            continue
+        except ValueError:
+            failures.append(ProjectFailure(pid, "/pay/detail", "SEMANTIC_ERROR", "PAYMENT_MATERIALIZATION_INVALID"))
+            continue
         payload = build_publication_payloads(materialized)
         visit_rows.extend(payload[PAYMENT_VISIT_TAB][1:])
         project_rows.extend(payload[PAYMENT_PROJECT_TAB][1:])
+        payment_success_ids.append(pid)
         if index % 25 == 0 or index == len(selected_ids):
-            _stage(f"PAYMENT_ACQUISITION {index}/{len(selected_ids)} | success={index}")
-    # Read/reconstruct the previous accepted snapshot only after every selected
-    # project's Portal and payment acquisition has succeeded.
+            _stage(f"PAYMENT_ACQUISITION {index}/{len(selected_ids)} | success={len(payment_success_ids)}")
+    # Reconstruct after all per-ID outcomes; failed IDs are outside replacement.
     previous = {PAYMENT_VISIT_TAB: _read_payment_tab(token, sid, PAYMENT_VISIT_TAB),
                 PAYMENT_PROJECT_TAB: _read_payment_tab(token, sid, PAYMENT_PROJECT_TAB)}
     for tab, headers in expected_headers.items():
@@ -180,8 +216,8 @@ def _prepare_regular_payment_publication(
         PAYMENT_VISIT_TAB: [expected_headers[PAYMENT_VISIT_TAB], *visit_rows],
         PAYMENT_PROJECT_TAB: [expected_headers[PAYMENT_PROJECT_TAB], *project_rows],
     }
-    candidate = replace_by_project(previous, incoming, selected_ids)
-    return previous, candidate, sheet_ids, grid_row_counts
+    candidate = replace_by_project(previous, incoming, payment_success_ids)
+    return previous, candidate, sheet_ids, grid_row_counts, failures
 
 
 def _destination_preflight(token: str, sid: str, expected_title: str = PRODUCTION_TITLE) -> dict[str, Any]:
@@ -354,7 +390,7 @@ def _load_bootstrap_seed(
         if pid not in target_ids:
             raise ValueError(f"bootstrap project_id missing from target: {pid}")
         if pid not in applicable_ids:
-            raise ValueError(f"bootstrap project_id is pre-cutoff or has no qualified period: {pid}")
+            raise ValueError(f"bootstrap project_id is outside the active rolling window: {pid}")
         effective_catalog = catalog
         if effective_catalog is None:
             effective_catalog = PROJECT_TYPE_DICTIONARY
@@ -380,11 +416,8 @@ def _resolve_project_type_state(
     """Use persisted state when present; bootstrap is strictly absent-state only."""
     if state_exists:
         state = validate_state_rows(persisted_rows, allow_dynamic_catalog=True)
-        applicable_ids = project_type_applicable_ids(universe)
-        if not set(state).issubset(target_ids):
-            raise ValueError("persisted project_types state references project absent from target")
-        if not set(state).issubset(applicable_ids):
-            raise ValueError("persisted project_types state includes pre-0926 or unqualified project")
+        # Persisted assignments are historical last-good state. API omission
+        # or moving outside the active window is not evidence of deletion.
         return persisted_rows, state, "PERSISTED_STATE", "NONE"
     if not seed_path or not seed_sha256:
         raise ValueError("project_types state is absent; explicit validated bootstrap artifact is required")
@@ -395,13 +428,13 @@ def _resolve_project_type_state(
 def _prune_absent_project_type_state_rows(
     rows: list[list[Any]], authoritative_ids: set[str]
 ) -> list[list[Any]]:
-    """Drop only current-state assignments for IDs absent from a complete universe."""
+    """Keep all last-good assignments; API absence alone is not a deletion signal."""
     if not rows:
         return rows
     if rows[0] != STATE_COLUMNS:
         raise ValueError("project_types header mismatch")
-    ids = {str(project_id) for project_id in authoritative_ids}
-    return [rows[0]] + [row for row in rows[1:] if row and str(row[0]) in ids]
+    validate_state_rows(rows, allow_dynamic_catalog=True)
+    return [list(row) for row in rows]
 
 
 def _validate_authoritative_universe(universe: list[dict[str, Any]]) -> set[str]:
@@ -415,8 +448,6 @@ def _validate_authoritative_universe(universe: list[dict[str, Any]]) -> set[str]
         project_id = str(item.get("project_id", ""))
         if not project_id.isdigit() or project_id in ids:
             raise RuntimeError("authoritative project universe contains invalid or duplicate project IDs")
-        if item.get("project_name") in (None, ""):
-            raise RuntimeError("authoritative project universe contains a project without a name")
         ids.add(project_id)
     return ids
 
@@ -536,9 +567,6 @@ def _validate_project_type_state_materialization(
     absent from the candidate; any assignment that is present must still match
     the immutable persisted value.
     """
-    if not applicable_ids.issuperset(state):
-        invalid = sorted(set(state) - applicable_ids, key=int)
-        raise RuntimeError(f"candidate contains pre-0926 Project Type assignment: {','.join(invalid)}")
     for row in rows:
         project_id = str(row.get("project_id", ""))
         assignment = state.get(project_id)
@@ -663,7 +691,7 @@ def _rollback_full_refresh(
     """Best-effort restore every target snapshot; report any unverifiable tab."""
     errors: list[str] = []
     if payment_publication is not None:
-        old_payment, _candidate, sheet_ids, _grid_rows = payment_publication
+        old_payment, _candidate, sheet_ids, _grid_rows = payment_publication[:4]
         try:
             live = {tab: _read_payment_tab(token, sid, tab) for tab in old_payment}
             if live != old_payment:
@@ -1128,7 +1156,7 @@ def _payment_report(publication: Any, selected: list[dict[str, Any]]) -> dict[st
     if publication is None:
         return {"enabled": False, "projects_refreshed": 0, "assignment_rows_refreshed": 0,
                 "unmatched_visit_mappings_refreshed": 0, "visit_final_rows": 0, "project_final_rows": 0}
-    _previous, candidate, _sheet_ids, _grid_rows = publication
+    _previous, candidate, _sheet_ids, _grid_rows = publication[:4]
     selected_ids = {str(row["project_id"]) for row in selected}
     project_rows = candidate[PAYMENT_PROJECT_TAB][1:]
     selected_project_rows = [row for row in project_rows if row and str(row[0]) in selected_ids]
@@ -1140,6 +1168,94 @@ def _payment_report(publication: Any, selected: list[dict[str, Any]]) -> dict[st
         "visit_final_rows": len(candidate[PAYMENT_VISIT_TAB]) - 1,
         "project_final_rows": len(project_rows),
     }
+
+
+def _project_failure_from_type_error(error: ProjectTypeAcquisitionError) -> ProjectFailure:
+    diagnostic = error.diagnostic
+    category = diagnostic["FAILURE_CATEGORY"]
+    mapping = {
+        "JSON_ERROR": ("JSON_ERROR", "PROJECT_DETAIL_JSON_INVALID"),
+        "HTTP_ERROR": ("HTTP_ERROR", "PROJECT_DETAIL_HTTP_FAILURE"),
+        "TRANSPORT_ERROR": ("TRANSPORT_ERROR", "PROJECT_DETAIL_TRANSPORT_FAILURE"),
+        "UTF8_ERROR": ("UTF8_ERROR", "PROJECT_DETAIL_SCHEMA_INVALID"),
+        "UNRESOLVED_TYPE": ("SCHEMA_ERROR", "PROJECT_DETAIL_TYPE_UNRESOLVED"),
+        "INTERNAL_ERROR": ("SCHEMA_ERROR", "PROJECT_DETAIL_SCHEMA_INVALID"),
+    }
+    error_class, sanitized = mapping.get(category, mapping["INTERNAL_ERROR"])
+    return ProjectFailure(str(diagnostic["PROJECT_ID"]), "/api/project/{project_id}", error_class, sanitized)
+
+
+def _project_failure_from_record(project: dict[str, Any]) -> list[ProjectFailure]:
+    """Translate Reader's safe per-project outcomes into a fixed-code failure list."""
+    project_id = str(project.get("project_id", ""))
+    failures: list[ProjectFailure] = []
+    request_failures = project.get("acquisition_request_failures", [])
+    for failure in request_failures:
+        stage = failure.get("request_stage")
+        endpoint = {
+            "project": "/proj/{project_id}",
+            "project_edit": "/proj/{project_id}/edit",
+            "action_query": "/action",
+        }.get(stage)
+        if endpoint is None:
+            raise RuntimeError("project acquisition failure has an unknown request stage")
+        failure_class = str(failure.get("failure_class", ""))
+        if failure_class in {"HTTP_401", "HTTP_403"}:
+            raise RuntimeError("Portal authentication or authorization failed")
+        if failure_class.startswith("HTTP_"):
+            error_class, sanitized = "HTTP_ERROR", {
+                "project": "PROJECT_VIEW_REQUEST_FAILURE",
+                "project_edit": "PROJECT_EDIT_REQUEST_FAILURE",
+                "action_query": "PROJECT_ACTION_REQUEST_FAILURE",
+            }[stage]
+        elif failure_class == "TIMEOUT":
+            error_class, sanitized = "TIMEOUT_ERROR", {
+                "project": "PROJECT_VIEW_REQUEST_FAILURE",
+                "project_edit": "PROJECT_EDIT_REQUEST_FAILURE",
+                "action_query": "PROJECT_ACTION_REQUEST_FAILURE",
+            }[stage]
+        elif failure_class == "EMPTY_BODY":
+            error_class, sanitized = "SCHEMA_ERROR", "PROJECT_DETAIL_SCHEMA_INVALID"
+        elif failure_class in {"DNS_ERROR", "CONNECT_ERROR", "CONNECTION_RESET", "CONNECTION_CLOSED",
+                               "CONNECTION_SEND_ERROR", "TLS_ERROR", "TRANSPORT_ERROR"}:
+            error_class, sanitized = "TRANSPORT_ERROR", {
+                "project": "PROJECT_VIEW_REQUEST_FAILURE",
+                "project_edit": "PROJECT_EDIT_REQUEST_FAILURE",
+                "action_query": "PROJECT_ACTION_REQUEST_FAILURE",
+            }[stage]
+        else:
+            raise RuntimeError("project acquisition failure has an unknown failure class")
+        failures.append(ProjectFailure(project_id, endpoint, error_class, sanitized))
+    if project.get("acquisition_state") == "SEMANTIC_FAILURE":
+        reasons = project.get("acquisition_failure_reasons", [])
+        endpoint = "/proj/{project_id}/edit" if any(str(item).startswith("edit:") for item in reasons) else "/proj/{project_id}"
+        failures.append(ProjectFailure(
+            project_id, endpoint, "SEMANTIC_ERROR", "PROJECT_SEMANTIC_VALIDATION_FAILED"
+        ))
+    if project.get("acquisition_state") == "FAILED" and not failures:
+        raise RuntimeError("project acquisition failed without a classified request failure")
+    return failures
+
+
+def _project_error_journal_records(
+    failures: list[ProjectFailure], previous: list[list[Any]], columns: list[str],
+    prior_data_ids: set[str] | None = None,
+) -> list[dict[str, str]]:
+    old = {str(row[0]): row for row in previous[1:] if row and row[0] not in (None, "")}
+    timestamp_index = columns.index("last_refreshed") if "last_refreshed" in columns else None
+    records: list[dict[str, str]] = []
+    for failure in failures:
+        row = old.get(failure.project_id)
+        value = row[timestamp_index] if row is not None and timestamp_index is not None and timestamp_index < len(row) else None
+        last_success = last_successful_timestamp(value)
+        has_prior = row is not None or failure.project_id in (prior_data_ids or set())
+        records.append(project_failure_record(
+            failure,
+            last_successful_refresh=last_success,
+            recovery_status=("CANDIDATE_PRESERVES_LAST_GOOD" if has_prior
+                             else "CANDIDATE_OMITS_WITHOUT_LAST_GOOD"),
+        ))
+    return records
 
 
 CHECKPOINT_FORBIDDEN_KEYS = {
@@ -1204,7 +1320,10 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     previous_raw = checkpoint["previous_raw"]
     previous_state_rows = checkpoint["previous_state_rows"]
     state = {str(pid): tuple(value) for pid, value in checkpoint["state"].items()}
-    state = {pid: value for pid, value in state.items() if pid in authoritative_ids}
+    state_before_project_type_refresh = {
+        str(pid): tuple(value)
+        for pid, value in checkpoint.get("state_before_project_type_refresh", checkpoint["state"]).items()
+    }
     source_columns = list(previous_raw[0]) if previous_raw else []
     previous = _upgrade_projects_rows(previous_raw, source_columns, columns)
     if os.environ.get("MATERIALIZATION_PREFLIGHT", "false").strip().lower() == "true":
@@ -1216,7 +1335,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         )
         if workflow_enabled:
             validate_materialized_rows(merged)
-        apply_canonical_project_names(merged, universe)
+        apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
         materialize_project_types(merged, state, project_type_applicable_ids(universe))
         candidate = sheet_rows(merged, columns=columns)
         candidate_summary = summary(candidate)
@@ -1230,17 +1349,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         raise RuntimeError("checkpoint baseline schema does not match destination width")
     plan = _plan_project_type_layout(meta, columns, source_columns=source_columns)
     _require_complete_operational_acquisition(projects)
-    _stage("MATERIALIZATION_START")
-    timestamp = now()
-    rows = materialize(projects, visits, timestamp)
-    merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp, columns=columns)
-    merged, stale_ids = reconcile_current_rows(
-        merged, authoritative_ids, acquisition_complete=True
-    )
-    validate_materialized_rows(merged)
-    apply_canonical_project_names(merged, universe)
-    applicable = project_type_applicable_ids(universe)
-    materialize_project_types(merged, state, applicable)
+    error_records = list(checkpoint.get("project_errors", []))
     payment_publication = None
     payment_portal_requests = 0
     if _payment_refresh_enabled():
@@ -1252,10 +1361,39 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
             payment_publication = _prepare_regular_payment_publication(
                 token, sid, meta, session, selected, projects
             )
+            payment_failures = payment_publication[4]
+            if payment_failures:
+                selected, projects, visits, state, _failed_ids = reconcile_failed_project_bundles(
+                    selected, projects, visits, state,
+                    state_before_project_type_refresh, payment_failures,
+                )
+                prior_bundle_ids = set(state_before_project_type_refresh)
+                for tab_rows in payment_publication[0].values():
+                    prior_bundle_ids.update(
+                        str(row[0]) for row in tab_rows[1:] if row and row[0] not in (None, "")
+                    )
+                payment_error_records = _project_error_journal_records(
+                    payment_failures, previous, columns, prior_bundle_ids
+                )
+                append_project_error_journal(payment_error_records)
+                error_records.extend(payment_error_records)
             payment_portal_requests = session.requests
         finally:
             session.close()
         _stage("PAYMENT_ACQUISITION_AND_CANDIDATE_VALIDATION_PASS")
+    if checkpoint.get("selected_scope", checkpoint.get("selected", [])) and not selected:
+        raise RuntimeError("all selected project bundles failed; refusing an empty refresh")
+    _stage("MATERIALIZATION_START")
+    timestamp = now()
+    rows = materialize(projects, visits, timestamp)
+    merged = merge_previous(rows, previous, {str(x["project_id"]) for x in selected}, timestamp, columns=columns)
+    merged, stale_ids = reconcile_current_rows(
+        merged, authoritative_ids, acquisition_complete=True
+    )
+    validate_materialized_rows(merged)
+    apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
+    applicable = project_type_applicable_ids(universe)
+    materialize_project_types(merged, state, applicable)
     candidate = sheet_rows(merged, columns=columns)
     candidate_summary = summary(candidate)
     if candidate_summary["duplicates"]:
@@ -1302,7 +1440,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
             _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", exc)
             raise
         if payment_publication is not None:
-            old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
+            old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication[:4]
             _stage("PAYMENT_PUBLICATION_START | tabs=2")
             payment_result = publish_payment_pair(
                 sheet_ids=payment_sheet_ids,
@@ -1341,6 +1479,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         "CORE_PROJECTS": len(universe), "CORE_FINAL_ROWS": candidate_summary["rows"],
         "WORKFLOW_PROJECTS_REFRESHED": len(selected), "WORKFLOW_FINAL_ROWS": len(third_tab_rows(merged)) - 1,
         "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
+        "PROJECT_ERRORS": error_records,
         "PREPUBLICATION_BACKUP": private_backup,
         "NON_TARGET_TABS_UNCHANGED": len(non_target_before),
         "SERVICE_INFORMATION_REFRESH_TIMESTAMP": now(),
@@ -1423,10 +1562,13 @@ def run() -> dict[str, Any]:
         universe = discover_universe(session)
         authoritative_ids = _validate_authoritative_universe(universe)
         _stage(f"UNIVERSE_DISCOVERY_PASS | universe={len(universe)} | authoritative=PASS")
+        moscow_today = get_moscow_today()
 
         type_telemetry = None
         type_catalog: dict[str, str] | None = None
         applicable_ids: set[str] = set()
+        state_before_project_type_refresh = dict(state)
+        type_project_failures: list[ProjectFailure] = []
         if project_type_enabled:
             _stage("PROJECT_TYPE_CATALOG_ACQUISITION_START")
             type_catalog = acquire_project_type_catalog(session)
@@ -1447,6 +1589,7 @@ def run() -> dict[str, Any]:
                 _stage(f"PROJECT_TYPE_BOOTSTRAP_VALIDATED | rows={bootstrap_rows} | sha256={bootstrap_sha256}")
             else:
                 _stage(f"PROJECT_TYPE_PERSISTED_STATE_AUTHORITATIVE | rows={len(state)}")
+            state_before_project_type_refresh = dict(state)
             _stage("PROJECT_TYPE_ACQUISITION_START")
             state, type_telemetry, applicable_ids = acquire_current_types(
                 session,
@@ -1454,7 +1597,12 @@ def run() -> dict[str, Any]:
                 state,
                 type_catalog,
                 float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")),
+                today=moscow_today,
             )
+            type_project_failures = [
+                _project_failure_from_type_error(error)
+                for error in type_telemetry.project_failures
+            ]
             _stage(
                 f"PROJECT_TYPE_ACQUISITION_PASS | applicable={type_telemetry.applicable_projects} | "
                 f"assigned_before={type_telemetry.already_assigned} | pending_before={type_telemetry.pending_before} | "
@@ -1463,36 +1611,45 @@ def run() -> dict[str, Any]:
             )
 
         backfill_scope = os.environ.get("BACKFILL_SCOPE", "").strip()
-        moscow_today = (datetime.now(timezone.utc) + timedelta(hours=3)).date()
         scope_counts: dict[str, int] | None = None
+        if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
+            raise RuntimeError("regular refresh refuses full-universe project detail acquisition")
         if workflow_enabled and backfill_scope == "2026":
-            if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
-                raise RuntimeError("2026 backfill refuses full-universe acquisition fallback")
             selected = _select_reporting_year_scope(universe, previous, 2026)
             if not 1000 <= len(selected) <= 3000:
                 raise RuntimeError(f"2026 backfill scope count outside expected order of magnitude: {len(selected)}")
             _stage(f"BACKFILL_SCOPE_GUARD_PASS | scope=2026_ONLY | projects={len(selected)} | pre2026=0")
         else:
-            if os.environ.get("WORKFLOW_ANALYTICS_FULL_ACQUISITION", "false").strip().lower() == "true":
-                selected = sorted((dict(item) for item in universe), key=lambda row: int(row["project_id"]))
-                scope_counts = {"new": len({str(x["project_id"]) for x in universe} - {str(r[0]) for r in previous[1:] if r and r[0] not in (None, "")}), "current_month": 0, "previous_month": 0, "union": len(selected)}
-            else:
-                scope_counts = regular_scope_counts(universe, previous, moscow_today)
-                selected = select_scope(universe, previous, today=moscow_today)
-                if len(selected) != scope_counts["union"]:
-                    raise RuntimeError("regular selector summary disagrees with deduplicated selection")
-        _stage(f"SCOPE_SELECTION_PASS | selected={len(selected)}")
+            scope_counts = regular_scope_counts(universe, previous, moscow_today)
+            selected = select_scope(universe, previous, today=moscow_today)
+            if len(selected) != scope_counts["union"]:
+                raise RuntimeError("regular selector summary disagrees with deduplicated selection")
+            _stage(
+                "SCOPE_CLASSIFICATION | "
+                f"unrecognized={scope_counts['unrecognized']} | "
+                f"ambiguous={scope_counts['ambiguous']} | "
+                f"quarter_warnings={scope_counts['quarter_warnings']}"
+            )
+        selected_scope = list(selected)
+        type_failed_ids = {failure.project_id for failure in type_project_failures}
+        selected_for_acquisition = [
+            item for item in selected_scope if str(item["project_id"]) not in type_failed_ids
+        ]
+        _stage(
+            f"SCOPE_SELECTION_PASS | selected={len(selected_scope)} | "
+            f"deferred_project_type_failures={len(type_failed_ids & {str(item['project_id']) for item in selected_scope})}"
+        )
         # Budget for one full retry sequence plus one failed-project-only recovery pass.
         reader = Reader(
             session,
-            max(3 * (MAX_REQUEST_RETRIES + 1) * 2 * len(selected), 3),
-            expected_projects=len(selected),
+            max(3 * (MAX_REQUEST_RETRIES + 1) * 2 * len(selected_for_acquisition), 3),
+            expected_projects=len(selected_for_acquisition),
         )
         projects: list[dict[str, Any]] = []
         visits: list[dict[str, Any]] = []
         acquisition_started = time.monotonic()
 
-        for index, spec in enumerate(selected, start=1):
+        for index, spec in enumerate(selected_for_acquisition, start=1):
             project, project_visits = acquire_project(
                 reader,
                 spec,
@@ -1500,23 +1657,23 @@ def run() -> dict[str, Any]:
             )
             projects.append(project)
             visits.extend(project_visits)
-            if index % 10 == 0 or index == len(selected):
+            if index % 10 == 0 or index == len(selected_for_acquisition):
                 failed = sum(p.get("acquisition_state") == "FAILED" for p in projects)
                 semantic_failed = sum(p.get("acquisition_state") == "SEMANTIC_FAILURE" for p in projects)
                 success = len(projects) - failed - semantic_failed
                 elapsed = max(time.monotonic() - acquisition_started, 0.001)
                 rate = len(projects) / elapsed * 60.0
-                remaining = len(selected) - len(projects)
+                remaining = len(selected_for_acquisition) - len(projects)
                 eta_min = (remaining / rate) if rate > 0 else 0.0
                 print(
-                    f"ACQUISITION {len(projects)}/{len(selected)} | success={success} | failed={failed} | semantic_failed={semantic_failed} | "
+                    f"ACQUISITION {len(projects)}/{len(selected_for_acquisition)} | success={success} | failed={failed} | semantic_failed={semantic_failed} | "
                     f"http={reader.count} | elapsed={elapsed:.0f}s | {rate:.1f} proj/min | ETA={eta_min:.1f} min",
                     flush=True,
                 )
 
         projects, visits, recovery_ids = recover_retryable_failed_projects(
             reader,
-            selected,
+            selected_for_acquisition,
             projects,
             visits,
             float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")),
@@ -1561,15 +1718,64 @@ def run() -> dict[str, Any]:
             }, sort_keys=True),
             flush=True,
         )
-        _require_complete_operational_acquisition(projects, selected_count=len(selected))
+        operational_project_failures = [
+            failure
+            for project in projects
+            if project.get("acquisition_state") != "ACQUIRED"
+            for failure in _project_failure_from_record(project)
+        ]
+        operational_failed_ids = {failure.project_id for failure in operational_project_failures}
+        acquired_core_ids = {
+            str(project["project_id"]) for project in projects
+            if project.get("acquisition_state") == "ACQUIRED"
+        }
+        acquired_core_ids, operational_failed_ids = partition_project_results(
+            (item["project_id"] for item in selected_for_acquisition), projects
+        )
+        if selected_for_acquisition and not acquired_core_ids:
+            raise RuntimeError("no selected projects were acquired successfully")
+        if operational_failed_ids != {
+            failure.project_id for failure in operational_project_failures
+        }:
+            raise RuntimeError("project failure classification does not match acquisition outcomes")
 
-        payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]] | None = None
+        payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int], list[ProjectFailure]] | None = None
         if payment_enabled and os.environ.get("ACQUISITION_ONLY", "false").strip().lower() != "true":
             _stage("PAYMENT_STAGE_START | mode=REGULAR | cross_run_checkpoint=NO")
             payment_publication = _prepare_regular_payment_publication(
-                token, sid, destination_meta, session, selected, projects
+                token, sid, destination_meta, session,
+                [item for item in selected_for_acquisition if str(item["project_id"]) in acquired_core_ids],
+                [project for project in projects if str(project["project_id"]) in acquired_core_ids],
             )
             _stage("PAYMENT_ACQUISITION_AND_CANDIDATE_VALIDATION_PASS")
+
+        payment_project_failures = (
+            payment_publication[4]
+            if payment_publication is not None and len(payment_publication) > 4 else []
+        )
+        all_project_failures = [*type_project_failures, *operational_project_failures, *payment_project_failures]
+        selected, projects, visits, state, failed_bundle_ids = reconcile_failed_project_bundles(
+            selected_scope, projects, visits, state,
+            state_before_project_type_refresh, all_project_failures,
+        )
+        if selected_scope and not selected:
+            raise RuntimeError("all selected project bundles failed; refusing an empty refresh")
+        if all_project_failures:
+            prior_bundle_ids = set(state_before_project_type_refresh)
+            if payment_publication is not None:
+                for tab_rows in payment_publication[0].values():
+                    prior_bundle_ids.update(str(row[0]) for row in tab_rows[1:] if row and row[0] not in (None, ""))
+            error_records = _project_error_journal_records(
+                all_project_failures, previous, columns, prior_bundle_ids
+            )
+            journal_count = append_project_error_journal(error_records)
+            _stage(f"PROJECT_FAILURE_JOURNAL_PASS | records={journal_count} | failed_projects={len(failed_bundle_ids)}")
+        else:
+            error_records = []
+        _stage(
+            f"PROJECT_BUNDLE_RECONCILIATION_PASS | selected={len(selected_scope)} | "
+            f"published_candidates={len(selected)} | isolated_failures={len(failed_bundle_ids)}"
+        )
 
         checkpoint_path = os.environ.get("ACQUISITION_CHECKPOINT_PATH", "/tmp/j4b-acquisition-checkpoint.json")
         checkpoint = serialize_acquisition_checkpoint(checkpoint_path, {
@@ -1585,6 +1791,9 @@ def run() -> dict[str, Any]:
             "previous_raw": previous_raw,
             "previous_state_rows": previous_state_rows,
             "state": state,
+            "state_before_project_type_refresh": state_before_project_type_refresh,
+            "selected_scope": selected_scope,
+            "project_errors": error_records,
             "layout_plan": layout_plan,
             "columns": columns,
         })
@@ -1599,6 +1808,8 @@ def run() -> dict[str, Any]:
                 "FINAL_STATUS": "ACQUISITION_CHECKPOINT_PASS",
                 "ACQUISITION_CHECKPOINT": checkpoint,
                 "SELECTED_COUNT": len(selected),
+                "SELECTED_SCOPE_COUNT": len(selected_scope),
+                "PROJECT_ERRORS": error_records,
                 "PORTAL_HTTP_REQUEST_COUNT": session.requests,
             }
 
@@ -1613,7 +1824,7 @@ def run() -> dict[str, Any]:
         if workflow_enabled:
             validate_materialized_rows(merged)
         if project_type_enabled:
-            apply_canonical_project_names(merged, universe)
+            apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
             applicable_ids = project_type_applicable_ids(universe)
             materialize_project_types(merged, state, applicable_ids)
         candidate = sheet_rows(merged, columns=columns)
@@ -1627,8 +1838,8 @@ def run() -> dict[str, Any]:
             _validate_project_type_state_materialization(merged, state, applicable_ids)
             layout_plan["planned"] = layout_plan.get("planned", []) + (["WRITE project_types state"] if state != validate_state_rows(previous_state_rows, allow_dynamic_catalog=True) else [])
             layout_plan["planned"] = layout_plan.get("planned", []) + [f"WRITE projects_current A:{col(len(columns)-1)}"]
-        _stage(f"LIFECYCLE_RECONCILIATION_PASS | authoritative={len(authoritative_ids)} | stale_pruned={len(stale_ids)}")
-        _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
+        _stage(f"LIFECYCLE_RECONCILIATION_PASS | authoritative={len(authoritative_ids)} | absent_ids_retained={len(stale_ids)}")
+        _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | absent_ids_retained={len(stale_ids)}")
         _stage("CANDIDATE_VALIDATION_PASS")
         _stage("DIFF_VALIDATION_PASS")
 
@@ -1698,7 +1909,7 @@ def run() -> dict[str, Any]:
                     _log_publication_failure("PROJECT_TYPE_AND_PROJECTS_CURRENT", exc)
                     raise
                 if payment_publication is not None:
-                    old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
+                    old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication[:4]
                     _stage("PAYMENT_PUBLICATION_START | tabs=2")
                     payment_result = publish_payment_pair(
                         sheet_ids=payment_sheet_ids,
@@ -1740,7 +1951,7 @@ def run() -> dict[str, Any]:
                 authoritative_stale_ids=stale_ids,
             )
             if payment_publication is not None:
-                old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
+                old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication[:4]
                 _stage("PAYMENT_PUBLICATION_START | tabs=2")
                 payment_result = publish_payment_pair(
                     sheet_ids=payment_sheet_ids,
@@ -1754,8 +1965,11 @@ def run() -> dict[str, Any]:
         _stage("READBACK_PASS")
         _stage("TYPE_VALIDATION=EXTERNAL_POSTCHECK_REQUIRED")
 
-        failed = sum(p.get("acquisition_state") == "FAILED" for p in projects)
-        semantic_failed = sum(p.get("acquisition_state") == "SEMANTIC_FAILURE" for p in projects)
+        failed = len({failure.project_id for failure in all_project_failures})
+        semantic_failed = len({
+            failure.project_id for failure in all_project_failures
+            if failure.error_class == "SEMANTIC_ERROR"
+        })
         baseline_ids = {str(r[0]) for r in previous[1:] if r and r[0] != ""}
         selected_ids = {str(x["project_id"]) for x in selected}
         final_ids = {str(r[0]) for r in candidate[1:] if r and r[0] != ""}
@@ -1769,6 +1983,7 @@ def run() -> dict[str, Any]:
             "WALL_SECONDS": round(wall, 3),
             "UNIVERSE_COUNT": len(universe),
             "SELECTED_COUNT": len(selected),
+            "SCOPE_SELECTED_COUNT": len(selected_scope),
             "REGULAR_SELECTOR": scope_counts,
             "CORE_PROJECTS": len(universe),
             "CORE_FINAL_ROWS": candidate_summary["rows"],
@@ -1777,7 +1992,7 @@ def run() -> dict[str, Any]:
             "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
             "PREPUBLICATION_BACKUP": private_backup if project_type_enabled else None,
             "NON_TARGET_TABS_UNCHANGED": len(non_target_before) if project_type_enabled else None,
-            "SUCCESS_COUNT": len(projects) - failed - semantic_failed,
+            "SUCCESS_COUNT": len(acquired_core_ids - failed_bundle_ids),
             "FAILED_COUNT": failed,
             "SEMANTIC_FAILURE_COUNT": semantic_failed,
             "SEMANTIC_FAILURE_REASONS": {
@@ -1785,6 +2000,10 @@ def run() -> dict[str, Any]:
                 for p in projects
                 if p.get("acquisition_state") == "SEMANTIC_FAILURE"
             },
+            "PROJECT_ERRORS": error_records,
+            "PROJECT_FAILURE_COUNT": len({failure.project_id for failure in all_project_failures}),
+            "PROJECT_ISOLATION_STATUS": "COMPLETED_WITH_ERRORS" if all_project_failures else "CLEAN",
+            "AUTO_RECOVERY": "RETRY_ON_NEXT_RUN",
             "BASELINE_ROWS": len(previous) - 1,
             "BASELINE_UNIQUE_IDS": summary(previous)["unique"],
             "BASELINE_HAS_8110": "8110" in baseline_ids,
@@ -1849,13 +2068,18 @@ def main() -> int:
         )
         return 1
     except Exception as exc:
+        failure = {
+            "FINAL_STATUS": "FAILED",
+            "ERROR_TYPE": type(exc).__name__,
+            "FAILURE_CLASS": _safe_failure_class(exc),
+        }
+        if isinstance(exc, ProjectTypeAcquisitionError):
+            # This object is constructed only from fixed stage/category codes,
+            # numeric IDs, counters, and a validated numeric HTTP status.
+            failure.update(exc.diagnostic)
         print(
             json.dumps(
-                {
-                    "FINAL_STATUS": "FAILED",
-                    "ERROR_TYPE": type(exc).__name__,
-                    "FAILURE_CLASS": _safe_failure_class(exc),
-                },
+                failure,
                 ensure_ascii=False,
                 sort_keys=True,
             ),

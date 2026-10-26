@@ -5,43 +5,77 @@ from src.refresh import BASE_COLUMNS, COLUMNS, CURRENCY_COLUMNS, PROJECT_TYPE_CO
 from src.production import load_acquisition_checkpoint, serialize_acquisition_checkpoint
 
 
-def test_selector_current_previous_and_new():
-    previous = [COLUMNS, ["1", "Legacy 0826"] + [""] * 29]
+def test_selector_uses_live_api_name_and_previous_current_next_months():
+    previous = [COLUMNS, ["1", "Legacy 0926"] + [""] * 35]
     catalogue = [
-        {"project_id": "1", "project_name": "Legacy 0826"},
-        {"project_id": "2", "project_name": "Current 0926"},
-        {"project_id": "3", "project_name": "Future 0127"},
+        {"project_id": "1", "project_name": "Renamed 1026"},
+        {"project_id": "2", "project_name": "Current 1026"},
+        {"project_id": "3", "project_name": "Next 1126"},
+        {"project_id": "4", "project_name": "Old 0926"},
+        {"project_id": "5", "project_name": "New without period"},
+        {"project_id": "6", "project_name": "Historical 0826"},
     ]
-    selected = select_scope(catalogue, previous, today=date(2026, 9, 4))
-    assert [row["project_id"] for row in selected] == ["1", "2", "3"]
+    selected = select_scope(catalogue, previous, today=date(2026, 10, 4))
+    assert [row["project_id"] for row in selected] == ["1", "2", "3", "4"]
 
 
-def test_regular_selector_counts_new_current_previous_union_and_deduplicates():
-    previous = [COLUMNS, ["1", "Legacy_0826"] + [""] * 31, ["2", "Current_0926"] + [""] * 31]
+def test_regular_selector_counts_window_and_classification_from_current_names():
+    previous = [COLUMNS, ["1", "Legacy_0826"] + [""] * 35, ["2", "Current_0926"] + [""] * 35]
     catalogue = [
-        {"project_id": "1", "project_name": "changed name"},
-        {"project_id": "2", "project_name": "Current_0926"},
+        {"project_id": "1", "project_name": "Renamed_1026"},
+        {"project_id": "2", "project_name": "Current_1026"},
         {"project_id": "3", "project_name": "New_0926"},
-        {"project_id": "4", "project_name": "New_0826"},
-        {"project_id": "5", "project_name": "Historical_0726"},
+        {"project_id": "4", "project_name": "Next_1126"},
+        {"project_id": "5", "project_name": "Historical_0826"},
+        {"project_id": "6", "project_name": "Unknown"},
+        {"project_id": "7", "project_name": "Ambiguous_0926_1026"},
+        {"project_id": "8", "project_name": "Q3_1026"},
     ]
-    counts = regular_scope_counts(catalogue, previous, today=date(2026, 9, 30))
-    selected = select_scope(catalogue, previous, today=date(2026, 9, 30))
-    assert counts == {"new": 3, "current_month": 2, "previous_month": 2, "union": 5}
-    assert [item["project_id"] for item in selected] == ["1", "2", "3", "4", "5"]
+    counts = regular_scope_counts(catalogue, previous, today=date(2026, 10, 30))
+    selected = select_scope(catalogue, previous, today=date(2026, 10, 30))
+    assert counts == {"new": 3, "current_month": 3, "previous_month": 1, "next_month": 1,
+                      "union": 5, "unrecognized": 1, "ambiguous": 1, "quarter_warnings": 1}
+    assert [item["project_id"] for item in selected] == ["1", "2", "3", "4", "8"]
 
 
-def test_regular_selector_checks_all_period_markers_and_deduplicates_union():
-    previous = [COLUMNS, ["1", "Old_0726_then_0926"] + [""] * 31,
-                ["2", "Contains_0926_and_0826"] + [""] * 31]
+def test_regular_selector_rejects_multiple_distinct_markers_but_accepts_repeated_same_marker():
+    previous = [COLUMNS]
     catalogue = [
-        {"project_id": "1", "project_name": "Old_0726_then_0926"},
-        {"project_id": "2", "project_name": "Contains_0926_and_0826"},
+        {"project_id": "1", "project_name": "Repeat_1026_1026"},
+        {"project_id": "2", "project_name": "Ambiguous_0926_and_1026"},
     ]
-    counts = regular_scope_counts(catalogue, previous, today=date(2026, 9, 30))
-    selected = select_scope(catalogue, previous, today=date(2026, 9, 30))
-    assert counts == {"new": 0, "current_month": 2, "previous_month": 1, "union": 2}
-    assert [row["project_id"] for row in selected] == ["1", "2"]
+    counts = regular_scope_counts(catalogue, previous, today=date(2026, 10, 30))
+    selected = select_scope(catalogue, previous, today=date(2026, 10, 30))
+    assert counts["union"] == 1 and counts["ambiguous"] == 1
+    assert [row["project_id"] for row in selected] == ["1"]
+
+
+def test_three_month_window_crosses_calendar_year():
+    catalogue = [{"project_id": str(i), "project_name": name} for i, name in enumerate(
+        ("Dec_1226", "Jan_0127", "Feb_0227", "Nov_1126"), 1
+    )]
+    assert [row["project_id"] for row in select_scope(catalogue, [], today=date(2027, 1, 10))] == ["1", "2", "3"]
+
+
+def test_window_entry_uses_renamed_api_name_while_window_exit_preserves_last_good_row():
+    prior = [COLUMNS, ["10", "Project_0826"] + [""] * (len(COLUMNS) - 2)]
+    api_now = [
+        {"project_id": "10", "project_name": "Project_1026"},
+        {"project_id": "11", "project_name": "Project_0826"},
+    ]
+    selected = select_scope(api_now, prior, today=date(2026, 10, 19))
+    assert [project["project_id"] for project in selected] == ["10"]
+    merged = merge_previous([], prior, set(), "2026-10-19T10:00:00+03:00")
+    assert merged[0]["project_name"] == "Project_0826"
+
+
+def test_mmyy_parser_does_not_infer_period_from_arbitrary_digits_or_invalid_month():
+    catalogue = [
+        {"project_id": "1", "project_name": "Project 8375"},
+        {"project_id": "2", "project_name": "Project_1326"},
+        {"project_id": "3", "project_name": "Project_1026"},
+    ]
+    assert [project["project_id"] for project in select_scope(catalogue, [], today=date(2026, 10, 19))] == ["3"]
 
 
 def test_plan_zero_is_real_zero():
@@ -112,10 +146,10 @@ def test_current_schema_is_37_columns_and_unique_summary():
     assert summary(rows) == {"rows": 2, "unique": 2, "duplicates": 0}
 
 
-def test_lifecycle_reconciliation_prunes_ids_absent_from_complete_universe():
+def test_lifecycle_reconciliation_preserves_ids_absent_from_api():
     rows = [{"project_id": "100"}, {"project_id": "101"}, {"project_id": "102"}]
     current, stale = reconcile_current_rows(rows, {"100", "101"}, acquisition_complete=True)
-    assert [row["project_id"] for row in current] == ["100", "101"]
+    assert [row["project_id"] for row in current] == ["100", "101", "102"]
     assert stale == {"102"}
 
 
@@ -130,10 +164,10 @@ def test_lifecycle_reconciliation_is_id_based_for_duplicate_names():
     assert len(current) == 2 and not stale
 
 
-def test_lifecycle_reconciliation_removes_old_id_but_keeps_new_same_name_id():
+def test_lifecycle_reconciliation_does_not_treat_api_absence_as_deletion():
     rows = [{"project_id": "8062", "project_name": "same"}, {"project_id": "8183", "project_name": "same"}]
     current, stale = reconcile_current_rows(rows, {"8183"}, acquisition_complete=True)
-    assert [row["project_id"] for row in current] == ["8183"]
+    assert [row["project_id"] for row in current] == ["8062", "8183"]
     assert stale == {"8062"}
 
 
@@ -150,10 +184,10 @@ def test_lifecycle_reconciliation_keeps_hidden_related_entity_when_authoritative
     assert not stale
 
 
-def test_lifecycle_reconciliation_fails_closed_on_unexpected_major_drop():
+def test_lifecycle_reconciliation_reports_but_preserves_large_api_omission():
     rows = [{"project_id": str(i)} for i in range(100)]
-    with pytest.raises(RuntimeError, match="suspicious stale-project count"):
-        reconcile_current_rows(rows, {"0"}, acquisition_complete=True)
+    current, absent = reconcile_current_rows(rows, {"0"}, acquisition_complete=True)
+    assert len(current) == 100 and len(absent) == 99
 
 
 def test_sheet_rows_emit_full_width():
@@ -202,6 +236,13 @@ def test_selected_refresh_preserves_previously_unmapped_fields_and_recalculates_
     assert merged["lag"] == 2
     assert merged["period"] == ""
     assert merged["has_period_marker"] is True
+
+
+def test_unselected_last_good_row_keeps_its_original_last_refreshed():
+    previous = [COLUMNS, [1, "Historical_0826"] + [""] * (len(COLUMNS) - 2)]
+    previous[1][COLUMNS.index("last_refreshed")] = "2026-10-01T10:00:00+00:00"
+    merged = merge_previous([], previous, set(), "2026-10-19T10:00:00+03:00")
+    assert merged[0]["last_refreshed"] == "2026-10-01T10:00:00+00:00"
 
 
 def test_selected_refresh_preserves_project_type_assignment_without_state_reenrichment():

@@ -156,7 +156,7 @@ def test_full_publication_accepts_project_type_string_ids_and_omitted_trailing_b
     assert emulator.events.index("read_projects_current") > emulator.events.index("write_projects_current")
 
 
-def test_authoritatively_pruned_previous_project_can_shrink_current_snapshot(emulated_sheets):
+def test_api_omission_never_prunes_previous_project_from_current_snapshot(emulated_sheets):
     emulator = emulated_sheets(SheetsEmulator())
     source_rows = [{"project_id": str(pid)} for pid in (10, 11, 12, 13, 14, 15, 16)]
     reconciled, stale_ids = refresh.reconcile_current_rows(
@@ -167,12 +167,13 @@ def test_authoritatively_pruned_previous_project_can_shrink_current_snapshot(emu
     emulator.current = deepcopy(emulator.previous_current)
 
     assert stale_ids == {"12", "13", "14"}
-    assert len(emulator.candidate_current) - 1 < len(emulator.previous_current) - 1
+    assert len(emulator.candidate_current) - 1 > len(emulator.previous_current) - 1
     publish(emulator, authoritative_stale_ids=stale_ids)
 
     assert emulator.current == emulator.candidate_current
     assert emulator.project_types == emulator.candidate_types
     assert "write_projects_current" in emulator.events
+    assert {str(row[0]) for row in emulator.current[1:]} >= {"12", "13", "14"}
 
 
 @pytest.mark.parametrize("authoritative_stale_ids", [None, {"99"}, {"10", "12"}])

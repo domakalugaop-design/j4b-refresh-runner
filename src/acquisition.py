@@ -7,6 +7,7 @@ import socket
 import ssl
 import time
 from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
 from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -131,7 +132,23 @@ class Reader:
                 status, content_type, body = self.session.request(
                     path, method, data, accept="text/html, application/json"
                 )
-            except Exception as exc:
+            except HTTPError as exc:
+                if exc.code in {401, 403}:
+                    raise RuntimeError("Portal authentication or authorization failed") from None
+                failure_class = f"HTTP_{exc.code}"
+                retryable = self._http_retryable(exc.code)
+                event = self._emit_failure(
+                    project_id=project_id, stage=stage, attempt=attempt,
+                    failure_class=failure_class, http_status=exc.code, retryable=retryable,
+                )
+                last_failure = event
+                self.failures += 1
+                if not retryable or attempt > self.max_retries:
+                    break
+                self._wait_before_retry(attempt, None)
+                continue
+            except (PortalTransportError, TimeoutError, socket.timeout, socket.gaierror,
+                    ssl.SSLError, ConnectionError, URLError) as exc:
                 failure_class, retryable = self._exception_class(exc)
                 event = self._emit_failure(
                     project_id=project_id, stage=stage, attempt=attempt,
@@ -143,6 +160,13 @@ class Reader:
                     break
                 self._wait_before_retry(attempt, None)
                 continue
+            except Exception:
+                # Unknown exceptions can represent local programming/configuration
+                # defects; do not disguise them as an isolatable project outage.
+                raise
+
+            if status in {401, 403}:
+                raise RuntimeError("Portal authentication or authorization failed")
 
             if status == 200 and body:
                 return {
@@ -377,6 +401,11 @@ def acquire_project(
     semantic_failures = [] if failed else _semantic_failures(
         project_id, project, edit, action, edit_fields, canonical_name, portal_base_url
     )
+    if any(
+        reason in {"edit:LOGIN_PAGE", "edit:ACCESS_DENIED", "project:ACCESS_DENIED", "action:ACCESS_DENIED"}
+        for reason in semantic_failures
+    ):
+        raise RuntimeError("Portal authentication or authorization page detected during project acquisition")
     acquisition_state = "FAILED" if failed else "SEMANTIC_FAILURE" if semantic_failures else "ACQUIRED"
     edit_name = edit_fields.get("project_name", {}).get("value")
     if not semantic_failures and canonical_name and canonical_name in plain_text(project_html):

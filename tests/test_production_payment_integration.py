@@ -3,6 +3,7 @@ from urllib.parse import unquote
 from unittest.mock import patch
 
 import pytest
+from urllib.error import HTTPError
 
 from src import production
 from src.payment_materialization import PROJECT_PUBLICATION_COLUMNS, VISIT_PUBLICATION_COLUMNS
@@ -112,9 +113,10 @@ def test_regular_payment_preparation_replaces_only_selected_project_rows():
                      "expense_compensation_raw": None, "bonus_penalty_raw": None, "portal_paid_amount_raw": "5"}]
     with patch.object(production, "_read_payment_tab", side_effect=lambda _token, _sid, tab: old[tab]), \
          patch.object(production, "acquire_project_payment_assignments", return_value=(fake_payment, 200)):
-        _previous, candidate, sheet_ids, grid_rows = production._prepare_regular_payment_publication(
+        _previous, candidate, sheet_ids, grid_rows, failures = production._prepare_regular_payment_publication(
             "token", "sheet", metadata, object(), selected, projects
         )
+    assert failures == []
     assert sheet_ids == {production.PAYMENT_VISIT_TAB: 20, production.PAYMENT_PROJECT_TAB: 21}
     assert grid_rows == {production.PAYMENT_VISIT_TAB: 10, production.PAYMENT_PROJECT_TAB: 10}
     assert candidate[production.PAYMENT_VISIT_TAB][0] == list(VISIT_PUBLICATION_COLUMNS)
@@ -122,6 +124,68 @@ def test_regular_payment_preparation_replaces_only_selected_project_rows():
     assert all(str(row[0]) == "1" for rows in candidate.values() for row in rows[1:])
     assert candidate[production.PAYMENT_PROJECT_TAB][1][0] == 1
     assert candidate[production.PAYMENT_PROJECT_TAB][1][7] == Decimal("5")
+
+
+def test_payment_project_failure_preserves_both_financial_last_good_rows():
+    old = _old_tabs()
+    old[production.PAYMENT_VISIT_TAB].append(
+        ["2", "Old two", None, None, "19", 2, Decimal("7"), Decimal("0"), 0, 1, "[]", "COMPLETE"]
+    )
+    old[production.PAYMENT_PROJECT_TAB].append(
+        ["2", "Old two", None, None, 2, 1, Decimal("7"), Decimal("0"), 0, 1, 0, 1, 0, 0, "COMPLETE"]
+    )
+    selected = [
+        {"project_id": "1", "project_name": "New_0926"},
+        {"project_id": "2", "project_name": "Two_0926"},
+    ]
+    projects = [
+        {"project_id": "1", "acquisition_state": "ACQUIRED", "project_name": {"value": "New_0926"},
+         "client": {"value": "Client"}, "primary_manager": {"value": "Manager"},
+         "workflow_memberships": [{"project_id": "1", "action_id": "42", "visit_id": "7", "workflow_state_code": 50}]},
+        {"project_id": "2", "acquisition_state": "ACQUIRED", "project_name": {"value": "Two_0926"},
+         "client": {"value": "Client"}, "primary_manager": {"value": "Manager"}, "workflow_memberships": []},
+    ]
+    metadata = {"sheets": [
+        {"properties": {"title": production.PAYMENT_VISIT_TAB, "sheetId": 20, "gridProperties": {"rowCount": 10}}},
+        {"properties": {"title": production.PAYMENT_PROJECT_TAB, "sheetId": 21, "gridProperties": {"rowCount": 10}}},
+    ]}
+    export = [{"my_id": "42", "visit_reward_raw": "10", "transport_expense_raw": None,
+               "expense_compensation_raw": None, "bonus_penalty_raw": None, "portal_paid_amount_raw": "5"}]
+
+    def acquire(project_id, *_args, **_kwargs):
+        if project_id == "2":
+            raise production.PaymentWorkbookError("private workbook detail", failure_code="ROW_SCHEMA")
+        return export, 200
+
+    with patch.object(production, "_read_payment_tab", side_effect=lambda _token, _sid, tab: old[tab]), \
+         patch.object(production, "acquire_project_payment_assignments", side_effect=acquire):
+        _previous, candidate, _sheet_ids, _grid_rows, failures = production._prepare_regular_payment_publication(
+            "token", "sheet", metadata, object(), selected, projects
+        )
+
+    assert len(failures) == 1 and failures[0].project_id == "2"
+    for tab in (production.PAYMENT_VISIT_TAB, production.PAYMENT_PROJECT_TAB):
+        normalized_candidate = production.normalize_payment_sheet_values(tab, candidate[tab])
+        retained = next(row for row in normalized_candidate[1:] if str(row[0]) == "2")
+        normalized_old = production.normalize_payment_sheet_values(tab, old[tab])
+        assert retained == next(row for row in normalized_old[1:] if str(row[0]) == "2")
+        assert sum(str(row[0]) == "2" for row in candidate[tab][1:]) == 1
+        assert any(str(row[0]) == "1" for row in candidate[tab][1:])
+
+
+def test_payment_authorization_http_failure_remains_global():
+    selected = [{"project_id": "1"}]
+    projects = [{"project_id": "1", "acquisition_state": "ACQUIRED"}]
+    metadata = {"sheets": [
+        {"properties": {"title": production.PAYMENT_VISIT_TAB, "sheetId": 20, "gridProperties": {"rowCount": 10}}},
+        {"properties": {"title": production.PAYMENT_PROJECT_TAB, "sheetId": 21, "gridProperties": {"rowCount": 10}}},
+    ]}
+    denied = HTTPError("https://portal.invalid/?token=hidden", 403, "private", None, None)
+    with patch.object(production, "acquire_project_payment_assignments", side_effect=denied):
+        with pytest.raises(RuntimeError, match="authentication or authorization"):
+            production._prepare_regular_payment_publication(
+                "token", "sheet", metadata, object(), selected, projects
+            )
 
 
 def test_regular_payment_incomplete_operational_acquisition_blocks_before_export_or_sheet_read():
