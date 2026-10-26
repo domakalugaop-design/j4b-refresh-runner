@@ -29,26 +29,32 @@ Fields:
 
 ## Suggested charts and measures
 
-Use only the filtered active generation:
+Use only the filtered active generation. Label counts as **observed snapshot** measures; the source is not the complete Portal population and does not establish completed controller reviews.
 
-- **Known report/action records by corrector:** distinct count of `report_id`, grouped by `corrector_fio`; label as “observed reports with known corrector”.
-- **Known visits by corrector:** distinct count of composite `(project_id, visit_id)`; because one visit can have several correctors/versions, mark as attribution-overlap-capable and do not sum across correctors as a total.
-- **Observed workflow membership by code:** distinct `report_id` where each status flag equals `OBSERVED_PRESENT`. Label as current observed membership, not event count or outcome.
-- **Multi-version visits:** count visits with `report_records_count > 1`; show `version_resolution_status`.
-- **Unknown status matches:** report count with status flags `UNKNOWN`; this is a data coverage indicator.
-- **Freshness/coverage:** show `last_successful_refresh_at`, `source_snapshot_at`, `source_freshness`, `coverage_status`, and `refresh_status` from the manifest.
+- **Summary:** observed reports, composite observed visits, controllers, projects, reports with current observed status 39, visits with current observed status 39, and status-39 share among status-known observed entities.
+- **Controller associations:** distinct reports, distinct composite visits, distinct projects, status-39 reports/visits, and same-grain observed status-39 shares by `corrector_id`/`corrector_fio`. These are associations in this source, not completed-review workload or performance. Visit/project totals may overlap across controllers and are non-additive.
+- **Project associations:** project ID, associated controller count, observed composite visits/reports, current status-39 counts/shares. Project names are blank in the current schema; do not infer them.
+- **Detail:** controller, project ID, visit ID, report/action ID, report URL, observed status flags, report date, source status and coverage flag.
+- **Version and coverage:** multi-report visits and unresolved current version; unknown exact status matches; generation freshness and source coverage.
 
-Example calculated-field patterns (confirm function availability and null handling in the current DataLens editor):
+Status-39 membership is current observed `/action` membership. It is not a historical transition, a count of individual claims, a substantiation result, or evidence of fault. Label rates “доля наблюдаемых … с известным статусом 39”, never as a Portal-wide claim rate.
+
+Calculated fields (verify the current DataLens UI accepts the syntax before saving):
 
 ```text
-Known report records = COUNTD([report_id])
-Status 39 observed reports = COUNTD(IF([status_39] = "OBSERVED_PRESENT", [report_id], NULL))
-Status 39 unknown reports = COUNTD(IF([status_39] = "UNKNOWN", [report_id], NULL))
 Composite visit key = CONCAT(STR([project_id]), "|", STR([visit_id]))
-Known visits = COUNTD([Composite visit key])
+Observed reports = COUNTD([report_id])
+Observed visits = COUNTD([Composite visit key])
+Known-status reports = COUNTD(IF([status_39] = "OBSERVED_PRESENT" OR [status_39] = "OBSERVED_ABSENT", [report_id], NULL))
+Status-39 reports = COUNTD(IF([status_39] = "OBSERVED_PRESENT", [report_id], NULL))
+Status-39 report share = [Status-39 reports] / [Known-status reports]
+Known-status visits = COUNTD(IF([status_39] = "OBSERVED_PRESENT" OR [status_39] = "OBSERVED_ABSENT", [Composite visit key], NULL))
+Status-39 visits = COUNTD(IF([status_39] = "OBSERVED_PRESENT", [Composite visit key], NULL))
+Status-39 visit share = [Status-39 visits] / [Known-status visits]
+Unknown-status reports = COUNTD(IF([status_39] = "UNKNOWN", [report_id], NULL))
 ```
 
-Do not publish rates or rankings. The source does not provide a proven complete denominator, corrector error outcome, review completion timestamp, or current-version selection rule. Status 39 means a claim exists; it does not establish controller fault.
+Guard each ratio against a zero denominator and preserve NULL, not 0. Report-grain rates use distinct `report_id`; visit-grain rates use distinct `(project_id, visit_id)`. For a visit with several report/action rows, numerator membership is 1 if any associated row is `OBSERVED_PRESENT`; denominator membership exists if any associated row has a known status. Grouped visit/project counts can overlap, so never sum groups into an overall total. Do not publish an “unusually high claim rate” flag until a threshold, minimum sample size, and complete comparable population are approved.
 
 ## Dashboard construction
 
@@ -56,10 +62,16 @@ Do not publish rates or rankings. The source does not provide a proven complete 
 2. Verify all four tabs appear as separate tables and headers are recognized.
 3. Create report, visit, quality, and metric-dictionary datasets; apply active-generation filtering to generated data.
 4. Verify IDs remain dimensions (string or integer consistently), dates parse as dates, status flags remain strings, and counts are measures.
-5. Add filters for corrector, project ID, report date, status membership, and coverage label.
+5. Add filters for corrector, project ID, report date, status membership, and coverage label. Date is report filing date, not visit or review date.
 6. Add a drilldown link from `report_url`; preserve exact action/report ID.
 7. Display coverage and freshness prominently. Never label the dashboard as a complete company-wide audit.
-8. Compare control totals with `data_quality_status`; ensure counts match the generation rows.
+8. Compare control totals with `data_quality_status`; ensure counts match the generation rows. Independently validate report and composite-visit counts/rates against `summarize_observed_metrics` from the same candidate generation.
 9. Keep this as a separate dashboard. Do not modify the existing customer dashboard in this task.
 
-Google Sheets connection refresh and DataLens cache timing can delay visible changes; freshness should be read from the manifest, not inferred from when a chart happens to refresh. DataLens configuration and publication were not performed here.
+Google Sheets connection refresh and DataLens cache timing can delay visible changes; freshness should be read from the manifest, not inferred from when a chart happens to refresh.
+
+## Current test connection blocker
+
+On 2026-10-26 the existing private test workbook was confirmed to contain the four required header schemas and no data rows. Account A was signed in to DataLens, Google authentication in the connection draft passed, and the workbook had been shared with the intended service accounts; DataLens still returned `Не удалось загрузить файл` (Request ID `3626871e-d3e6-4216-9785-a1310e956cdd`). Yandex documents a minimum of two populated rows per table: a single header row is insufficient for type detection, and empty tabs are unavailable to add. All four tabs currently have only that header row, so this is a directly matching technical condition and the most specific supported explanation for the failure. Do not add synthetic rows to satisfy the connector. After a successful same-day collector generation is published to the TEST workbook, retry the DataLens connection once. If the same failure persists with populated tabs, use the Request ID and a browser HAR with Yandex support rather than repeating blind attempts.
+
+Yandex documentation: [Google Sheets connection requirements](https://yandex.cloud/ru/docs/datalens/operations/connection/create-google-sheets) and [troubleshooting “Could not upload file”](https://yandex.cloud/en/docs/troubleshooting/datalens/known-issues/unable-to-load-file-when-using-gsheets-as-data-source).

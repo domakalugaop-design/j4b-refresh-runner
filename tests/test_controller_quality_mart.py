@@ -7,6 +7,7 @@ import pytest
 from src.controller_quality_mart import (
     METRIC_DICTIONARY_COLUMNS, REPORT_COLUMNS, TAB_SCHEMAS, VISIT_COLUMNS, GenerationPublisher,
     MartError, acquire_action_statuses, build_candidate, extract_project_action_rows,
+    summarize_observed_metrics,
     run_refresh, validate_collector_success, validate_report_source, validate_status_rows,
 )
 
@@ -44,7 +45,7 @@ def test_exact_schemas_and_source_id_normalization():
     assert tuple(candidate["controller_report_snapshot"][0]) == REPORT_COLUMNS
     assert tuple(candidate["controller_visit_summary"][0]) == VISIT_COLUMNS
     assert tuple(candidate["metric_dictionary"][0]) == METRIC_DICTIONARY_COLUMNS
-    assert any(row[2] == "workflow_39" and "not a controller error" in row[7]
+    assert any(row[2] == "status_39_reports" and "не ошибка контролёра" in row[7]
                for row in candidate["metric_dictionary"][1:])
     assert set(candidate) == set(TAB_SCHEMAS)
     assert candidate["controller_report_snapshot"][1][13] == "OBSERVED_PRESENT"
@@ -118,6 +119,70 @@ def test_empty_source_and_stale_collector_are_fail_closed():
     stale = {**COLLECTOR, "started_at": datetime(2026, 10, 25, 16, 0, tzinfo=timezone.utc)}
     with pytest.raises(MartError, match="not from today"):
         validate_collector_success(stale, now=NOW)
+
+
+def test_observed_workload_and_status_39_metrics_use_correct_grains_and_denominators():
+    reports = [
+        report("500", "500", visit_id="100", project_id="10", corrector_id="42"),
+        report("501", "501", visit_id="100", project_id="10", corrector_id="43",
+               corrector_fio="Other Person"),
+        report("502", "502", visit_id="200", project_id="10", corrector_id="43",
+               corrector_fio="Other Person"),
+        report("503", "503", visit_id="300", project_id="11", corrector_id="42"),
+    ]
+    candidate = build_candidate(
+        reports,
+        [action(visit="100", action_id="500", codes=[39]),
+         action(visit="100", action_id="501", codes=[]),
+         action(visit="300", project="11", action_id="503", codes=[])],
+        queried_project_ids={"10", "11"}, generation_id="f" * 32,
+        source_snapshot_at=NOW.isoformat(),
+    )
+
+    result = summarize_observed_metrics(candidate)
+
+    assert result["coverage"] == "OBSERVED_CORRECTOR_SNAPSHOT_ONLY"
+    assert result["controllers_count"] == 2
+    assert result["projects_count"] == 2
+    assert result["overall"] == {
+        "observed_reports": 4,
+        "observed_visits": 3,
+        "eligible_reports": 3,
+        "status_39_reports": 1,
+        "status_39_report_share": pytest.approx(1 / 3),
+        "eligible_visits": 2,
+        "status_39_visits": 1,
+        "status_39_visit_share": pytest.approx(1 / 2),
+    }
+    assert result["by_controller"]["42"]["status_39_reports"] == 1
+    assert result["by_controller"]["42"]["status_39_report_share"] == pytest.approx(1 / 2)
+    assert result["by_controller"]["43"]["eligible_reports"] == 1
+    assert result["by_controller"]["43"]["status_39_report_share"] == 0
+    # The same visit is associated with both controllers, so grouped distinct
+    # visit totals overlap and must not be summed into an overall total.
+    assert result["by_controller"]["42"]["observed_visits"] == 2
+    assert result["by_controller"]["43"]["observed_visits"] == 2
+    assert result["controller_visit_totals_additive"] is False
+    assert result["controller_project_totals_additive"] is False
+    assert result["status_39_semantics"].endswith("NOT_FAULT_OR_CLAIM_EVENT_COUNT")
+
+
+def test_status_39_rate_is_null_when_no_known_status_denominator_exists():
+    candidate = build_candidate(
+        [report("600", "600", visit_id="400", project_id="12", corrector_id="44",
+                corrector_fio="Unknown Status Person")],
+        [], queried_project_ids={"12"}, generation_id="1" * 32,
+        source_snapshot_at=NOW.isoformat(),
+    )
+
+    result = summarize_observed_metrics(candidate)
+    controller = result["by_controller"]["44"]
+    assert controller["eligible_reports"] == 0
+    assert controller["status_39_reports"] is None
+    assert controller["status_39_report_share"] is None
+    assert controller["eligible_visits"] == 0
+    assert controller["status_39_visits"] is None
+    assert controller["status_39_visit_share"] is None
 
 
 def test_collector_failure_blocks_but_success_with_no_new_rows_is_accepted():

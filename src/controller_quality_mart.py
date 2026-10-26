@@ -47,18 +47,28 @@ METRIC_DICTIONARY_COLUMNS = (
     "source_fields", "availability", "limitation",
 )
 METRIC_DICTIONARY = (
-    ("observed_reports", "Observed reports/actions", "Distinct report_id values in the observed corrector snapshot", "controller_report_snapshot.report_id", "AVAILABLE", "Partial source population; not a complete Portal report universe"),
-    ("projects_by_controller", "Projects by controller", "Distinct project_id values grouped by known corrector", "controller_report_snapshot.project_id,corrector_id", "AVAILABLE", "Observed assignments only; not a complete controller workload denominator"),
-    ("workflow_35", "Observed workflow membership 35", "Observed report rows with status_35=OBSERVED_PRESENT", "controller_report_snapshot.status_35", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
-    ("workflow_38", "Observed workflow membership 38", "Observed report rows with status_38=OBSERVED_PRESENT", "controller_report_snapshot.status_38", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
-    ("workflow_39", "Observed claim membership", "Observed report rows with status_39=OBSERVED_PRESENT", "controller_report_snapshot.status_39", "AVAILABLE", "Code 39 indicates claim membership; it is not a controller error count"),
-    ("workflow_40", "Observed workflow membership 40", "Observed report rows with status_40=OBSERVED_PRESENT", "controller_report_snapshot.status_40", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
-    ("workflow_45", "Observed workflow membership 45", "Observed report rows with status_45=OBSERVED_PRESENT", "controller_report_snapshot.status_45", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
-    ("workflow_50", "Observed workflow membership 50", "Observed report rows with status_50=OBSERVED_PRESENT", "controller_report_snapshot.status_50", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
-    ("controller_error_rate", "Controller error rate", "No qualified source outcome or denominator is available", "NOT_AVAILABLE", "NOT_AVAILABLE", "Do not infer controller fault from workflow state 39 or source status"),
-    ("claims_count", "Claims count", "No complete claim-level source fact is provided by this mart", "NOT_AVAILABLE", "NOT_AVAILABLE", "State 39 on observed report rows is not a complete claims count"),
-    ("review_completion_rate", "Review completion rate", "No qualified review-completion timestamp or denominator is available", "NOT_AVAILABLE", "NOT_AVAILABLE", "Do not interpret collector source_status as review completion"),
-    ("current_report_attribution", "Current report/corrector attribution", "Current version selection is unresolved", "controller_visit_summary.current_report_id,current_corrector_id", "NOT_AVAILABLE", "Multiple report versions are retained without selecting a current version"),
+    ("controllers_count", "Контролёры в наблюдаемом snapshot", "Distinct nonblank corrector_id values", "controller_report_snapshot.corrector_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Не число всех контролёров в Portal"),
+    ("projects_count", "Проекты в наблюдаемом snapshot", "Distinct project_id values", "controller_report_snapshot.project_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Не полная проектная совокупность Portal"),
+    ("observed_visits_count", "Наблюдаемые визиты", "Distinct (project_id, visit_id) keys in the snapshot", "controller_report_snapshot.project_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Визит может быть связан с несколькими контролёрами через разные отчёты; суммы по контролёрам неаддитивны"),
+    ("observed_reports_count", "Наблюдаемые отчёты", "Distinct report_id values in the snapshot", "controller_report_snapshot.report_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Не полный Portal report universe; равенство report_id=action_id подтверждено только для текущего snapshot"),
+    ("controller_visits", "Визиты по контролёрам", "Distinct (project_id, visit_id) grouped by corrector_id", "controller_report_snapshot.corrector_id,project_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Ассоциация, не оценка нагрузки или виновности; суммы по контролёрам могут перекрываться"),
+    ("controller_reports", "Отчёты по контролёрам", "Distinct report_id grouped by corrector_id", "controller_report_snapshot.corrector_id,report_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Отчёт связан с контролёром в источнике; не доказывает завершённую проверку"),
+    ("controller_projects", "Проекты по контролёрам", "Distinct project_id grouped by corrector_id", "controller_report_snapshot.corrector_id,project_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Проект может быть у нескольких контролёров; суммы неаддитивны"),
+    ("status_39_reports", "Отчёты в текущем статусе 39", "Distinct report_id with observed status_39=OBSERVED_PRESENT", "controller_report_snapshot.status_39,report_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Клиентский индикатор претензии; не число отдельных претензий и не ошибка контролёра"),
+    ("status_39_visits", "Визиты в текущем статусе 39", "Distinct (project_id, visit_id) with at least one associated report/action observed in status 39", "controller_report_snapshot.status_39,project_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Текущая membership snapshot, не историческое прохождение статуса и не число отдельных претензий"),
+    ("status_39_report_share", "Доля отчётов с текущим статусом 39", "Distinct status-39 reports divided by distinct reports with status_39 known", "controller_report_snapshot.status_39,report_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Знаменатель исключает UNKNOWN; только наблюдаемый snapshot"),
+    ("status_39_visit_share", "Доля визитов с текущим статусом 39", "Distinct visits with any associated status-39 report divided by distinct visits with at least one known status_39 row", "controller_report_snapshot.status_39,project_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Знаменатель исключает полностью UNKNOWN визиты; группы контролёров/проектов могут перекрываться"),
+    ("status_39_by_controller", "Статус 39 по контролёрам", "Distinct observed reports and visit keys with status_39 grouped by associated corrector_id", "controller_report_snapshot.corrector_id,status_39,report_id,project_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Ассоциативная группировка; не атрибуция причины или вины"),
+    ("status_39_by_project", "Статус 39 по проектам", "Distinct observed reports and visit keys with status_39 grouped by project_id", "controller_report_snapshot.project_id,status_39,report_id,visit_id", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Наблюдаемый snapshot; не полный клиентский claim register"),
+    ("status_39_rate_by_controller", "Доля статуса 39 по контролёру", "Status-39 eligible report or visit entities divided by same-grain known-status entities for the associated corrector", "controller_report_snapshot.corrector_id,status_39", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Не рейтинг качества; NULL при нулевом знаменателе; UNKNOWN не превращается в 0"),
+    ("status_39_rate_by_project", "Доля статуса 39 по проекту", "Status-39 eligible report or visit entities divided by same-grain known-status entities in the project", "controller_report_snapshot.project_id,status_39", "AVAILABLE_IN_OBSERVED_SNAPSHOT", "Не полный claim rate Portal; NULL при нулевом знаменателе"),
+    ("unusually_high_claim_rate", "Необычно высокая доля претензий", "No approved threshold, minimum sample size, or complete project population", "NOT_AVAILABLE", "NOT_AVAILABLE", "Не ранжировать и не присваивать риск по неполному наблюдаемому snapshot"),
+    ("individual_client_claim_count", "Количество отдельных претензий клиентов", "Workflow status membership does not count separate claim records", "NOT_AVAILABLE", "NOT_AVAILABLE", "Одна сущность/визит может иметь более одной претензии; отдельный claim ID/source отсутствует"),
+    ("controller_remarks", "Замечания контролёров к отчётам", "No verified mechanism is available and this subject is out of scope", "NOT_AVAILABLE", "NOT_AVAILABLE", "Не выводить из workflow status"),
+    ("controller_fault", "Ошибка контролёра", "Status 39 is not a causal fault or substantiation field", "NOT_AVAILABLE", "NOT_AVAILABLE", "Не делать причинную атрибуцию контролёру или тайному покупателю"),
+    ("historical_status_39_events", "Исторические переходы в статус 39", "The acquired action response is a current snapshot; no transition/event history is available", "NOT_AVAILABLE", "NOT_AVAILABLE", "Не подписывать как проходившие статус 39"),
+    ("review_completion_rate", "Доля завершённых проверок", "No qualified review-completion timestamp or denominator is available", "NOT_AVAILABLE", "NOT_AVAILABLE", "source_status — статус источника/коллектора, не завершение проверки"),
+    ("current_report_attribution", "Атрибуция текущей версии отчёта", "Current report version selection is unresolved", "NOT_AVAILABLE", "NOT_AVAILABLE", "Несколько report versions сохраняются; не выбирать по максимальному ID/дате"),
 )
 QUALITY_COLUMNS = (
     "publication_key", "schema_version", "active_generation", "refresh_status",
@@ -211,7 +221,7 @@ def build_candidate(
     *, queried_project_ids: Iterable[Any], generation_id: str | None = None,
     source_snapshot_at: str | None = None,
 ) -> dict[str, Any]:
-    """Build three fact tabs plus manifest data from observed source snapshots."""
+    """Build report/visit facts, quality manifest, and metric dictionary."""
     generation = generation_id or uuid.uuid4().hex
     if not re.fullmatch(r"[0-9a-f]{32}", generation):
         raise MartError("invalid generation_id")
@@ -340,6 +350,85 @@ def validate_candidate(candidate: Mapping[str, list[list[Any]]], *, expected_gen
         raise MartError("quality report counts do not reconcile")
     if quality[1][8] != len(visit_rows):
         raise MartError("quality visit count does not reconcile")
+
+
+def summarize_observed_metrics(candidate: Mapping[str, list[list[Any]]]) -> dict[str, Any]:
+    """Return aggregate-only metrics for the observed report snapshot.
+
+    Status 39 is treated as a current observed client-claim membership. Unknown
+    status matches are excluded from rate denominators, never coerced to zero.
+    Visits use the composite (project_id, visit_id) key. Grouped visit and
+    project counts may overlap across controllers.
+    """
+    try:
+        quality = candidate["data_quality_status"]
+        generation = quality[1][2]
+    except (KeyError, IndexError, TypeError):
+        raise MartError("metrics candidate generation is missing") from None
+    validate_candidate(candidate, expected_generation=str(generation))
+    report_rows = candidate["controller_report_snapshot"][1:]
+    report_index = {name: REPORT_COLUMNS.index(name) for name in REPORT_COLUMNS}
+    known = {"OBSERVED_PRESENT", "OBSERVED_ABSENT"}
+    status_index = report_index["status_39"]
+    report_id_index = report_index["report_id"]
+    project_index = report_index["project_id"]
+    visit_index = report_index["visit_id"]
+    controller_index = report_index["corrector_id"]
+
+    def bucket(rows: list[list[Any]]) -> dict[str, Any]:
+        reports = {str(row[report_id_index]) for row in rows}
+        visits: dict[tuple[str, str], list[list[Any]]] = defaultdict(list)
+        for row in rows:
+            visits[(str(row[project_index]), str(row[visit_index]))].append(row)
+        eligible_reports = {
+            str(row[report_id_index]) for row in rows if row[status_index] in known
+        }
+        status39_reports = {
+            str(row[report_id_index]) for row in rows
+            if row[status_index] == "OBSERVED_PRESENT"
+        }
+        eligible_visits = {
+            key for key, members in visits.items()
+            if any(row[status_index] in known for row in members)
+        }
+        status39_visits = {
+            key for key, members in visits.items()
+            if any(row[status_index] == "OBSERVED_PRESENT" for row in members)
+        }
+        return {
+            "observed_reports": len(reports),
+            "observed_visits": len(visits),
+            "eligible_reports": len(eligible_reports),
+            "status_39_reports": len(status39_reports) if eligible_reports else None,
+            "status_39_report_share": (
+                len(status39_reports) / len(eligible_reports) if eligible_reports else None
+            ),
+            "eligible_visits": len(eligible_visits),
+            "status_39_visits": len(status39_visits) if eligible_visits else None,
+            "status_39_visit_share": (
+                len(status39_visits) / len(eligible_visits) if eligible_visits else None
+            ),
+        }
+
+    by_controller_rows: dict[str, list[list[Any]]] = defaultdict(list)
+    by_project_rows: dict[str, list[list[Any]]] = defaultdict(list)
+    for row in report_rows:
+        controller_id = str(row[controller_index] or "").strip()
+        if controller_id:
+            by_controller_rows[controller_id].append(row)
+        by_project_rows[str(row[project_index])].append(row)
+
+    return {
+        "coverage": "OBSERVED_CORRECTOR_SNAPSHOT_ONLY",
+        "controllers_count": len(by_controller_rows),
+        "projects_count": len(by_project_rows),
+        "overall": bucket(report_rows),
+        "by_controller": {key: bucket(value) for key, value in sorted(by_controller_rows.items())},
+        "by_project": {key: bucket(value) for key, value in sorted(by_project_rows.items())},
+        "controller_visit_totals_additive": False,
+        "controller_project_totals_additive": False,
+        "status_39_semantics": "CURRENT_OBSERVED_CLIENT_CLAIM_MEMBERSHIP_NOT_FAULT_OR_CLAIM_EVENT_COUNT",
+    }
 
 
 def extract_project_action_rows(markup: str, project_id: Any) -> list[dict[str, Any]]:
