@@ -42,9 +42,23 @@ VISIT_COLUMNS = (
     "report_records_count", "known_corrector_ids", "current_report_id",
     "current_corrector_id", "version_resolution_status", "data_coverage_flag",
 )
-STATUS_COLUMNS = (
-    "publication_key", "generation_id", "project_id", "visit_id", "action_id",
-    "workflow_state_code", "workflow_state_label", "predicate_source", "observed_at",
+METRIC_DICTIONARY_COLUMNS = (
+    "publication_key", "generation_id", "metric_key", "display_name", "definition",
+    "source_fields", "availability", "limitation",
+)
+METRIC_DICTIONARY = (
+    ("observed_reports", "Observed reports/actions", "Distinct report_id values in the observed corrector snapshot", "controller_report_snapshot.report_id", "AVAILABLE", "Partial source population; not a complete Portal report universe"),
+    ("projects_by_controller", "Projects by controller", "Distinct project_id values grouped by known corrector", "controller_report_snapshot.project_id,corrector_id", "AVAILABLE", "Observed assignments only; not a complete controller workload denominator"),
+    ("workflow_35", "Observed workflow membership 35", "Observed report rows with status_35=OBSERVED_PRESENT", "controller_report_snapshot.status_35", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
+    ("workflow_38", "Observed workflow membership 38", "Observed report rows with status_38=OBSERVED_PRESENT", "controller_report_snapshot.status_38", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
+    ("workflow_39", "Observed claim membership", "Observed report rows with status_39=OBSERVED_PRESENT", "controller_report_snapshot.status_39", "AVAILABLE", "Code 39 indicates claim membership; it is not a controller error count"),
+    ("workflow_40", "Observed workflow membership 40", "Observed report rows with status_40=OBSERVED_PRESENT", "controller_report_snapshot.status_40", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
+    ("workflow_45", "Observed workflow membership 45", "Observed report rows with status_45=OBSERVED_PRESENT", "controller_report_snapshot.status_45", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
+    ("workflow_50", "Observed workflow membership 50", "Observed report rows with status_50=OBSERVED_PRESENT", "controller_report_snapshot.status_50", "AVAILABLE", "Current observed membership, not a transition or outcome count"),
+    ("controller_error_rate", "Controller error rate", "No qualified source outcome or denominator is available", "NOT_AVAILABLE", "NOT_AVAILABLE", "Do not infer controller fault from workflow state 39 or source status"),
+    ("claims_count", "Claims count", "No complete claim-level source fact is provided by this mart", "NOT_AVAILABLE", "NOT_AVAILABLE", "State 39 on observed report rows is not a complete claims count"),
+    ("review_completion_rate", "Review completion rate", "No qualified review-completion timestamp or denominator is available", "NOT_AVAILABLE", "NOT_AVAILABLE", "Do not interpret collector source_status as review completion"),
+    ("current_report_attribution", "Current report/corrector attribution", "Current version selection is unresolved", "controller_visit_summary.current_report_id,current_corrector_id", "NOT_AVAILABLE", "Multiple report versions are retained without selecting a current version"),
 )
 QUALITY_COLUMNS = (
     "publication_key", "schema_version", "active_generation", "refresh_status",
@@ -56,7 +70,7 @@ QUALITY_COLUMNS = (
 TAB_SCHEMAS = {
     "controller_report_snapshot": REPORT_COLUMNS,
     "controller_visit_summary": VISIT_COLUMNS,
-    "controller_status_membership": STATUS_COLUMNS,
+    "metric_dictionary": METRIC_DICTIONARY_COLUMNS,
     "data_quality_status": QUALITY_COLUMNS,
 }
 STATUS_CODES = (35, 38, 39, 40, 45, 50)
@@ -217,7 +231,6 @@ def build_candidate(
 
     status_by_action: dict[tuple[str, str, str], set[int]] = defaultdict(set)
     observed_action_keys: set[tuple[str, str, str]] = set()
-    status_tab: list[list[Any]] = [list(STATUS_COLUMNS)]
     unknown_status_count = 0
     for row in status_rows:
         key = (row["project_id"], row["action_id"], row["visit_id"])
@@ -226,11 +239,6 @@ def build_candidate(
             status_by_action[key].add(row["workflow_state_code"])
             if row["workflow_state_code"] not in WORKFLOW_STATES:
                 unknown_status_count += 1
-            status_tab.append([
-                PUBLICATION_KEY, generation, row["project_id"], row["visit_id"],
-                row["action_id"], row["workflow_state_code"],
-                WORKFLOW_STATES[row["workflow_state_code"]], row["predicate_source"], snapshot,
-            ])
 
     report_tab: list[list[Any]] = [list(REPORT_COLUMNS)]
     report_to_status_match: dict[tuple[str, str, str], bool] = {}
@@ -282,10 +290,13 @@ def build_candidate(
         unmatched, ambiguous_versions, unknown_status_count,
         "OBSERVED_CORRECTOR_SNAPSHOT_ONLY", source_freshness, len(queried),
     ]]
+    dictionary_tab = [list(METRIC_DICTIONARY_COLUMNS)] + [
+        [PUBLICATION_KEY, generation, *metric] for metric in METRIC_DICTIONARY
+    ]
     candidate = {
         "controller_report_snapshot": report_tab,
         "controller_visit_summary": visit_tab,
-        "controller_status_membership": status_tab,
+        "metric_dictionary": dictionary_tab,
         "data_quality_status": quality_tab,
     }
     validate_candidate(candidate, expected_generation=generation)
@@ -313,10 +324,10 @@ def validate_candidate(candidate: Mapping[str, list[list[Any]]], *, expected_gen
     visit_keys = [(str(row[2]), str(row[3])) for row in visit_rows]
     if len(visit_keys) != len(set(visit_keys)):
         raise MartError("duplicate visit key in candidate")
-    status_rows = candidate["controller_status_membership"][1:]
-    status_keys = [(str(row[2]), str(row[3]), str(row[4]), str(row[5])) for row in status_rows]
-    if len(status_keys) != len(set(status_keys)):
-        raise MartError("duplicate status membership in candidate")
+    metric_rows = candidate["metric_dictionary"][1:]
+    metric_keys = [str(row[2]) for row in metric_rows]
+    if len(metric_keys) != len(set(metric_keys)):
+        raise MartError("duplicate metric_key in candidate")
     quality = candidate["data_quality_status"]
     if len(quality) != 2 or quality[1][2] != expected_generation:
         raise MartError("quality status singleton contract failed")
@@ -421,7 +432,7 @@ class GenerationPublisher:
     """Append immutable generation rows, verify, then switch one manifest row."""
 
     FACT_TABS = (
-        "controller_report_snapshot", "controller_visit_summary", "controller_status_membership",
+        "controller_report_snapshot", "controller_visit_summary", "metric_dictionary",
     )
 
     def __init__(self, gateway: Any) -> None:
@@ -632,7 +643,7 @@ def run_refresh(
             "generation_id": generation,
             "source_report_count": len(candidate["controller_report_snapshot"]) - 1,
             "visit_count": len(candidate["controller_visit_summary"]) - 1,
-            "status_membership_count": len(candidate["controller_status_membership"]) - 1,
+            "metric_dictionary_count": len(candidate["metric_dictionary"]) - 1,
             "candidate_sha256": candidate_fingerprint(candidate),
             "coverage_status": "OBSERVED_CORRECTOR_SNAPSHOT_ONLY",
         }

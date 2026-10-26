@@ -2,7 +2,7 @@
 
 ## Decision
 
-Create a **new owner-provisioned Google spreadsheet** used only by the controller-quality mart. Keep the six existing J4B materialized tabs unchanged. The mart has four tabs: `controller_report_snapshot`, `controller_visit_summary`, `controller_status_membership`, and `data_quality_status`. All four must be in the same workbook so DataLens can join each fact tab to the generation manifest within one Google Sheets connection.
+Create a **new private Google spreadsheet** used only by the controller-quality mart. Keep the six existing J4B materialized tabs unchanged. The mart has four tabs: `controller_report_snapshot`, `controller_visit_summary`, `data_quality_status`, and `metric_dictionary`. Workflow flags are materialized on the report snapshot; the dictionary marks unsupported measures `NOT_AVAILABLE` and documents limitations.
 
 The published data is an observed sample, not the complete Portal report population. The existing `report_reviewers` source contains reports with a known positive corrector; historical observed count was 722 reports and 22 correctors at the 2026-10-25 collection. These are checkpoints, not expected totals. A documented live report is absent from the global registry/checkpoint/sheet, so completeness is explicitly `OBSERVED_CORRECTOR_SNAPSHOT_ONLY`.
 
@@ -12,7 +12,7 @@ The published data is an observed sample, not the complete Portal report populat
 |---|---|---|---|
 | `controller_report_snapshot` | One observed report/action record | `report_id`; action attribution uses `(project_id, action_id, visit_id)` | `PRESENT`, `OBSERVED_ABSENT`, or `UNKNOWN`; absence is only asserted after a structurally valid project-scoped action response contains the exact action row |
 | `controller_visit_summary` | One business visit | `(project_id, visit_id)` | Keeps all known report IDs; current report/corrector remain blank with `UNRESOLVED_CURRENT_VERSION_RULE` |
-| `controller_status_membership` | One report/action status predicate | `(project_id, visit_id, action_id, workflow_state_code)` | Memberships may overlap; this is a current snapshot, not a transition log |
+| `metric_dictionary` | One documented metric | `metric_key` | Includes supported observed measures and explicit `NOT_AVAILABLE` metrics |
 | `data_quality_status` | One active generation | `publication_key` | Pointer and freshness/coverage metadata; written only after fact rows are staged and read back |
 
 Statuses are joined to reports only by project, action, and visit identity, never by `visit_id` alone. Project-level status counters are not used to infer report status. Missing action-level membership is `UNKNOWN`; it is not converted to false. `35`, `38`, and `39` keep their Portal meanings; `39` is a claim membership, not proof of controller error. No status history is reconstructed from simultaneous memberships.

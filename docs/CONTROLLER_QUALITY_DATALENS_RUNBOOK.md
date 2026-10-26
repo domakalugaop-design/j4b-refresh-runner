@@ -8,8 +8,8 @@ Create exactly these tabs with the exact header rows from `src/controller_qualit
 
 1. `controller_report_snapshot`
 2. `controller_visit_summary`
-3. `controller_status_membership`
-4. `data_quality_status`
+3. `data_quality_status`
+4. `metric_dictionary`
 
 Do not add sample production rows. A new blank workbook can contain headers only; the first active generation is created by a later separately approved deployment.
 
@@ -17,13 +17,14 @@ Yandex documents that one Google Sheets connection can include multiple tabs as 
 
 ## Dataset pattern
 
-Create a dataset per fact grain. Join that fact to `data_quality_status` using `publication_key`, then filter the fact’s `generation_id` to the single manifest `active_generation`. Do not join report and status facts directly unless the dataset uses the exact project/action/visit key and handles one-to-many status rows intentionally.
+Create a dataset per fact grain. Join that fact to `data_quality_status` using `publication_key`, then filter the fact’s `generation_id` to the single manifest `active_generation`.
 
 Fields:
 
 - report fact: report/action/visit/project IDs, report date, corrector ID/FIO, status flags, report URL, source status, coverage flag.
 - visit fact: project/visit IDs, all observed report IDs, report-record count, known corrector IDs, unresolved-current-version label.
-- status fact: project/visit/action IDs, numeric state code, Portal state label, observation timestamp.
+- workflow status: report-level tri-state flags for supported codes; current observed memberships, not a transition log.
+- metric dictionary: metric key, display name, definition, source fields, availability, and limitation.
 - quality manifest: source and published counts, unmatched rows, ambiguous versions, unknown statuses, source freshness, refresh status, active generation, coverage status.
 
 ## Suggested charts and measures
@@ -32,7 +33,7 @@ Use only the filtered active generation:
 
 - **Known report/action records by corrector:** distinct count of `report_id`, grouped by `corrector_fio`; label as “observed reports with known corrector”.
 - **Known visits by corrector:** distinct count of composite `(project_id, visit_id)`; because one visit can have several correctors/versions, mark as attribution-overlap-capable and do not sum across correctors as a total.
-- **Observed workflow membership by code:** distinct `report_id` where a status flag equals `OBSERVED_PRESENT`, grouped by status or use the status fact. Label each as a current observed membership, not event count or outcome.
+- **Observed workflow membership by code:** distinct `report_id` where each status flag equals `OBSERVED_PRESENT`. Label as current observed membership, not event count or outcome.
 - **Multi-version visits:** count visits with `report_records_count > 1`; show `version_resolution_status`.
 - **Unknown status matches:** report count with status flags `UNKNOWN`; this is a data coverage indicator.
 - **Freshness/coverage:** show `last_successful_refresh_at`, `source_snapshot_at`, `source_freshness`, `coverage_status`, and `refresh_status` from the manifest.
@@ -53,7 +54,7 @@ Do not publish rates or rankings. The source does not provide a proven complete 
 
 1. Open Yandex DataLens and create a Google Sheets connection to the owner-provisioned workbook.
 2. Verify all four tabs appear as separate tables and headers are recognized.
-3. Create report, visit, status, and quality datasets with the active-generation filter.
+3. Create report, visit, quality, and metric-dictionary datasets; apply active-generation filtering to generated data.
 4. Verify IDs remain dimensions (string or integer consistently), dates parse as dates, status flags remain strings, and counts are measures.
 5. Add filters for corrector, project ID, report date, status membership, and coverage label.
 6. Add a drilldown link from `report_url`; preserve exact action/report ID.

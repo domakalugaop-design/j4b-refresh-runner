@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from src.controller_quality_mart import (
-    REPORT_COLUMNS, STATUS_COLUMNS, TAB_SCHEMAS, VISIT_COLUMNS, GenerationPublisher,
+    METRIC_DICTIONARY_COLUMNS, REPORT_COLUMNS, TAB_SCHEMAS, VISIT_COLUMNS, GenerationPublisher,
     MartError, acquire_action_statuses, build_candidate, extract_project_action_rows,
     run_refresh, validate_collector_success, validate_report_source, validate_status_rows,
 )
@@ -43,7 +43,9 @@ def test_exact_schemas_and_source_id_normalization():
                                 generation_id="a" * 32, source_snapshot_at=NOW.isoformat())
     assert tuple(candidate["controller_report_snapshot"][0]) == REPORT_COLUMNS
     assert tuple(candidate["controller_visit_summary"][0]) == VISIT_COLUMNS
-    assert tuple(candidate["controller_status_membership"][0]) == STATUS_COLUMNS
+    assert tuple(candidate["metric_dictionary"][0]) == METRIC_DICTIONARY_COLUMNS
+    assert any(row[2] == "workflow_39" and "not a controller error" in row[7]
+               for row in candidate["metric_dictionary"][1:])
     assert set(candidate) == set(TAB_SCHEMAS)
     assert candidate["controller_report_snapshot"][1][13] == "OBSERVED_PRESENT"
 
@@ -300,7 +302,7 @@ def test_generation_publication_verifies_ranges_then_pointer_last():
 def test_target_readonly_validation_requires_exact_four_headers():
     gateway = FakeGateway()
     GenerationPublisher(gateway).validate_target()
-    gateway.data["controller_status_membership"][0][0] = "wrong"
+    gateway.data["metric_dictionary"][0][0] = "wrong"
     with pytest.raises(Exception, match="schema"):
         GenerationPublisher(gateway).validate_target()
 
