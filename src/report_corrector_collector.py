@@ -26,6 +26,7 @@ from html.parser import HTMLParser
 from typing import Any, Callable, Collection, Iterable, Mapping
 
 from .report_reviewer import ReportCorrectorParseError, parse_report_corrector
+from .report_inventory import ReportInventoryPage
 
 START_DATE = date(2026, 10, 1)
 REGISTRY_PATH = "/report/"
@@ -270,6 +271,46 @@ def merge_candidates(state: dict[str, Any], report_ids: Iterable[str], *, discov
         }
         added += 1
     return added
+
+
+def bounded_project_report_candidates(
+    page: ReportInventoryPage,
+    project_id: str,
+    existing_report_ids: Collection[str],
+    *,
+    max_candidates: int,
+) -> tuple[str, ...]:
+    """Validate one explicit project-page supplement without assuming completeness.
+
+    The global ``/report/`` registry has a reproduced omission. This optional
+    fallback is restricted to a caller-specified project, one non-paginated
+    project report page, and a candidate ceiling no larger than the remaining
+    detail-GET budget. It fails closed on pagination or a cross-project row; it
+    is not a substitute for a complete global registry.
+    """
+    pid = str(project_id).strip()
+    if not pid.isdigit() or int(pid) <= 0:
+        raise CollectorError("invalid project report fallback project_id")
+    if not 0 <= max_candidates <= MAX_DETAIL_GETS_PER_RUN:
+        raise CollectorError("project report fallback budget is outside the detail GET cap")
+    if page.tables < 1:
+        raise CollectorError("project report listing has no table")
+    if page.pagination:
+        raise CollectorError("project report listing is paginated; fallback is incomplete")
+    if set(page.project_ids) != {pid}:
+        raise CollectorError("project report listing contains a different project")
+    if any(row.project_id and row.project_id != pid for row in page.rows):
+        raise CollectorError("project report row belongs to a different project")
+
+    page_ids = set(page.report_ids)
+    if len(page_ids) > max_candidates:
+        raise CollectorError("project report listing exceeds the bounded candidate limit")
+    if any(not report_id.isdigit() or int(report_id) <= 0 for report_id in page_ids):
+        raise CollectorError("project report listing contains an invalid report id")
+    candidates = tuple(sorted(page_ids - {str(value) for value in existing_report_ids}, key=int))
+    if len(candidates) > max_candidates:
+        raise CollectorError("project report listing exceeds the remaining detail GET budget")
+    return candidates
 
 
 def record_discovery(

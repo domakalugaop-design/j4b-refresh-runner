@@ -5,28 +5,32 @@ corrector ("Проверил") together with its project, visit and filing date,
 publishes them into the `report_reviewers` tab of the materialized-layer
 spreadsheet.
 
-Status: collection path and publication path are verified end-to-end against the
-live portal and live spreadsheet metadata. The `report_reviewers` tab has **not**
-been created or written yet.
+Status: collection and publication path have been verified against the live
+portal and spreadsheet. A 2026-10-26 readback showed 722 unique `report_id`
+rows, all reconciled to the schema-2 checkpoint. This is a corrector-only
+materialized set, not a completeness guarantee for all portal reports: a later
+bounded check reproduced a report absent from the global registry/checkpoint/tab.
 
 ## Verified portal model
 
 | Question | Answer | Evidence |
 | --- | --- | --- |
 | Detail page for a report | `/action/{id}` | `/report/{id}` redirects to `/report/`; three sampled IDs returned the identical listing page |
-| Report/action join | `report_id == action_id` | 3/3 sampled IDs: the action page links `/report/{same id}`, `/proj/{expected}` and one `/visit/{id}` |
+| Report/action join | `report_id == action_id` | current Sheets readback 722/722 plus limited live detail samples; each sampled action page links one report, project and visit |
 | Corrector field | `select[name=staff]` on the action page | parsed to `VALUE_PRESENT` with a numeric employee ID and a 3-word FIO |
 | Report filing date | `input[name=dt]` on the action page | `/proj/7986/report` lists each report under exactly that date |
 | October inventory | `POST /report/` with `dt1 = dt2 = day` | see coverage calibration below |
 
 ### Why the registry, not the project page
 
-`/proj/{id}/report` is a closed-month journal: project 7986 showed 1124 reports,
-all dated 2026-09-01..2026-09-30, with 0 October rows. The page has no date,
-month or period control (`forms: ["", ""]`, the only field is
-`textarea[name=log-body-25]`), and `dt1`/`dt2` are ignored on `GET` and `POST`
-alike. It also does not change when the registry session state changes
-(byte-identical responses), so it cannot be steered to October.
+`/proj/{id}/report` is project-scoped and its observed period behavior is not
+uniform across projects. Project 7986 showed 1124 reports dated
+2026-09-01..2026-09-30 and 0 October rows at the earlier probe; it had no date
+or month filter (`textarea[name=log-body-25]` was the only field). In the new
+bounded check, another project's page contained five report IDs including a
+17-October report omitted by the global registry. Therefore a project journal
+can be a cross-check for a known project, but it is not established as a
+complete global inventory or a universal replacement for `/report/`.
 
 The registry (`/report/`) does filter by date, at day granularity with 96-100%
 precision (2026-10-02: 100% of returned rows on the requested day).
@@ -43,10 +47,18 @@ registry for the same day:
 | Project reports present in registry | **1123 / 1124 (99.91%)** |
 | Registry reports from other projects | 1025 |
 
-The registry is therefore a cross-project superset with 99.91% coverage; one
-report of the 1124 was absent. October coverage cannot be cross-checked the same
-way because no project page exposes October yet, so October completeness carries
-that residual ~0.1% risk plus day-to-day registry variance.
+The registry is therefore a cross-project superset in that calibration, with
+1123/1124 observed project reports present; one report was absent. **99.91% is a
+historical sample result, not a guaranteed completeness bound.** A later bounded
+check found a live status39 report filed 2026-10-17 (corrector selected and
+detail route valid) that was not in the day-filtered registry response, the
+checkpoint, or `report_reviewers`; the same project report listing did contain
+it. Day, 3-day and October-range global registry reads returned 144, 468 and
+5,058 IDs respectively without the sample. The responses showed no pagination
+controls, and the sample ID was absent from raw registry HTML, so the collector
+parser did not discard a received link. The source inclusion rule remains
+unknown; October registry completeness is known to be imperfect, with total
+missed count unknown.
 
 ## Semantics
 
@@ -55,6 +67,10 @@ that residual ~0.1% risk plus day-to-day registry variance.
   an action page.
 - `visit_id`, `project_id` — taken from the action page's single visit/project
   link. A page that resolves to zero or several of either fails closed.
+- One visit may have multiple distinct action/report IDs in the portal. The
+  collector keeps report IDs separate and does not collapse them by visit; the
+  business rule for selecting one operative version per visit is not yet
+  established.
 - `report_date` — the action page's `dt`, i.e. the date the portal files the
   report under. It is **not** the visit date and **not** a corrector timestamp.
 - `corrector_id` / `corrector_fio` — the selected `staff` option, only when the
@@ -69,6 +85,17 @@ that residual ~0.1% risk plus day-to-day registry variance.
   failed, previous values kept), `FETCH_FAILED_NO_HISTORY` (failed, no previous
   values), `PENDING`.
 - `last_successful_fetch` — UTC ISO-8601 timestamp of the last successful read.
+
+### Visit/action versioning
+
+`report_id == action_id` is confirmed for each tested detail record and 722/722
+current sheet rows, but it does **not** imply one action/report per visit. A
+bounded live sample found two separate report/action IDs on one visit (older
+code 15 with no selected corrector; later code 39 with a selected corrector).
+Do not deduplicate reports by `visit_id` or assume the highest ID/date is the
+current version. A limited project report listing surfaced the later report and
+not the older one in that sample, but no global current-version contract was
+found. See `docs/ACTION_VERSIONING_FINDINGS.md`.
 
 ## Corrector-only dataset
 

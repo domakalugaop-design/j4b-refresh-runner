@@ -19,7 +19,7 @@ Dashboard, dataset, таблицы и публикации в рамках ис�
 
 | Поле | Тип/nullable | Статус | Источник/правило |
 |---|---|---|---|
-| `report_id` | string / required | CONFIRMED | `report_reviewers.report_id`; decimal identifier normalized as string |
+| `report_id` | string / required | CONFIRMED per observed row; population incomplete | `report_reviewers.report_id`; decimal identifier normalized as string; global registry omitted a report visible in the project report list |
 | `action_id` | string / required | CONFIRMED on observed 722 | `report_reviewers.action_id`; equals report_id 722/722 in current readback |
 | `visit_id` | string / required for observed rows | CONFIRMED on observed 722 | `report_reviewers.visit_id`; do not infer report status from it |
 | `project_id` | string / required | CONFIRMED | `report_reviewers.project_id`; project dimension join separately validated |
@@ -83,9 +83,11 @@ Until report inventory completeness, action/report version selection, and comple
 
 1. Keep the existing approved portal auth flow plus project/date/status-filter `POST /action` strictly read-only; PostgreSQL is not required for this proposal and was not used.
 2. Preserve project→visit→action/report links and the exact status source; distinguish project sums, payment-mapped visit snapshots, report/action memberships and transition events.
-3. Reconcile registry completeness: one live status39 report was not in the day registry/checkpoint/sheet despite a report date within collector scope.
+3. Reconcile registry completeness: one live status39 report was in the project report list but not the day/3-day/month global registry/checkpoint/sheet; the server-side inclusion rule remains unknown.
 4. Validate bounded real cases for status 39, codes 35/38, multiple action/report records on one visit, no-controller and a completed/approved report; keep samples private.
 5. Confirm report-to-action status join cardinality and how to select the operative report version for one business operation.
 6. Confirm `review_date` and corrector-at-review attribution; otherwise suppress “checked by controller” comparison.
 7. Re-read current Google Sheets data and reconcile IDs; do not assume the 722 baseline remains current.
 8. Only after these gates: implement the physical dataset and dashboard in a separately authorized task.
+
+The development branch also contains an **opt-in** `--supplement-project-report PROJECT_ID` recovery path: one explicit, non-paginated project report page, one project per invocation, and no more candidate IDs than the detail GET budget. It is not enabled by default or by the production timer, was not run here, and cannot guarantee global coverage.

@@ -56,7 +56,7 @@ report_reviewers.report_id == report_reviewers.action_id
 
 Среди 720 report-reviewer keys, совпавших с payment visit table, current `workflow_state_codes` дают: code 35 — 7; 38 — 1; 39 — 0; 37 — 0; 40 — 696; 50 — 139. Counts пересекаются и не складываются. Все 720 matched visits имеют как минимум один код из {37,40,50}; это согласуется с кодовой формулой `finished_visits`, но не доказывает completed review именно контролёром. Два unmatched reports в ограниченном portal check имеют current code 50.
 
-Есть зафиксированный пробел покрытия: найденный live report/action с code 39, датой 2026-10-17 и выбранным corrector отсутствует в checkpoint и `report_reviewers`; date-filtered registry read тем же DMY форматом не вернул его (144 других IDs за день). Поэтому 722-строчная вкладка не полна по отношению к порталу.
+Есть зафиксированный пробел покрытия: live report/action с code39, датой 2026-10-17 и выбранным corrector отсутствует в checkpoint и `report_reviewers`; day/3-day/month date-filtered `/report/` reads его не возвращали, хотя `/proj/{project_id}/report` для того же проекта содержит его. Поэтому 722-строчная вкладка не полна по отношению к порталу. Dev содержит только opt-in single-project fallback; он не был запущен и не даёт global completeness guarantee.
 
 Sum code 39 в nonblank project aggregate rows `projects_current` и `Статусы проектов` = 32; workflow fields заполнены только для 617/8,088 projects, поэтому это не complete portal total. `Выплаты по визитам` содержит code39 membership на 50 visit keys в payment-scoped population. Эти populations/grains не совпадают. Ни одно значение нельзя использовать как окончательный report-level numerator без reconciliation.
 

@@ -12,6 +12,11 @@ Usage:
     python3 scripts/run_report_corrector_collector.py --state /path/state.json \
         [--max-fetches 50] [--days-back 3] [--recheck ID] [--plan] [--publish]
 
+An explicitly requested, single-project report-list fallback is available via
+``--supplement-project-report PROJECT_ID``. It is bounded by the remaining
+detail-GET budget and refuses paginated/project-mismatched pages. It is not
+enabled by default and is not a global completeness guarantee.
+
 Hard limits: at most 200 detail GETs per run and at least 1.5 s between them.
 Stable reports (a known corrector, or a removed one) are never re-read on a
 schedule; pass ``--recheck`` to re-read chosen IDs once.
@@ -32,14 +37,17 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.portal_transport import PortalSession  # noqa: E402
 from src.report_corrector_collector import (  # noqa: E402
-    DEFAULT_POLICY, MAX_DETAIL_GETS_PER_RUN, MIN_REQUEST_INTERVAL_SECONDS,
-    START_DATE, collect_batch, coverage_summary, extract_registry_report_ids,
-    mark_published, migrate_state, new_state, queue_remaining, reconcile_dataset,
-    record_discovery, render_sheet_rows, request_manual_recheck, validate_sheet_rows,
+    DEFAULT_POLICY, MAX_DETAIL_GETS_PER_RUN, MIN_REQUEST_INTERVAL_SECONDS, CollectorError,
+    START_DATE, bounded_project_report_candidates, collect_batch, coverage_summary,
+    extract_registry_report_ids, mark_published, merge_candidates, migrate_state,
+    new_state, queue_remaining, reconcile_dataset, record_discovery, render_sheet_rows,
+    request_manual_recheck, validate_sheet_rows,
 )
+from src.report_inventory import extract_report_inventory  # noqa: E402
 
 SPREADSHEET_ID = "14PRG3HXsZaN4pVwV390PpMMqHupCW5j6RyI6HBzPQR8"
 REFRESH_WINDOWS_MSK = ((9 * 60 + 55, 10 * 60 + 20), (16 * 60 + 55, 17 * 60 + 20))
+MAX_PROJECT_REPORT_FALLBACK_PROJECTS = 1
 BASE_URL = "https://lk.j4b.ru"
 
 
@@ -74,6 +82,33 @@ def _moscow_now() -> datetime:
 def _in_refresh_window(now: datetime) -> bool:
     minutes = now.hour * 60 + now.minute
     return any(start <= minutes <= end for start, end in REFRESH_WINDOWS_MSK)
+
+
+def fetch_project_report_supplement(
+    session: PortalSession,
+    project_id: str,
+    existing_report_ids: set[str],
+    *,
+    max_candidates: int,
+    interval: float = MIN_REQUEST_INTERVAL_SECONDS,
+    sleep=None,
+):
+    """Read one explicit project report page and fail closed on partial scope."""
+    import time
+
+    sleep = sleep or time.sleep
+    if session.requests:
+        sleep(interval)
+    status, content_type, body = session.request(
+        f"/proj/{project_id}/report", "GET", accept="text/html, application/json",
+    )
+    if status != 200 or "html" not in content_type.lower():
+        raise CollectorError("project report fallback did not return an HTML page")
+    page = extract_report_inventory(body.decode("utf-8", errors="replace"), base_url=BASE_URL)
+    candidates = bounded_project_report_candidates(
+        page, project_id, existing_report_ids, max_candidates=max_candidates,
+    )
+    return page, candidates
 
 
 def _build_gateway():
@@ -139,6 +174,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--recheck", action="append", default=[], metavar="REPORT_ID",
                         help="re-read this report id once (repeatable, comma separated)")
     parser.add_argument("--skip-discovery", action="store_true")
+    parser.add_argument(
+        "--supplement-project-report", action="append", default=[], metavar="PROJECT_ID",
+        help=("opt-in GET of one explicit /proj/{id}/report page to supplement registry discovery; "
+              "bounded and not a global completeness scan"),
+    )
     parser.add_argument("--plan", action="store_true", help="read-only publication plan")
     parser.add_argument("--publish", action="store_true", help="publish the tab")
     args = parser.parse_args(argv)
@@ -150,6 +190,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "REFUSED_INTERVAL",
                           "minimum": MIN_REQUEST_INTERVAL_SECONDS}, ensure_ascii=False))
         return 2
+    if args.supplement_project_report:
+        project_ids = [str(value).strip() for value in args.supplement_project_report]
+        if args.skip_discovery:
+            print(json.dumps({"status": "REFUSED_PROJECT_SUPPLEMENT_WITH_SKIP_DISCOVERY"}, ensure_ascii=False))
+            return 2
+        if args.recheck:
+            print(json.dumps({"status": "REFUSED_PROJECT_SUPPLEMENT_WITH_MANUAL_RECHECK"}, ensure_ascii=False))
+            return 2
+        if args.max_fetches <= 0:
+            print(json.dumps({"status": "REFUSED_PROJECT_SUPPLEMENT_WITH_ZERO_BUDGET"}, ensure_ascii=False))
+            return 2
+        if len(project_ids) > MAX_PROJECT_REPORT_FALLBACK_PROJECTS:
+            print(json.dumps({"status": "REFUSED_TOO_MANY_PROJECT_SUPPLEMENTS",
+                              "limit": MAX_PROJECT_REPORT_FALLBACK_PROJECTS}, ensure_ascii=False))
+            return 2
+        if any(not project_id.isdigit() or int(project_id) <= 0 for project_id in project_ids):
+            print(json.dumps({"status": "REFUSED_INVALID_SUPPLEMENT_PROJECT"}, ensure_ascii=False))
+            return 2
 
     now_local = _moscow_now()
     if _in_refresh_window(now_local):
@@ -181,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     session = None
+    project_fallback_scope: set[str] | None = None
     if not args.skip_discovery:
         with open(credentials_path, encoding="utf-8") as stream:
             config = json.load(stream)
@@ -212,6 +271,31 @@ def main(argv: list[str] | None = None) -> int:
                 added += counts["added"]
                 late += counts["late_adds"]
                 day += timedelta(days=1)
+            if args.supplement_project_report:
+                project_id = args.supplement_project_report[0]
+                try:
+                    page, candidates = fetch_project_report_supplement(
+                        session, project_id, set(state["reports"]),
+                        max_candidates=args.max_fetches, interval=args.interval,
+                    )
+                except Exception as exc:
+                    print(json.dumps({
+                        "status": "PROJECT_REPORT_FALLBACK_REFUSED",
+                        "error_class": type(exc).__name__,
+                    }, ensure_ascii=False))
+                    return 2
+                fallback_added = merge_candidates(
+                    state, candidates, discovered_for=today.isoformat(),
+                )
+                project_fallback_scope = set(page.report_ids)
+                report["project_report_fallback"] = {
+                    "projects_scanned": 1,
+                    "report_rows_seen": len(page.rows),
+                    "unique_report_ids_seen": len(page.report_ids),
+                    "new_candidates": len(candidates),
+                    "added_to_checkpoint": fallback_added,
+                    "paginated": page.pagination,
+                }
             _save_state(state_path, state)
             report["discovered"] = added
             report["late_ids"] = late
@@ -239,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
                 policy=DEFAULT_POLICY,
                 save=lambda payload: _save_state(state_path, payload),
                 request_interval_seconds=args.interval,
+                scope=project_fallback_scope,
             )
     finally:
         if fetch_session is not None:

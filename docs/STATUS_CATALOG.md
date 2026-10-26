@@ -10,7 +10,7 @@
 - **CONFIRMED:** код `35` имеет label «Анкета отклонена», код `38` — «Вопрос координатору». Для одного report/action каждого кода ограниченный HTTPS read-only search подтвердил membership и совпадение `action_id` со строкой `report_reviewers`. Это не доказывает возврат на замечания ТП.
 - **PARTIAL:** текущий словарь workflow кодов подтверждён, но значения в разных вкладках относятся к различным population/grain. Сумма `workflow_state_39_visits` по nonblank rows двух project-level вкладок — 32; в `Выплаты по визитам.workflow_state_codes` код 39 встретился в 50 composite visit keys. Workflow поля заполнены только для 617/8,088 projects; остальные blanks не означают zero. Эти итоги не совпадают и не должны взаимозаменяться.
 - **UNKNOWN:** отдельный report-level `status_id`/current field, точная семантика возврата тайному покупателю и complete report-transition history.
-- **CONFIRMED limitation:** в ограниченной выборке обнаружен report с датой 2026-10-17, выбранным контролёром и workflow 39, отсутствующий в `report_reviewers`, checkpoint и дневном registry read (`POST /report/`, dt1=dt2=`17.10.2026`; 144 других unique report IDs returned). Значит 722-строчный corrector sheet не полон по отношению к порталу.
+- **CONFIRMED limitation:** в ограниченной выборке обнаружен report с датой 2026-10-17, выбранным контролёром и workflow 39, присутствующий в `/proj/{project_id}/report`, но отсутствующий в `report_reviewers`, checkpoint и дневном global registry read (`POST /report/`, dt1=dt2=`17.10.2026`; 144 других unique report IDs returned). Значит 722-строчный corrector sheet не полон по отношению к порталу.
 
 ## Подтверждённые workflow-коды
 
