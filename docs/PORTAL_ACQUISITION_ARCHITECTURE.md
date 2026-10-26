@@ -19,7 +19,7 @@ Evidence classes used below:
 | # | Source | Grain | Verified this stage | Notes |
 |---|--------|-------|---------------------|-------|
 | S1 | `POST /action` global, all states | action row (visit-linked) | MEASURED (saved GET + prior POST) | Current-state registry; capped at `limit`; **date filter not enforced**; state filter enforced |
-| S2 | `POST /action` per-project (`proj=["<id>"]`, all states, `limit=10000`) | action row (visit-linked) | MEASURED (live, project 8050) | **Complete per-project visit registry**: 38 action rows → 27 distinct visit_ids = exactly the 27 visits on `/proj/8050` |
+| S2 | `POST /action` per-project (`proj=["<id>"]`, all states, `limit=10000`) | action row (visit-linked) | MEASURED (live, project 8050) | **Complete per-project visit registry**: 39 action rows → 27 distinct visit_ids = exactly the 27 visits on `/proj/8050` (count corrected from 38 — earlier ad-hoc under-count, see `docs/ACCEPTANCE_2026-10-26_MULTIPROJECT.md` §A) |
 | S3 | `POST /action` `state[39]=on` + `empty=on` | action row | MEASURED (live) | Complete current-claims list: **12 rows** (test-project claim excluded, see §5) |
 | S4 | `/report/` registry (`POST /report/`) | report id list | PRIOR-VERIFIED | `dt1/dt2` **enforced** here (day=144, 3-day=468, month=5058 report ids); misses status-39 reports and visits without reports |
 | S5 | SOURCE tab «Выплаты по визитам» | visit (project_id, visit_id) | MEASURED (Google API read) | 89 128 rows; `workflow_state_codes` per visit; **no date columns**; covers all 13 known claim visits; 54 rows contain code 39 (includes resolved/stale states) |
@@ -62,8 +62,9 @@ rows; MEASURED). Deduplicate by visit_id for visit counts.
 
 ## 4. Controller linkage findings
 
-- Every assigned row of S1/S2 carries the controller **FIO** (no controller ID) — MEASURED
-  (38/38 rows of project 8050; 648 of 905 assigned rows in the saved global GET).
+- Every assigned row of S1/S2 carries the controller **FIO** field (no controller ID) — MEASURED
+  (39/39 rows of project 8050 carry the field; only 28/39 have it populated — intermediate
+  workflow rows (5/15/25/45) leave it empty; see `docs/ACCEPTANCE_2026-10-26_MULTIPROJECT.md` §A/§B).
 - Controller IDs exist only in report details (existing `report_reviewers` pipeline, 722 rows,
   22 controllers — PRIOR-VERIFIED). Join key between S2 FIO and mart IDs is FIO text —
   normalization risk is real and must be gated (INFERRED).
@@ -128,7 +129,7 @@ Measured values are marked; the rest are estimates derived from measured sizes.
 
 | Strategy | Portal requests / refresh | Response volume | Completeness |
 |---|---|---|---|
-| Collector per-project crawl (existing, 57+ projects) | ~3 per project ≈ 170+ (MEASURED pattern: 3/project) | per-project action ≈ 150 KB (MEASURED, 38 rows); scales with project size | Complete per project |
+| Collector per-project crawl (existing, 57+ projects) | ~3 per project ≈ 170+ (MEASURED pattern: 3/project) | per-project action ≈ 150 KB (MEASURED, 39 rows); scales with project size | Complete per project |
 | Claims cross-check (S3) | 1 (MEASURED) | ~124 KB (MEASURED) | Complete current state |
 | Global S1 all-states fetch | 1 | ≥ 60 MB estimated (89k+ rows × ~0.7 KB) — **rejected** | Truncated at limit |
 | S4 report registry (proxy) | 1–3 (PRIOR-VERIFIED pattern) | small (id lists) | Report-grain only |

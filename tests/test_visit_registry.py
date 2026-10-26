@@ -581,6 +581,28 @@ def test_publication_allows_complete_current_replace(facts: list[dict]):
     assert plan["status"] == "PUBLISH"
 
 
+def test_publication_rewrites_partially_written_current(facts: list[dict]):
+    """A current tab holding only some of this snapshot's rows (e.g. a write
+    interrupted mid-update) must be rewritten, not accepted as complete."""
+    from scripts.publish_visit_registry_test import (
+        CURRENT_HEADER,
+        _visit_row,
+        build_publication_plan,
+    )
+    payload = _payload(facts)
+    grain = payload["visit_grain"]
+    assert len(grain) > 1
+    partial_current = [list(CURRENT_HEADER)] + [
+        _visit_row(visit, payload["manifest"]["snapshot_id"]) for visit in grain[:-1]
+    ]
+    plan = build_publication_plan(payload, {"visits_current": partial_current}, "2026-10-26T14:00:00Z")
+    assert plan["status"] == "PUBLISH"
+    current_ops = [op for op in plan["ops"] if op["title"] == "visits_current"]
+    assert any(op["op"] == "clear_rows" for op in current_ops)
+    write = next(op for op in current_ops if op["op"] == "write_rows")
+    assert len(write["rows"]) == len(grain)
+
+
 def test_publication_refuses_header_mismatch(facts: list[dict]):
     from scripts.publish_visit_registry_test import build_publication_plan
     payload = _payload(facts)

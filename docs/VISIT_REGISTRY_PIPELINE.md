@@ -166,4 +166,20 @@ The complete technical checkpoint, verified facts, the owner's explicit **UNVERI
 
 **NEXT TASK:** Multi-Project Visit Registry Acceptance, CONTROLLED TEST VALIDATION. Investigate 8050's 38 vs 39 rows without forced reconciliation, prove cross-project safety of partial `visits_current` publication, validate controller associations and status-39 claim membership, check history/recovery, and issue a documented READY_FOR_PRODUCTION or NOT_READY_FOR_PRODUCTION recommendation. **Do not perform production deployment.**
 
+## 2026-10-26 acceptance result
+
+The acceptance was executed the same day; full evidence in
+[ACCEPTANCE_2026-10-26_MULTIPROJECT.md](ACCEPTANCE_2026-10-26_MULTIPROJECT.md).
+Summary: the 38-vs-39 discrepancy is a classification/counting artifact of the
+earlier ad-hoc analysis (39 is correct; identical action-id sets across two
+captures); the parser validated on 5 live projects with varying row layouts;
+a `visits_current` partial-write gap was found and fixed (row-count check +
+regression test); native `state[39]=on` semantics established (claims +
+no-action visits; dt range required); real-TEST publication, read-back and
+idempotent rerun verified. **Recommendation: READY_FOR_PRODUCTION** for the
+pipeline as validated, with documented limitations (workload invisibility of
+no-FIO visits, never-actioned visits in `visits_current`, point-in-time
+claims) and the production collector extension still requiring separate
+owner approval.
+
 This file is the technical pipeline status index; the existing management initiative register remains authoritative.

@@ -283,8 +283,13 @@ def build_publication_plan(
 
     # Current-state view: replace data rows with this snapshot's visit grain.
     # A rerun whose current rows are already this snapshot's grain is a no-op.
+    # The row count must match too: a write interrupted after a partial
+    # values.update would leave fewer rows, all correctly tagged, and must
+    # not be mistaken for a complete current view.
     current_header = current_rows[0] if current_rows else []
-    current_is_ours = bool(current_data) and "snapshot_id" in current_header and all(
+    current_is_ours = bool(current_data) and "snapshot_id" in current_header and len(
+        current_data
+    ) == len(payload["visit_grain"]) and all(
         current_header.index("snapshot_id") < len(row)
         and str(row[current_header.index("snapshot_id")]) == snapshot_id
         for row in current_data
