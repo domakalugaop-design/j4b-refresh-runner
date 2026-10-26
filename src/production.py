@@ -687,6 +687,7 @@ def _rollback_full_refresh(
     workflow_backup: dict[str, Any] | None,
     payment_publication: tuple[dict[str, list[list[Any]]], dict[str, list[list[Any]]], dict[str, int], dict[str, int]] | None,
     layout_plan: dict[str, Any],
+    failed_candidate: list[list[Any]] | None = None,
 ) -> None:
     """Best-effort restore every target snapshot; report any unverifiable tab."""
     errors: list[str] = []
@@ -721,7 +722,23 @@ def _rollback_full_refresh(
     try:
         live_current = read_sheet(token, sid, columns=columns)
         if live_current != previous:
-            publish(token, sid, previous, live_current, columns=columns)
+            baseline_ids = {str(row[0]) for row in previous[1:] if row and row[0] not in (None, "")}
+            live_ids = {str(row[0]) for row in live_current[1:] if row and row[0] not in (None, "")}
+            candidate_ids = (
+                {str(row[0]) for row in failed_candidate[1:] if row and row[0] not in (None, "")}
+                if failed_candidate else baseline_ids
+            )
+            newly_introduced_ids = live_ids - baseline_ids
+            if not newly_introduced_ids.issubset(candidate_ids - baseline_ids):
+                raise RuntimeError("projects_current rollback found IDs outside failed candidate")
+            expected_fingerprint = _projects_current_fingerprint(previous, columns)
+            publish(
+                token, sid, previous, live_current, columns=columns,
+                authoritative_stale_ids=newly_introduced_ids,
+            )
+            restored_current = read_sheet(token, sid, columns=columns)
+            if _projects_current_fingerprint(restored_current, columns) != expected_fingerprint:
+                raise RuntimeError("projects_current rollback fingerprint mismatch")
     except Exception as exc:
         errors.append(f"projects_current: {type(exc).__name__}")
     try:
@@ -754,6 +771,17 @@ def _rollback_full_refresh(
             errors.append(f"schema: {type(exc).__name__}")
     if errors:
         raise RuntimeError("full refresh rollback incomplete: " + "; ".join(errors))
+
+
+def _projects_current_fingerprint(rows: list[list[Any]], columns: list[str]) -> str:
+    """Fingerprint the exact logical values matrix while normalizing null cells."""
+    normalized: list[list[Any]] = []
+    for row in rows:
+        if len(row) > len(columns):
+            raise RuntimeError("projects_current fingerprint row exceeds schema width")
+        normalized.append(["" if value is None else value for value in row])
+    encoded = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _require_production_gate() -> str:
@@ -1462,6 +1490,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
                 token, sid, columns=columns, previous=previous, previous_raw=previous_raw,
                 previous_state_rows=previous_state_rows, workflow_backup=backup,
                 payment_publication=payment_publication, layout_plan=plan,
+                failed_candidate=candidate,
             )
         except Exception as rollback_error:
             _finish_full_refresh_rollback(primary_error, rollback_error)
@@ -1933,6 +1962,7 @@ def run() -> dict[str, Any]:
                         workflow_backup=workflow_backup if workflow_enabled else None,
                         payment_publication=payment_publication,
                         layout_plan=layout_plan,
+                        failed_candidate=candidate,
                     )
                 except Exception as rollback_error:
                     _finish_full_refresh_rollback(primary_error, rollback_error)
