@@ -220,6 +220,9 @@ def build_candidate(
     action_rows: Iterable[Mapping[str, Any]],
     *, queried_project_ids: Iterable[Any], generation_id: str | None = None,
     source_snapshot_at: str | None = None,
+    action_scope_keys: Iterable[tuple[Any, Any, Any]] | None = None,
+    refresh_status: str = "PUBLISHED_SUCCESS",
+    source_freshness: str = "FRESH_COLLECTOR_SUCCESS",
 ) -> dict[str, Any]:
     """Build report/visit facts, quality manifest, and metric dictionary."""
     generation = generation_id or uuid.uuid4().hex
@@ -234,6 +237,18 @@ def build_candidate(
     if not reports:
         raise MartError("corrector report source is empty")
     status_rows = validate_status_rows(action_rows)
+    if action_scope_keys is not None:
+        scope = {
+            (_identifier(project, "scope project_id"), _identifier(action, "scope action_id"),
+             _identifier(visit, "scope visit_id"))
+            for project, action, visit in action_scope_keys
+        }
+        # Keep only memberships for the exact observed report/action rows. The
+        # project-scoped response remains a current snapshot, not event history.
+        status_rows = [
+            row for row in status_rows
+            if (row["project_id"], row["action_id"], row["visit_id"]) in scope
+        ]
     queried = {_identifier(value, "queried project_id") for value in queried_project_ids}
     required_projects = {row["project_id"] for row in reports}
     if not required_projects.issubset(queried):
@@ -293,9 +308,8 @@ def build_candidate(
     )
     # Freshness refers to today's verified collector run, not each stable
     # report's last individual Portal detail read.
-    source_freshness = "FRESH_COLLECTOR_SUCCESS"
     quality_tab = [list(QUALITY_COLUMNS), [
-        PUBLICATION_KEY, SCHEMA_VERSION, generation, "PUBLISHED_SUCCESS",
+        PUBLICATION_KEY, SCHEMA_VERSION, generation, refresh_status,
         datetime.now(timezone.utc).isoformat(), snapshot, len(reports), len(reports), len(visits),
         unmatched, ambiguous_versions, unknown_status_count,
         "OBSERVED_CORRECTOR_SNAPSHOT_ONLY", source_freshness, len(queried),
@@ -622,6 +636,31 @@ def validate_collector_success(evidence: Mapping[str, Any], *, now: datetime) ->
     if evidence.get("collector_result") not in {"SUCCESS", "SUCCESS_NO_NEW_RECORDS"}:
         raise MartError("collector result marker is missing or unsuccessful")
     return str(evidence["collector_result"])
+
+
+def validate_historical_source(
+    rows: Iterable[Mapping[str, Any]], *, expected_fetch_day_counts: Mapping[str, int],
+    expected_rows: int, expected_projects: int, expected_controllers: int,
+) -> list[dict[str, str]]:
+    """Fail-closed gate for the reviewed accumulated four-day source registry."""
+    reports = validate_report_source(rows)
+    if len(reports) != expected_rows:
+        raise MartError("historical source row count differs from reviewed inventory")
+    projects = {row["project_id"] for row in reports}
+    controllers = {row["corrector_id"] for row in reports if row["corrector_id"]}
+    if len(projects) != expected_projects or len(controllers) != expected_controllers:
+        raise MartError("historical source population differs from reviewed inventory")
+    from collections import Counter
+    fetch_counts = Counter(
+        row["last_successful_fetch"][:10]
+        for row in reports if row["last_successful_fetch"]
+    )
+    if dict(fetch_counts) != dict(expected_fetch_day_counts):
+        raise MartError("historical source fetch-day coverage differs from reviewed inventory")
+    report_dates = [row["report_date"] for row in reports]
+    if min(report_dates) != "2026-10-01" or max(report_dates) != "2026-10-25":
+        raise MartError("historical source report-date range differs from reviewed inventory")
+    return reports
 
 
 def read_systemd_collector_evidence(

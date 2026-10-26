@@ -9,6 +9,11 @@ from src.controller_quality_mart import (
     MartError, acquire_action_statuses, build_candidate, extract_project_action_rows,
     summarize_observed_metrics,
     run_refresh, validate_collector_success, validate_report_source, validate_status_rows,
+    validate_historical_source,
+)
+from scripts.run_controller_quality_mart import (
+    HISTORICAL_TEST_SPREADSHEET_ID, SOURCE_SPREADSHEET_ID,
+    _historical_destination_gate,
 )
 
 
@@ -100,6 +105,59 @@ def test_exact_action_visit_join_prevents_status_from_wrong_visit():
                                 queried_project_ids={"10"}, generation_id="e" * 32,
                                 source_snapshot_at=NOW.isoformat())
     assert candidate["controller_report_snapshot"][1][13] == "UNKNOWN"
+
+
+def test_historical_backfill_scopes_current_status_to_exact_report_action_keys():
+    reports = [report("500", "500", visit_id="100"), report("501", "501", visit_id="101")]
+    candidate = build_candidate(
+        reports,
+        [action(visit="100", action_id="500", codes=[39]),
+         action(visit="101", action_id="501", codes=[]),
+         action(visit="999", action_id="999", codes=[39])],
+        queried_project_ids={"10"}, generation_id="2" * 32,
+        source_snapshot_at=NOW.isoformat(),
+        action_scope_keys={("10", "500", "100"), ("10", "501", "101")},
+        refresh_status="PUBLISHED_HISTORICAL_BACKFILL",
+        source_freshness="ACCUMULATED_4_DAY_REGISTRY_CURRENT_STATUS",
+    )
+    assert [row[13] for row in candidate["controller_report_snapshot"][1:]] == [
+        "OBSERVED_PRESENT", "OBSERVED_ABSENT",
+    ]
+    assert candidate["data_quality_status"][1][3] == "PUBLISHED_HISTORICAL_BACKFILL"
+    assert candidate["data_quality_status"][1][13] == "ACCUMULATED_4_DAY_REGISTRY_CURRENT_STATUS"
+
+
+def test_historical_backfill_source_gate_requires_exact_reviewed_inventory():
+    rows = []
+    for index in range(722):
+        day = ("2026-10-22", "2026-10-23", "2026-10-24", "2026-10-25")[
+            0 if index < 161 else 1 if index < 361 else 2 if index < 549 else 3
+        ]
+        rows.append(report(
+            str(10000 + index), str(20000 + index), visit_id=str(30000 + index),
+            project_id=str(1 + index % 57), corrector_id=str(1 + index % 22),
+            corrector_fio=f"Person {1 + index % 22}",
+            report_date="2026-10-01" if index == 0 else "2026-10-25" if index == 721 else "2026-10-17",
+            last_successful_fetch=f"{day}T15:00:00+00:00",
+        ))
+    expected = {"2026-10-22": 161, "2026-10-23": 200, "2026-10-24": 188, "2026-10-25": 173}
+    assert len(validate_historical_source(
+        rows, expected_fetch_day_counts=expected, expected_rows=722,
+        expected_projects=57, expected_controllers=22,
+    )) == 722
+    with pytest.raises(MartError, match="row count"):
+        validate_historical_source(
+            rows[:-1], expected_fetch_day_counts=expected, expected_rows=722,
+            expected_projects=57, expected_controllers=22,
+        )
+
+
+def test_historical_backfill_destination_is_fixed_and_explicitly_enabled():
+    _historical_destination_gate(SOURCE_SPREADSHEET_ID, HISTORICAL_TEST_SPREADSHEET_ID, "true")
+    with pytest.raises(MartError, match="feature gate"):
+        _historical_destination_gate(SOURCE_SPREADSHEET_ID, HISTORICAL_TEST_SPREADSHEET_ID, "")
+    with pytest.raises(MartError, match="not allowlisted"):
+        _historical_destination_gate(SOURCE_SPREADSHEET_ID, SOURCE_SPREADSHEET_ID, "true")
 
 
 def test_project_aggregate_without_action_identity_is_rejected():
