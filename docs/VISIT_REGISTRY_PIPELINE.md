@@ -159,3 +159,11 @@ are published only to the TEST spreadsheet, not to this repository.
 - The production collector does not yet persist visit datetime / report
   datetime / controller FIO from the per-project response; extending
   `acquire_project` storage is a separate owner-approved change.
+
+## 2026-10-26 checkpoint and handoff
+
+The complete technical checkpoint, verified facts, the owner's explicit **UNVERIFIED** hypothesis, unresolved items, and not-yet-executed acceptance plan are in [HANDOFF_2026-10-26_PORTAL_001_3.md](HANDOFF_2026-10-26_PORTAL_001_3.md).
+
+**NEXT TASK:** Multi-Project Visit Registry Acceptance, CONTROLLED TEST VALIDATION. Investigate 8050's 38 vs 39 rows without forced reconciliation, prove cross-project safety of partial `visits_current` publication, validate controller associations and status-39 claim membership, check history/recovery, and issue a documented READY_FOR_PRODUCTION or NOT_READY_FOR_PRODUCTION recommendation. **Do not perform production deployment.**
+
+This file is the technical pipeline status index; the existing management initiative register remains authoritative.
