@@ -30,6 +30,10 @@ fetched live by these scripts.
 | `scripts/extract_project_controller_completion_cohort.py` | Bounded read-only MariaDB →40 project/visit cohort extractor |
 | `scripts/publish_project_controller_claims_test.py` | TEST-only append-only source publisher with grain verification |
 | `tests/test_project_controller_claims_mart.py` | Project mart grain, denominator, zero-claim, and `NOT_AVAILABLE` tests |
+| `src/controller_claims_association.py` | Controller–claims association logic (action_id → visit_id priority) |
+| `scripts/publish_controller_claims_association.py` | TEST-only append-only publisher with grain verification |
+| `tests/test_controller_claims_association.py` | Association logic tests (to be created) |
+| `tests/test_controller_quality_sheets_grid.py` | Grid capacity tests |
 
 ## Parsing contract (`parse_action_fact_rows`)
 
@@ -202,6 +206,19 @@ research contract in
 [STATUS_39_HISTORY_DISCOVERY_2026-10-26.md](STATUS_39_HISTORY_DISCOVERY_2026-10-26.md).
 No production writes or deployment.
 
+## 2026-10-27 Controller Parser Recovery & Claims Association
+
+The existing `visit_registry.py` parser was recovered and validated. It extracts `controller_fio` from per-project `POST /action` responses (the "Проверил" column). This current corrector snapshot (722 rows, 57 projects, 22 controllers) was joined with the historical claims mart (`claims_mart_90d`, 7,576 episodes) using `action_id` as primary key and `visit_id` as secondary key.
+
+**Results:** 217 claim episodes matched (215 via action_id, 2 via visit_id), 7,359 unmatched (97.1%). The controller snapshot covers only 57 of 495 claim projects and 722 of 7,534 claim visits. **No historical controller attribution was established** — the snapshot reflects current form state, not historical reviewer at claim time.
+
+Three new TEST tabs published with gates, idempotency, read-back:
+- `controller_current_observed` — 140 controller×project pairs
+- `claims_controller_association` — 7,576 episodes with association status
+- `controller_coverage_status` — coverage metrics
+
+Current DataLens-ready publication: `ctrlclaims-sha256:9eec64e08` (content-based fingerprint; filter all tabs to this ID). Full evidence in [CONTROLLER_PARSER_CLAIMS_ASSOCIATION_ACCEPTANCE.md](CONTROLLER_PARSER_CLAIMS_ASSOCIATION_ACCEPTANCE.md). Full suite: 622 passed. No production writes/deployment and no DataLens edits.
+
 ## 2026-10-27 project/report/controller historical source completion
 
 The first assessment used the wrong TLS connection contract and is superseded.
@@ -213,10 +230,7 @@ VIEW`). The bounded typ-140 completion cohort contains 31,170 distinct
 the TEST mart includes 767 projects total (28 claim-only), including 272
 zero-claim projects.
 
-Six new append-only, versioned TEST tabs are published and read-back verified;
-current DataLens-ready publication is v2
-`pcclaims90-v2-20261027T062709.087947+0000-801fc34e05` (numeric cells; filter
-all tabs to this publication ID; v1 is retained as history):
+Six new append-only, versioned TEST tabs are published and read-back verified:
 `project_directory`, `project_monthly_metrics`, `project_period_metrics`,
 `controller_monthly_metrics`, `report_controller_claim_links`, and
 `project_controller_claims_manifest`. The existing `claims_mart_90d` tab was
