@@ -1,7 +1,7 @@
 from datetime import date
 import pytest
 
-from src.refresh import BASE_COLUMNS, COLUMNS, CURRENCY_COLUMNS, PROJECT_TYPE_COLUMNS, CURRENCY_PROJECT_COLUMNS, materialize, merge_previous, reconcile_current_rows, regular_scope_counts, select_scope, sheet_rows, sheets_serial, summary
+from src.refresh import BASE_COLUMNS, COLUMNS, CURRENCY_COLUMNS, CURRENCY_PROJECT_COLUMNS, CURRENCY_PROJECT_COLUMNS_LEGACY, PROJECT_TYPE_COLUMNS, SUCCESS_METRIC_COLUMNS, materialize, merge_previous, reconcile_current_rows, regular_scope_counts, select_scope, sheet_rows, sheets_serial, summary
 from src.production import load_acquisition_checkpoint, serialize_acquisition_checkpoint
 
 
@@ -49,6 +49,8 @@ def test_plan_zero_is_real_zero():
     row = materialize(projects, [], "2026-09-04T10:00:00+00:00")[0]
     assert row["plan"] == 0
     assert row["plan_status"] == "VALID_PLAN"
+    assert row["execution_pct_successful"] is None
+    assert row["execution_pct"] is None
 
 
 def test_missing_plan_is_not_zero():
@@ -57,6 +59,7 @@ def test_missing_plan_is_not_zero():
     row = materialize(projects, visits, "2026-09-04T10:00:00+00:00")[0]
     assert row["plan"] is None
     assert row["plan_missing_with_activity"] is True
+    assert row["execution_pct_successful"] is None
 
 
 def test_project_dates_materialize_from_existing_edit_fields_and_preserve_missing():
@@ -83,8 +86,11 @@ def test_free_visits_counts_distinct_explicit_unassigned_ids_not_plan_or_states(
     ]
     row = materialize(projects, visits, "2026-10-05T00:00:00+00:00")[0]
     assert row["plan"] == 13
-    assert row["created"] == 5
+    assert row["created"] == row["total_project_visits"] == 4
     assert row["unassigned"] == 1
+    assert row["successful_visits_current"] == 0
+    assert row["current_state_unresolved_visits"] == 1
+    assert row["execution_pct_successful"] is None
 
 
 def test_free_visits_are_project_scoped_and_hidden_project_does_not_leak():
@@ -105,9 +111,11 @@ def test_native_serial_conversion():
     assert sheets_serial(46267.0) == 46267.0
 
 
-def test_current_schema_is_37_columns_and_unique_summary():
-    assert len(COLUMNS) == 37
-    assert COLUMNS[-4:] == CURRENCY_COLUMNS
+def test_current_schema_appends_success_metrics_without_moving_legacy_columns():
+    assert len(COLUMNS) == len(CURRENCY_PROJECT_COLUMNS_LEGACY) + len(SUCCESS_METRIC_COLUMNS) == 43
+    assert COLUMNS[:len(CURRENCY_PROJECT_COLUMNS_LEGACY)] == CURRENCY_PROJECT_COLUMNS_LEGACY
+    assert CURRENCY_PROJECT_COLUMNS_LEGACY[-4:] == CURRENCY_COLUMNS
+    assert COLUMNS[-len(SUCCESS_METRIC_COLUMNS):] == SUCCESS_METRIC_COLUMNS
     rows = [COLUMNS, ["1"] + [""] * 32, ["2"] + [""] * 32]
     assert summary(rows) == {"rows": 2, "unique": 2, "duplicates": 0}
 
@@ -161,8 +169,8 @@ def test_sheet_rows_emit_full_width():
     row["project_id"] = "1"
     row["last_refreshed"] = "2026-09-04T10:00:00+00:00"
     values = sheet_rows([row])
-    assert len(values[0]) == 37
-    assert len(values[1]) == 37
+    assert len(values[0]) == len(COLUMNS)
+    assert len(values[1]) == len(COLUMNS)
     assert values[1][0] == 1 and type(values[1][0]) is int
     assert values[1][1] == ""  # textual dimensions remain text
 
