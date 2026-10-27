@@ -108,7 +108,7 @@ One row per claim episode from `claims_mart_90d`.
 - "Claims per 100 reviewed reports" per controller (denominator not comparable)
 - Any metric implying controller causality for claims
 
-**DataLens filter guidance:** Filter all tabs by `publication_id = 'ctrlclaims-sha256:9eec64e08'` to isolate the v2 publication. The v1 publication (`ctrlclaims-20261027070909-sha256:0fc` etc.) remains as history and must not be unioned with v2.
+**DataLens filter guidance:** Filter all tabs by `publication_id = 'ctrlclaims-v2-sha256:080ae329b'` to isolate the v2 publication. The v1 publication (`ctrlclaims-20261027070909-sha256:0fc` etc.) remains as history and must not be unioned with v2.
 
 ## Validation & Gates
 
@@ -154,11 +154,12 @@ METRICS_AVAILABLE=Current workload, association status, coverage %
 METRICS_BLOCKED=Historical controller attribution, claim rate per controller, historical workload
 TESTS_PASSED=622
 DOCUMENT_PATH=docs/CONTROLLER_PARSER_CLAIMS_ASSOCIATION_ACCEPTANCE.md
-GITHUB_COMMIT=<pending>
-GITHUB_PUSH=<pending>
-REMOTE_VERIFIED=<pending>
+GITHUB_COMMIT=0b41b1bf7eb77c8e61ceb6537d72a686b58791d7
+GITHUB_PUSH=YES
+REMOTE_VERIFIED=YES
 PRODUCTION_WRITES=0
 PRODUCTION_DEPLOYMENT=NO
+DATALENS_CHANGED=NO
 FINAL_STATUS=PARTIAL_SOURCE_PUBLISHED_WITH_EXPLICIT_NOT_AVAILABLE_METRICS
 ```
 

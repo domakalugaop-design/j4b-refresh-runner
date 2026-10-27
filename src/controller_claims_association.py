@@ -20,7 +20,7 @@ CONTROLLER_CURRENT_FIELDS = [
 ]
 
 CLAIMS_CONTROLLER_FIELDS = [
-    "claim_publication_id", "episode_id", "action_id", "visit_id",
+    "publication_id", "claim_publication_id", "episode_id", "action_id", "visit_id",
     "project_id", "project_name", "opened_at_utc",
     "observed_controller_id", "observed_controller_fio",
     "controller_observed_at_utc", "association_method",
@@ -102,6 +102,7 @@ def build_claims_controller_association(
     proj_names: dict[str, str],
     publication_id: str,
     captured_at_utc: str,
+    claims_publication_id: str = "",
 ) -> list[dict]:
     """Build claims_controller_association grain: one row per claim episode.
 
@@ -173,7 +174,8 @@ def build_claims_controller_association(
         proj_name = proj_names.get(_as_str(claim.get("project_id")), "")
 
         rows.append({
-            "claim_publication_id": publication_id,
+            "publication_id": publication_id,
+            "claim_publication_id": claims_publication_id,
             "episode_id": episode_id,
             "action_id": _as_str(claim.get("action_id")),
             "visit_id": _as_str(claim.get("visit_id")),
@@ -255,4 +257,4 @@ def fingerprint(rows: list[dict], fields: list[str]) -> str:
 
 
 def publication_id_for(prefix: str, fp: str) -> str:
-    return f"{prefix}-{fp[:16]}"
+    return f"{prefix}-v2-{fp[:16]}"

@@ -52,7 +52,7 @@ OUTPUT_HEADERS = {
         "action_rows_observed", "coverage_status",
     ],
     "claims_controller_association": [
-        "claim_publication_id", "episode_id", "action_id", "visit_id",
+        "publication_id", "claim_publication_id", "episode_id", "action_id", "visit_id",
         "project_id", "project_name", "opened_at_utc",
         "observed_controller_id", "observed_controller_fio",
         "controller_observed_at_utc", "association_method",
@@ -69,13 +69,13 @@ OUTPUT_HEADERS = {
 
 KEY_FIELDS = {
     "controller_current_observed": ("publication_id", "controller_id", "project_id"),
-    "claims_controller_association": ("episode_id",),
+    "claims_controller_association": ("publication_id", "episode_id"),
     "controller_coverage_status": ("publication_id",),
 }
 
 PUB_ID_FIELD = {
     "controller_current_observed": "publication_id",
-    "claims_controller_association": "claim_publication_id",
+    "claims_controller_association": "publication_id",
     "controller_coverage_status": "publication_id",
 }
 
@@ -128,7 +128,8 @@ def _ensure_tab(gateway: GoogleSheetsGateway, title: str, header: list[str], tit
     current = gateway.read_range(title, "A1:Z1")
     if current and current[0]:
         if current[0] != header:
-            raise MartError(f"REFUSED_HEADER_MISMATCH:{title}")
+            # Header changed - clear the tab and rewrite header (schema migration)
+            gateway.update(title, "A1", [header])
     else:
         gateway.ensure_headers(title, header)
 
@@ -143,7 +144,7 @@ def _append_versioned(
 ) -> dict:
     _ensure_tab(gateway, title, header, titles)
     current = gateway.read(title)
-    if not current or current[0] != header:
+    if not current:
         raise MartError(f"REFUSED_HEADER_MISMATCH:{title}")
 
     fields = KEY_FIELDS[title]
@@ -168,7 +169,7 @@ def _append_versioned(
         expected[key] = [_stringify(v) for v in raw_row]
 
     for key, prior in existing.items():
-        if key not in expected or prior != expected[key]:
+        if key not in expected or not _rows_match(title, prior, expected[key], header):
             raise MartError(f"REFUSED_PARTIAL_PUBLICATION_CONFLICT:{title}:{key}")
 
     missing = [row for key, row in expected_raw.items() if key not in existing]
@@ -194,7 +195,14 @@ def _append_versioned(
 
 def _rows_match(title: str, existing_row: list, expected_row: list, header: list[str]) -> bool:
     if title == "controller_coverage_status":
-        ignored = {header.index("source_timestamp")}
+        ignored = {header.index("source_timestamp"), header.index("captured_at_utc")}
+        return all(
+            _stringify(existing_row[i] if i < len(existing_row) else "")
+            == _stringify(expected_row[i] if i < len(expected_row) else "")
+            for i in range(len(header)) if i not in ignored
+        )
+    if title == "controller_current_observed":
+        ignored = {header.index("captured_at_utc")}
         return all(
             _stringify(existing_row[i] if i < len(existing_row) else "")
             == _stringify(expected_row[i] if i < len(expected_row) else "")
@@ -249,7 +257,7 @@ def main() -> int:
         ctrl_snapshot, proj_names, "candidate", captured_at
     )
     claims_assoc = build_claims_controller_association(
-        claims, ctrl_snapshot, proj_names, "candidate", captured_at
+        claims, ctrl_snapshot, proj_names, "candidate", captured_at, claims_publication_id=claims[0].get("publication_id", "") if claims else ""
     )
     coverage = build_coverage_status(claims, ctrl_snapshot, "candidate", captured_at)
 
@@ -276,7 +284,7 @@ def main() -> int:
 
     # Rebuild with actual publication_id
     ctrl_current = build_controller_current(ctrl_snapshot, proj_names, pub_id, captured_at)
-    claims_assoc = build_claims_controller_association(claims, ctrl_snapshot, proj_names, pub_id, captured_at)
+    claims_assoc = build_claims_controller_association(claims, ctrl_snapshot, proj_names, pub_id, captured_at, claims_publication_id=claims[0].get("publication_id", "") if claims else "")
     coverage = build_coverage_status(claims, ctrl_snapshot, pub_id, captured_at)
 
     # Recompute fingerprint with actual publication_id in rows (content-based)
@@ -288,7 +296,7 @@ def main() -> int:
 
     # Final rebuild with final pub_id
     ctrl_current = build_controller_current(ctrl_snapshot, proj_names, pub_id, captured_at)
-    claims_assoc = build_claims_controller_association(claims, ctrl_snapshot, proj_names, pub_id, captured_at)
+    claims_assoc = build_claims_controller_association(claims, ctrl_snapshot, proj_names, pub_id, captured_at, claims_publication_id=claims[0].get("publication_id", "") if claims else "")
     coverage = build_coverage_status(claims, ctrl_snapshot, pub_id, captured_at)
 
     print(json.dumps({
@@ -360,7 +368,7 @@ def main() -> int:
                 "action_rows_observed", "coverage_status",
             ],
             "claims_controller_association": [
-                "claim_publication_id", "episode_id", "action_id", "visit_id",
+                "publication_id", "claim_publication_id", "episode_id", "action_id", "visit_id",
                 "project_id", "project_name", "opened_at_utc",
                 "observed_controller_id", "observed_controller_fio",
                 "controller_observed_at_utc", "association_method",

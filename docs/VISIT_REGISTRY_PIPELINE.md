@@ -217,7 +217,7 @@ Three new TEST tabs published with gates, idempotency, read-back:
 - `claims_controller_association` — 7,576 episodes with association status
 - `controller_coverage_status` — coverage metrics
 
-Current DataLens-ready publication: `ctrlclaims-sha256:9eec64e08` (content-based fingerprint; filter all tabs to this ID). Full evidence in [CONTROLLER_PARSER_CLAIMS_ASSOCIATION_ACCEPTANCE.md](CONTROLLER_PARSER_CLAIMS_ASSOCIATION_ACCEPTANCE.md). Full suite: 622 passed. No production writes/deployment and no DataLens edits.
+Current DataLens-ready publication: `ctrlclaims-v2-sha256:080ae329b` (content-based fingerprint; filter all tabs to this ID). Full evidence in [CONTROLLER_PARSER_CLAIMS_ASSOCIATION_ACCEPTANCE.md](CONTROLLER_PARSER_CLAIMS_ASSOCIATION_ACCEPTANCE.md). Full suite: 622 passed. No production writes/deployment and no DataLens edits.
 
 ## 2026-10-27 project/report/controller historical source completion
 
