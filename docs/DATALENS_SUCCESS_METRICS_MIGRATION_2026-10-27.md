@@ -65,3 +65,27 @@ No scheduler, production Sheet, DataLens object, Portal DB, or deployment was ch
 ## 5. Outstanding qualification
 
 The feature branch changes the source runner to choose one current action state by the highest action ID exposed for a Visit, and fails closed on a conflicting state tie. A bounded production SQL comparison qualified this ordering for the controlled set; the live `/action` HTTP payload was not replayed in this implementation task. The direct current `my.state` table and published workflow counts are not a one-to-one match for all statuses, so state 37/45/50 mapping remains a release gate. If the isolated TEST acquisition does not show the expected current state, do not deploy or compensate in DataLens; stop with `BLOCKED_BY_SOURCE`.
+
+## 6. Release qualification — 2026-10-27 (no cutover)
+
+- The authenticated Portal `/action` filter was set to the target project, October date window, and all fourteen workflow-state controls, then submitted read-only. The captured result showed only 48 action rows and was not a complete population read, so it was not used for a full count. Separate read-only detail pages confirmed two target exception actions currently at 45 after earlier 40, another target action currently at 40, and a current state-50 control action displayed as “Оплачено”. Exact identifiers/rows remain only in the local untracked diagnostic note.
+- Five bounded September/October projects were rechecked against MariaDB and the production workbook, including current 40, paid 50, refusal 45, multiple actions, and plan overrun cases. The specific two current-45 actions from the target remain excluded by the new current-success metric. Exact production identifiers and row data are kept out of this public document.
+- Workbook tab metadata read-only: `projects_current` currently has 58 columns; `Статусы проектов` has 25. Feature target is 64 and 31, respectively. The production workbook remains unchanged.
+- `gh secret list` confirms a separately named `TEST_GOOGLE_SPREADSHEET_ID` secret exists, but its value cannot be read back. The TEST workflow writes to that configured workbook and the existing runner requires the exact feature schema. Because target identity/isolation and header schema were not independently verified, no TEST publication was dispatched.
+- Existing TEST command (not run):
+
+  ```sh
+  gh workflow run test-refresh.yml --repo domakalugaop-design/j4b-refresh-runner --ref codex/portal-001-3-successful-visits-current-20261027
+  ```
+
+- The repository has no `schedule:`/cron workflow. The production scheduler is managed externally and its timing is unknown; GitHub's `j4b-refresh-production` concurrency group does not serialize an external scheduler. `SAFE_PRODUCTION_WINDOW=UNKNOWN` until the scheduler owner confirms a quiet window.
+- Existing production workflow command (not run; feature code is not merged and it performs production writes):
+
+  ```sh
+  gh workflow run manual-production-dispatch.yml --repo domakalugaop-design/j4b-refresh-runner --ref production-cutover
+  ```
+
+  The workflow hard-checks out `production-cutover`, performs acquisition and materialization preflight, creates a private baseline for target tabs, verifies its checksum, uploads a 7-day artifact, and only then performs refresh. Runtime rollback restores projects, project types, workflow and configured payment tabs with readback. A separately approved merge and dispatch are required.
+- The existing source feature commit `22f46e63cbbb694438eed4f15b62280d2287ff5c` was verified. This release-qualification document update will be a separate safe commit; no production action was taken.
+
+**Updated decision:** `TEST_PUBLICATION=NOT_RUN`, `ROLLBACK_READY=YES` (existing code path; no rollback rehearsal), `SAFE_PRODUCTION_WINDOW=UNKNOWN`, `DATALENS_FIELD_MAPPING=PARTIAL` (source fields defined, exact live dataset/chart bindings not accessible). `RELEASE_READY=NO` pending a verified isolated TEST target/schema, live Portal action-membership parity, read-only DataLens workspace access, and external scheduler window.

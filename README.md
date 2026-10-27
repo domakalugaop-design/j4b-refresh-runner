@@ -110,6 +110,32 @@ request. Raw IDs map through the qualified Portal currency dictionary in
 dictionary-label mismatch fails acquisition closed. Payment-tab schemas are
 unchanged.
 
+### Successful Visit metrics — qualification branch only
+
+The qualified feature branch appends six fields after the existing currency
+fields; it does not move legacy columns. The base/project-type/currency target
+is 43 columns (the prior 37-column contract plus six fields). The
+workflow-enabled target is 64 columns (the prior 58-column contract plus six
+fields), and the status summary tab grows from 25 to 31 columns. Production
+remains on its current schema until a separately approved deployment.
+
+The fields are `successful_visits_current`,
+`historically_approved_visits`, `total_project_visits`,
+`current_state_unresolved_visits`, `execution_pct_successful`, and `gap_pp`.
+`completed` and `execution_pct` become compatibility aliases to current
+successful completion. `finished_visits` remains the legacy observed union of
+workflow memberships `{37,40,50}` and is not the plan numerator.
+
+For the approved rule, current states 40 (Анкета утверждена) and 50 (Оплачено)
+count once per Visit; 37 (Анкета проверена) alone does not, and 45 (В оплате
+отказано) is excluded even after a previous 40. The resolver selects the
+latest state-bearing action ID, fails closed on conflicting latest states,
+and leaves the execution ratio null if any current state is unresolved or the
+plan is missing/zero. Ratios are stored as fractions (`1.0` = 100%) and are
+not capped. See `docs/PROJECT_SUCCESSFUL_VISITS_BUSINESS_RULE.md` and
+`docs/DATALENS_SUCCESS_METRICS_MIGRATION_2026-10-27.md` for the contract and
+release plan.
+
 The runner reads and maintains immutable qualified Project Type assignments in
 the persisted `project_types` tab; it does not issue a type-detail request for
 an already assigned project. New or pending projects are eligible only when a
