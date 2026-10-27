@@ -5,7 +5,7 @@ import pytest
 from src.acquisition import Reader, acquire_project
 from src.parsers import inspect_project_edit_structure, parse_currency_select, parse_edit
 from src.payment_materialization import PROJECT_PUBLICATION_COLUMNS, VISIT_PUBLICATION_COLUMNS
-from src.refresh import COLUMNS, PROJECT_TYPE_COLUMNS, materialize, sheet_rows
+from src.refresh import COLUMNS, CURRENCY_COLUMNS, PROJECT_TYPE_COLUMNS, SUCCESS_METRIC_COLUMNS, materialize, sheet_rows
 from src.production import _upgrade_projects_rows, primary_columns
 
 
@@ -77,7 +77,7 @@ def test_rub_currency_id_and_authoritative_dictionary_values_round_trip():
     rows = materialize([record], [], "2026-10-05T00:00:00+00:00")
     matrix = sheet_rows(rows)
     assert matrix[0] == COLUMNS
-    assert [matrix[1][COLUMNS.index(key)] for key in COLUMNS[-4:]] == ["1", "RUB", "рубль", "₽"]
+    assert [matrix[1][COLUMNS.index(key)] for key in CURRENCY_COLUMNS] == ["1", "RUB", "рубль", "₽"]
 
 
 def test_parse_edit_ignores_name_like_markup_outside_the_project_form():
@@ -204,20 +204,18 @@ def test_valid_project_form_does_not_require_currency_control():
     assert len(session.calls) == 3
 
 
-def test_workflow_publication_schema_appends_currency_without_moving_existing_fields():
+def test_workflow_publication_schema_appends_success_metrics_after_currency():
     workflow_columns = primary_columns(PROJECT_TYPE_COLUMNS)
-    current_target = workflow_columns + [
-        "currency_id", "currency_code", "currency_name", "currency_symbol",
-    ]
+    current_target = workflow_columns + CURRENCY_COLUMNS + SUCCESS_METRIC_COLUMNS
     assert len(workflow_columns) == 54
-    assert len(current_target) == 58
+    assert len(current_target) == 54 + len(CURRENCY_COLUMNS) + len(SUCCESS_METRIC_COLUMNS) == 64
     legacy_row = [f"old-{index}" for index in range(len(workflow_columns))]
     upgraded = _upgrade_projects_rows(
         [workflow_columns, legacy_row], workflow_columns, current_target,
     )
     assert upgraded[0] == current_target
     assert upgraded[1][:len(workflow_columns)] == legacy_row
-    assert upgraded[1][-4:] == ["", "", "", ""]
+    assert upgraded[1][-len(CURRENCY_COLUMNS) - len(SUCCESS_METRIC_COLUMNS):] == [""] * (len(CURRENCY_COLUMNS) + len(SUCCESS_METRIC_COLUMNS))
 
 
 def test_legacy_33_column_rows_map_currency_and_preserve_all_prior_values():
@@ -227,9 +225,9 @@ def test_legacy_33_column_rows_map_currency_and_preserve_all_prior_values():
     )
     assert upgraded[0] == COLUMNS
     assert upgraded[1][:len(PROJECT_TYPE_COLUMNS)] == legacy_row
-    assert upgraded[1][-4:] == ["", "", "", ""]
+    assert upgraded[1][len(PROJECT_TYPE_COLUMNS):] == [""] * (len(COLUMNS) - len(PROJECT_TYPE_COLUMNS))
 
 
 def test_currency_dimension_does_not_expand_payment_tab_contracts():
-    assert not set(COLUMNS[-4:]).intersection(VISIT_PUBLICATION_COLUMNS)
-    assert not set(COLUMNS[-4:]).intersection(PROJECT_PUBLICATION_COLUMNS)
+    assert not set(CURRENCY_COLUMNS).intersection(VISIT_PUBLICATION_COLUMNS)
+    assert not set(CURRENCY_COLUMNS).intersection(PROJECT_PUBLICATION_COLUMNS)

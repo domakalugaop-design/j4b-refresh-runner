@@ -58,6 +58,8 @@ from .refresh import (
     BASE_COLUMNS,
     PROJECT_TYPE_COLUMNS as PROJECT_TYPE_SCHEMA,
     CURRENCY_COLUMNS,
+    CURRENCY_PROJECT_COLUMNS_LEGACY,
+    SUCCESS_METRIC_COLUMNS,
     materialize,
     merge_previous,
     now,
@@ -248,12 +250,16 @@ def _plan_project_type_layout(
             source_columns = list(BASE_COLUMNS)
         elif column_count == len(PROJECT_TYPE_SCHEMA):
             source_columns = list(PROJECT_TYPE_SCHEMA)
+        elif column_count == len(CURRENCY_PROJECT_COLUMNS_LEGACY):
+            source_columns = list(CURRENCY_PROJECT_COLUMNS_LEGACY)
         elif column_count == len(COLUMNS):
             source_columns = list(COLUMNS)
         elif column_count == len(primary_columns(PROJECT_TYPE_SCHEMA)):
             source_columns = primary_columns(PROJECT_TYPE_SCHEMA)
         elif column_count == len(primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS):
             source_columns = primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS
+        elif column_count == len(primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS + SUCCESS_METRIC_COLUMNS):
+            source_columns = primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS + SUCCESS_METRIC_COLUMNS
         else:
             raise RuntimeError("source columns are required for an arbitrary baseline width")
     else:
@@ -458,11 +464,16 @@ def _upgrade_projects_rows(rows: list[list[Any]], source_columns: list[str], tar
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
     if rows[0] != source_columns or len(source_columns) != len(set(source_columns)):
         raise RuntimeError("baseline sheet unavailable or schema mismatch")
-    supported_source_schemas = {tuple(BASE_COLUMNS), tuple(PROJECT_TYPE_SCHEMA), tuple(COLUMNS)}
+    supported_source_schemas = {
+        tuple(BASE_COLUMNS), tuple(PROJECT_TYPE_SCHEMA),
+        tuple(CURRENCY_PROJECT_COLUMNS_LEGACY), tuple(COLUMNS),
+    }
     # A workflow-enabled projects_current has its 21 analytics fields after
     # the qualified 33-column contract. Accept that exact additive schema too.
     workflow_source = tuple(primary_columns(PROJECT_TYPE_SCHEMA))
     supported_source_schemas.add(workflow_source)
+    supported_source_schemas.add(tuple(primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS))
+    supported_source_schemas.add(tuple(primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS + SUCCESS_METRIC_COLUMNS))
     if tuple(source_columns) not in supported_source_schemas and tuple(source_columns) != tuple(target_columns):
         raise RuntimeError("unsupported projects_current source schema")
     if any(column not in target_columns for column in source_columns):
@@ -1338,7 +1349,10 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     sid = _production_target()
     token = google_token()
     workflow_enabled = _workflow_enabled()
-    columns = (primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS) if workflow_enabled else COLUMNS
+    columns = (
+        primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS + SUCCESS_METRIC_COLUMNS
+        if workflow_enabled else COLUMNS
+    )
     universe = checkpoint["universe"]
     authoritative_ids = _validate_authoritative_universe(universe)
     selected = checkpoint["selected"]
@@ -1534,7 +1548,10 @@ def run() -> dict[str, Any]:
     project_type_enabled = True
     workflow_enabled = _workflow_enabled()
     payment_enabled = _payment_refresh_enabled()
-    columns = (primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS) if workflow_enabled else COLUMNS
+    columns = (
+        primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS + SUCCESS_METRIC_COLUMNS
+        if workflow_enabled else COLUMNS
+    )
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + hashlib.sha1(os.urandom(8)).hexdigest()[:8]
 
     _stage("BASELINE_READ_START")
@@ -1557,10 +1574,14 @@ def run() -> dict[str, Any]:
             source_columns = BASE_COLUMNS
         elif header == PROJECT_TYPE_SCHEMA:
             source_columns = PROJECT_TYPE_SCHEMA
+        elif header == CURRENCY_PROJECT_COLUMNS_LEGACY:
+            source_columns = CURRENCY_PROJECT_COLUMNS_LEGACY
         elif header == COLUMNS:
             source_columns = COLUMNS
         elif header == primary_columns(PROJECT_TYPE_SCHEMA):
             source_columns = primary_columns(PROJECT_TYPE_SCHEMA)
+        elif header == primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS:
+            source_columns = primary_columns(PROJECT_TYPE_SCHEMA) + CURRENCY_COLUMNS
         elif header == columns:
             source_columns = columns
         else:

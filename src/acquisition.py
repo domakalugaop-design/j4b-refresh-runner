@@ -241,17 +241,59 @@ def action_index(markup: str, project_id: str) -> dict[str, dict[str, Any]]:
         explicit_free = row.get("assignment_state") == "UNASSIGNED_FREE"
         if existing and existing.get("assignment_state") == "UNASSIGNED_FREE":
             continue
-        if existing and not explicit_free and int(row.get("action_id") or 0) <= int(existing.get("action_id") or 0):
+        # Keep the established assignment/action-index ordering unchanged.
+        action_id = row.get("action_id")
+        if existing and not explicit_free and int(action_id or 0) <= int(existing.get("action_id") or 0):
             continue
         explicit_assignment = row.get("assignment_state")
         if explicit_assignment != "UNASSIGNED_FREE":
             explicit_assignment = "ASSIGNED" if row.get("participant_assigned") else "UNKNOWN"
         result[visit_id] = {
+            # Preserve the legacy status membership for compatibility. The
+            # approved current-success metric uses current_state_index instead.
             "raw_status": row.get("visit_status") or None,
+            "current_state_code": row.get("current_state_code") or None,
+            "current_state_resolution": row.get("current_state_resolution", "UNKNOWN"),
             "status_label": row.get("visit_status_label") or None,
             "assignment_state": explicit_assignment,
-            "action_id": row.get("action_id"),
+            "action_id": action_id,
         }
+    return result
+
+
+def current_state_index(markup: str, project_id: str) -> dict[str, dict[str, Any]]:
+    """Select the latest state-bearing action per Visit independently of assignment.
+
+    The legacy assignment index intentionally gives an explicit unassigned/free
+    row priority. Current-success calculation has a different contract: a later
+    real action supersedes that sentinel, and an equal-ID conflict fails closed.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for row in parse_action_table(markup, project_id):
+        visit_id = row["visit_id"]
+        resolution = row.get("current_state_resolution", "NO_WORKFLOW_STATE")
+        if resolution == "NO_WORKFLOW_STATE":
+            continue
+        action_id = row.get("current_action_id") or row.get("action_id") or "0"
+        try:
+            action_order = int(action_id)
+        except (TypeError, ValueError):
+            action_order = 0
+        state_code = row.get("current_state_code")
+        current = result.get(visit_id)
+        if current is None or action_order > int(current.get("action_id") or 0):
+            result[visit_id] = {
+                "action_id": str(action_id),
+                "current_state_code": int(state_code) if state_code not in (None, "") else None,
+                "current_state_resolution": resolution,
+            }
+            continue
+        if action_order == int(current.get("action_id") or 0):
+            prior_state = current.get("current_state_code")
+            candidate_state = int(state_code) if state_code not in (None, "") else None
+            if prior_state != candidate_state or resolution == "AMBIGUOUS_LATEST_ACTION":
+                current["current_state_code"] = None
+                current["current_state_resolution"] = "AMBIGUOUS_LATEST_ACTION"
     return result
 
 
@@ -265,7 +307,8 @@ def action_memberships(markup: str, project_id: str) -> list[dict[str, Any]]:
                 "project_id": str(project_id),
                 "visit_id": str(row["visit_id"]),
                 "workflow_state_code": int(code),
-                "action_id": row.get("action_id") or None,
+                "action_id": next((pair["action_id"] for pair in row.get("workflow_state_action_pairs", [])
+                                   if int(pair["workflow_state_code"]) == int(code)), row.get("action_id")) or None,
                 "predicate_source": "action_response",
             })
     return memberships
@@ -389,6 +432,7 @@ def acquire_project(
     plan = edit_fields.get("planned_visit_count", {"value": None, "state": edit["state"]})
     visit_ids = [row["visit_id"] for row in parse_visit_table(project_html)] if project_html else []
     actions = action_index(action_html, project_id) if action_html else {}
+    current_states = current_state_index(action_html, project_id) if action_html else {}
     memberships = action_memberships(action_html, project_id) if action_html else []
     request_failures = [
         dict(item["failure"])
@@ -445,13 +489,25 @@ def acquire_project(
     visits: list[dict[str, Any]] = []
     for visit_id in visit_ids:
         action_row = actions.get(visit_id, {})
-        raw = action_row.get("raw_status")
+        current_row = current_states.get(visit_id, {})
+        raw = current_row.get("current_state_code")
+        resolution = current_row.get("current_state_resolution")
         visits.append({
             "project_id": project_id,
             "visit_id": visit_id,
             "raw_status": field(raw, "VALUE_PRESENT" if raw else "UNKNOWN", f"/action?project={project_id}"),
+            "current_state_code": field(
+                raw,
+                "VALUE_PRESENT" if raw is not None else "UNKNOWN",
+                f"/action?project={project_id}",
+            ),
+            "current_state_resolution": field(
+                resolution,
+                "VALUE_PRESENT" if resolution is not None else "UNKNOWN",
+                f"/action?project={project_id}",
+            ),
             "assignment_state": field(action_row.get("assignment_state", "UNKNOWN"), "VALUE_PRESENT" if visit_id in actions else "UNKNOWN", f"/action?project={project_id}"),
-            "action_id": field(action_row.get("action_id"), "VALUE_PRESENT" if action_row.get("action_id") is not None else "FIELD_NOT_EXPOSED", f"/action?project={project_id}"),
+            "action_id": field(current_row.get("action_id"), "VALUE_PRESENT" if current_row.get("action_id") is not None else "FIELD_NOT_EXPOSED", f"/action?project={project_id}"),
         })
     if track_progress:
         reader.project_done(acquisition_state)

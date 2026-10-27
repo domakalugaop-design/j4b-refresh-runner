@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -14,21 +15,27 @@ from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 
-from .acquisition import MAX_REQUEST_RETRIES, COMPLETED_CODES, Reader, acquire_project, discover_universe
+from .acquisition import MAX_REQUEST_RETRIES, Reader, acquire_project, discover_universe
 from .portal_transport import PortalSession
 from .project_types import STATE_COLUMNS, serialize_state, state_rows_equivalent, validate_state_rows
-from .workflow_analytics import project_workflow_metrics
+from .workflow_analytics import project_workflow_metrics, successful_visit_metrics
 from .technical_ids import integer_id
 from .project_period import MMYY_RE as PERIOD_MARKER_RE, classify_project_period, rolling_month_markers, moscow_today
 
 SHEET_NAME = os.environ.get("GOOGLE_WORKSHEET", "projects_current")
 BASE_COLUMNS = ["project_id","project_name","period","plan","plan_value","plan_status","created","completed","unassigned","execution_pct","plan_missing_with_activity","has_period_marker","project_start","project_end","elapsed_pct","lag","risk_status","risk_reason","validation_state","last_refreshed","client","primary_manager","coordinators","date_from","date_to","scope","manager_payment","wave","assigned","questionnaire_filled","rejected"]
 PROJECT_TYPE_COLUMNS = BASE_COLUMNS + ["project_type_code", "project_type_name"]
-# Currency is a project-level dimension sourced from the already acquired edit
-# response. Keep the prior 33-column contract named for migration/readback,
-# then append nullable currency facts without moving any existing columns.
+# Keep the prior project-type and currency schemas available for migration and
+# readback; add the qualified visit-success metrics only after all existing
+# columns so downstream column positions remain stable.
 CURRENCY_COLUMNS = ["currency_id", "currency_code", "currency_name", "currency_symbol"]
-CURRENCY_PROJECT_COLUMNS = PROJECT_TYPE_COLUMNS + CURRENCY_COLUMNS
+CURRENCY_PROJECT_COLUMNS_LEGACY = PROJECT_TYPE_COLUMNS + CURRENCY_COLUMNS
+SUCCESS_METRIC_COLUMNS = [
+    "successful_visits_current", "historically_approved_visits",
+    "total_project_visits", "current_state_unresolved_visits",
+    "execution_pct_successful", "gap_pp",
+]
+CURRENCY_PROJECT_COLUMNS = CURRENCY_PROJECT_COLUMNS_LEGACY + SUCCESS_METRIC_COLUMNS
 # The normal runner contract is the production schema. BASE_COLUMNS remains
 # explicit for validating and upgrading legacy 31-column baselines.
 COLUMNS = CURRENCY_PROJECT_COLUMNS
@@ -263,6 +270,7 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
         pv = [v for v in visits if str(v.get("project_id")) == pid]
         plan = value(project.get("planned_visit_count"))
         codes = [text(v.get("raw_status")) for v in pv]
+        current_success = successful_visit_metrics(pid, pv, plan)
         row = {k: None for k in COLUMNS}
         row.update({
             "project_id": integer_id(pid, "project_id"),
@@ -270,7 +278,9 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
             "plan": plan,
             "plan_value": plan,
             "plan_status": "PLAN_MISSING_DATA" if plan is None else "VALID_PLAN",
-            "created": len(pv),
+            # The legacy field is now at the unique-Visit grain; the old raw
+            # row count was not a safe basis for completion or plan execution.
+            "created": current_success["total_project_visits"],
             # Portal-defined free Visits are explicit /action/0 rows.  Count
             # unique existing Visit IDs; never infer from plan or sum states.
             "unassigned": len({
@@ -279,8 +289,14 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
                 if str(value(v.get("assignment_state")) or "") == "UNASSIGNED_FREE"
                 or str(value(v.get("action_id")) or "") == "0"
             }),
-            "completed": sum(code in COMPLETED_CODES for code in codes),
-            "execution_pct": (sum(code in COMPLETED_CODES for code in codes) / plan if isinstance(plan, (int, float)) and plan > 0 else None),
+            "completed": current_success["successful_visits_current"],
+            "execution_pct": current_success["execution_pct_successful"],
+            "successful_visits_current": current_success["successful_visits_current"],
+            "historically_approved_visits": None,
+            "total_project_visits": current_success["total_project_visits"],
+            "current_state_unresolved_visits": current_success["current_state_unresolved_visits"],
+            "execution_pct_successful": current_success["execution_pct_successful"],
+            "gap_pp": None,
             "plan_missing_with_activity": plan is None and bool(pv),
             "risk_status": "DATA_QUALITY" if plan is None and pv else "NOT_QUALIFIED",
             "risk_reason": "PLAN_MISSING_DATA" if plan is None and pv else None,
@@ -305,8 +321,45 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
         })
         workflow = project_workflow_metrics(pid, (v.get("visit_id") for v in pv), project.get("workflow_memberships", []))
         row.update(workflow)
+        row["historically_approved_visits"] = workflow["historically_approved_visits"]
+        _recalculate_project_health(row)
         rows.append(row)
     return rows
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _recalculate_project_health(row: dict[str, Any]) -> dict[str, Any]:
+    """Apply the approved 10/20 pp lag bands without inventing missing inputs."""
+    plan = _finite_number(row.get("plan"))
+    execution = _finite_number(row.get("execution_pct_successful"))
+    elapsed = _finite_number(row.get("elapsed_pct"))
+    if plan is None or plan <= 0 or execution is None or elapsed is None:
+        row["gap_pp"] = None
+        if row.get("plan_status") != "PLAN_MISSING_DATA":
+            row["risk_status"] = "NOT_QUALIFIED"
+        return row
+
+    # Round only floating-point representation noise so exact 10/20 pp
+    # boundaries remain in the owner-approved next band.
+    gap_pp = round((execution - elapsed) * 100.0, 10)
+    lag_pp = max(0.0, -gap_pp)
+    row["gap_pp"] = gap_pp
+    if lag_pp < 10.0:
+        row["risk_status"] = "GREEN"
+    elif lag_pp < 20.0:
+        row["risk_status"] = "YELLOW"
+    else:
+        row["risk_status"] = "RED"
+    return row
 
 
 def sheets_serial(raw: Any) -> Any:
@@ -372,6 +425,7 @@ def merge_previous(rows: list[dict[str, Any]], previous: list[list[Any]], select
                 for name in UNMAPPED_PRESERVE_COLUMNS:
                     if row.get(name) is None:
                         row[name] = prior[COLUMNS.index(name)] if name in COLUMNS else None
+            _recalculate_project_health(row)
             merged[pid] = row
     for pid, prior in old.items():
         if pid not in selected_ids:

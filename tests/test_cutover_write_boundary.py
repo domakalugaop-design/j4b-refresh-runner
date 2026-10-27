@@ -10,7 +10,7 @@ import pytest
 
 from src import production
 from src.project_types import PROJECT_TYPE_DICTIONARY, STATE_COLUMNS
-from src.refresh import BASE_COLUMNS, PROJECT_TYPE_COLUMNS, api
+from src.refresh import BASE_COLUMNS, COLUMNS, PROJECT_TYPE_COLUMNS, api
 
 
 def _meta(columns=31, include_state=False):
@@ -40,7 +40,7 @@ def test_prevalidation_write_regression_31_columns_and_missing_state_only_plans(
     with patch("src.production.api") as sheet_api:
         plan = production._plan_project_type_layout(_meta())
     assert plan["state_exists"] is False
-    assert plan["planned"] == ["EXPAND projects_current to 37 columns", "CREATE project_types"]
+    assert plan["planned"] == [f"EXPAND projects_current to {len(COLUMNS)} columns", "CREATE project_types"]
     assert plan["requests"]
     sheet_api.assert_not_called()
 

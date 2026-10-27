@@ -27,11 +27,27 @@ from src.workflow_publication import (
 
 def materialized(pid, **overrides):
     row = {field: 0 for field in PRIMARY_ANALYTICS_COLUMNS}
-    row.update({"project_id": str(pid), "project_name": f"Project {pid}", "client": "Client", "primary_manager": "Manager"})
+    row.update({
+        "project_id": str(pid), "project_name": f"Project {pid}", "client": "Client", "primary_manager": "Manager",
+        "plan": None, "completed": 0, "execution_pct": None,
+        "successful_visits_current": 0, "historically_approved_visits": 0,
+        "total_project_visits": 0, "current_state_unresolved_visits": 0,
+        "execution_pct_successful": None, "gap_pp": None,
+        "elapsed_pct": None, "risk_status": "NOT_QUALIFIED",
+    })
     row.update(overrides)
     row["project_visit_count"] = max(row.get("project_visit_count", 0), 1)
     row["workflow_covered_visits"] = min(row.get("workflow_covered_visits", 0), row["project_visit_count"])
     row["workflow_unclassified_visits"] = row["project_visit_count"] - row["workflow_covered_visits"]
+    row["total_project_visits"] = row["project_visit_count"]
+    row["historically_approved_visits"] = row.get("finished_visits", 0)
+    row["completed"] = row["successful_visits_current"]
+    plan = row.get("plan")
+    row["execution_pct_successful"] = (
+        row["successful_visits_current"] / plan
+        if isinstance(plan, (int, float)) and not isinstance(plan, bool) and plan > 0 else None
+    )
+    row["execution_pct"] = row["execution_pct_successful"]
     return row
 
 
@@ -149,7 +165,12 @@ def test_full_refresh_rollback_failure_preserves_primary_and_final_rollback_erro
 def test_third_tab_has_exactly_fourteen_human_readable_workflow_columns_and_business_diagnostics():
     assert len([column for column in THIRD_TAB_COLUMNS if "[" in column]) == 14
     assert ["Назначено", "Выполнено", "Завершено"] == THIRD_TAB_COLUMNS[19:22]
-    assert THIRD_TAB_COLUMNS[-3:] == ["Покрыто workflow", "Без workflow-состояния", "Несколько workflow-состояний"]
+    assert THIRD_TAB_COLUMNS[22:25] == ["Покрыто workflow", "Без workflow-состояния", "Несколько workflow-состояний"]
+    assert THIRD_TAB_COLUMNS[-6:] == [
+        "Успешно завершено сейчас", "Когда-либо достигало успешного статуса",
+        "Всего уникальных визитов", "Состояние не разрешено",
+        "Выполнение плана (успешные визиты)", "Разница с графиком, п.п.",
+    ]
 
 
 def test_primary_fields_are_additive_and_existing_order_is_preserved():
@@ -387,14 +408,14 @@ def test_trailing_blank_transport_contract_matrix():
                 validate_readback(actual, expected)
 
 
-def test_workflow_25_column_real_shape_accepts_only_trailing_empty_suffix():
+def test_workflow_extended_real_shape_accepts_only_trailing_empty_suffix():
     from src.workflow_publication import THIRD_TAB_COLUMNS
 
-    expected = [THIRD_TAB_COLUMNS, ["8110", "project", "", "", *([""] * 21)]]
+    expected = [THIRD_TAB_COLUMNS, ["8110", "project"] + [""] * (len(THIRD_TAB_COLUMNS) - 2)]
     actual = [THIRD_TAB_COLUMNS, ["8110", "project"]]
     result = diagnose_workflow_readback(expected, actual)
     assert result["matches"]
-    assert result["trailing_blank_omissions_accepted"] == 23
+    assert result["trailing_blank_omissions_accepted"] == len(THIRD_TAB_COLUMNS) - 2
     assert result["rows_with_trailing_blank_omissions"] == 1
 
     # A non-empty workflow metric in the omitted suffix remains a hard error.

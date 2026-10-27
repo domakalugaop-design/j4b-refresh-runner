@@ -391,9 +391,36 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
         explicitly_unassigned = action_id == "0" and "table-red" in row_class
         links = [(identifier, plain_text(body)) for identifier, body in ACTION_LINK_RE.findall(row)]
         numeric = [text for _, text in links if text.isdigit()]
+        labels_by_action: dict[str, set[str]] = {}
+        for linked_action_id, text in links:
+            if not text.isdigit():
+                labels_by_action.setdefault(str(linked_action_id), set()).add(" ".join(text.split()).casefold())
+        for linked_action_id, text in links:
+            if (
+                text.isdigit()
+                and int(text) not in WORKFLOW_STATES
+                and (not str(linked_action_id).isdigit() or int(text) != int(linked_action_id))
+            ):
+                raise ValueError(f"unknown workflow state code: {text}")
         # In the red unassigned branch /action/0 is a sentinel link, not a
         # my.state=0 membership (state-0 invitation rows use their my.i ID).
-        codes = [] if explicitly_unassigned else [text for text in numeric if int(text) in WORKFLOW_STATES]
+        state_controls = []
+        if not explicitly_unassigned:
+            for linked_action_id, text in links:
+                if not text.isdigit() or int(text) not in WORKFLOW_STATES:
+                    continue
+                # If the displayed number is exactly the href action ID and
+                # the link has no canonical state label, it is an action ID,
+                # not a workflow state. State links whose action ID happens
+                # to equal a canonical code still qualify when labelled.
+                if (
+                    str(linked_action_id).isdigit()
+                    and int(linked_action_id) == int(text)
+                    and not (labels_by_action.get(str(linked_action_id), set()) & _WORKFLOW_LABELS)
+                ):
+                    continue
+                state_controls.append((str(linked_action_id), int(text)))
+        codes = [str(code) for _, code in state_controls]
         labels = [text for _, text in links if not text.isdigit()]
         # A structurally valid state control is represented by an action link
         # with a visible state label.  If such a control has no canonical code,
@@ -418,13 +445,34 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
             False if explicitly_unassigned else
             (action_id not in ("", "0") if "table-red" in row_class else True)
         )
+        state_action_ids = [int(linked_action_id) for linked_action_id, _ in state_controls
+                            if linked_action_id.isdigit() and int(linked_action_id) > 0]
+        current_action_id = str(max(state_action_ids)) if state_action_ids else action_id
+        latest_action_states = {
+            state_code for linked_action_id, state_code in state_controls
+            if linked_action_id == current_action_id
+        }
+        current_state_code = next(iter(latest_action_states)) if len(latest_action_states) == 1 else None
+        current_state_resolution = (
+            "EXPLICIT_UNASSIGNED" if explicitly_unassigned else
+            "RESOLVED_LATEST_ACTION" if current_state_code is not None else
+            "AMBIGUOUS_LATEST_ACTION" if latest_action_states else
+            "NO_WORKFLOW_STATE"
+        )
         rows.append({
             "visit_id": visit_match.group(1),
             "action_id": action_id,
+            "current_action_id": current_action_id,
+            "current_state_code": str(current_state_code) if current_state_code is not None else "",
+            "current_state_resolution": current_state_resolution,
             "participant_assigned": participant_assigned,
             "assignment_state": "UNASSIGNED_FREE" if explicitly_unassigned else None,
             "visit_status": codes[-1] if codes else "",
             "workflow_state_codes": codes,
+            "workflow_state_action_pairs": [
+                {"action_id": linked_action_id, "workflow_state_code": state_code}
+                for linked_action_id, state_code in state_controls
+            ],
             "visit_status_label": status_label,
         })
     return rows

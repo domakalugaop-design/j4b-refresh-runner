@@ -26,6 +26,11 @@ PRIMARY_ANALYTICS_COLUMNS = list(WORKFLOW_COUNTER_FIELDS) + [
 THIRD_TAB_COLUMNS = ["project_id", "project_name", "client", "manager", "project_visit_count"]
 THIRD_TAB_COLUMNS += [f"{label} [{code}]" for code, label in WORKFLOW_STATES.items()]
 THIRD_TAB_COLUMNS += ["Назначено", "Выполнено", "Завершено", "Покрыто workflow", "Без workflow-состояния", "Несколько workflow-состояний"]
+THIRD_TAB_COLUMNS += [
+    "Успешно завершено сейчас", "Когда-либо достигало успешного статуса",
+    "Всего уникальных визитов", "Состояние не разрешено", "Выполнение плана (успешные визиты)",
+    "Разница с графиком, п.п.",
+]
 
 
 def primary_columns(existing_columns: Iterable[str]) -> list[str]:
@@ -49,6 +54,53 @@ def validate_materialized_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         if missing:
             raise ValueError(f"materialized row missing workflow fields: {','.join(missing)}")
         validate_workflow_metrics(metrics)
+        total = int(row.get("project_visit_count", 0) or 0)
+        total_project_visits = row.get("total_project_visits")
+        successful = row.get("successful_visits_current")
+        historical = row.get("historically_approved_visits")
+        unresolved = row.get("current_state_unresolved_visits")
+        if any(value is None or isinstance(value, bool) or not str(value).isdigit()
+               for value in (total_project_visits, successful, historical, unresolved)):
+            raise ValueError("successful-visit metrics must be non-negative integer counts")
+        total_project_visits, successful, historical, unresolved = map(
+            int, (total_project_visits, successful, historical, unresolved)
+        )
+        if total_project_visits != total:
+            raise ValueError("total_project_visits must match project_visit_count")
+        if successful > total or historical > total or unresolved > total:
+            raise ValueError("successful-visit metrics exceed total_project_visits")
+        completed = row.get("completed")
+        finished = row.get("finished_visits")
+        if isinstance(completed, bool) or not isinstance(completed, int) or completed != successful:
+            raise ValueError("completed must equal successful_visits_current")
+        if isinstance(finished, bool) or not isinstance(finished, int) or historical > finished:
+            raise ValueError("historically_approved_visits must be a subset of legacy finished_visits")
+        plan = row.get("plan")
+        plan_number = float(plan) if isinstance(plan, (int, float)) and not isinstance(plan, bool) else None
+        execution = row.get("execution_pct_successful")
+        if unresolved or plan_number is None or not math.isfinite(plan_number) or plan_number <= 0:
+            if execution is not None:
+                raise ValueError("execution_pct_successful must be empty with unresolved state or without a positive plan")
+        else:
+            expected = successful / plan_number
+            if not isinstance(execution, (int, float)) or isinstance(execution, bool) or not math.isclose(float(execution), expected, rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError("execution_pct_successful does not match successful_visits_current / plan")
+        if row.get("execution_pct") != execution:
+            raise ValueError("execution_pct must match execution_pct_successful")
+        elapsed = row.get("elapsed_pct")
+        gap_pp = row.get("gap_pp")
+        elapsed_number = float(elapsed) if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else None
+        if execution is None or elapsed_number is None or not math.isfinite(elapsed_number):
+            if gap_pp is not None:
+                raise ValueError("gap_pp must be empty when plan/execution/elapsed data is unavailable")
+        else:
+            expected_gap = round((float(execution) - elapsed_number) * 100.0, 10)
+            if not isinstance(gap_pp, (int, float)) or isinstance(gap_pp, bool) or not math.isclose(float(gap_pp), expected_gap, rel_tol=1e-12, abs_tol=1e-12):
+                raise ValueError("gap_pp does not match execution_pct_successful - elapsed_pct")
+            lag_pp = max(0.0, -expected_gap)
+            expected_risk = "GREEN" if lag_pp < 10.0 else "YELLOW" if lag_pp < 20.0 else "RED"
+            if row.get("risk_status") != expected_risk:
+                raise ValueError("risk_status does not match the approved 10/20 pp lag bands")
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate project_id in materialized workflow rows")
     return {"rows": len(ids), "unique_project_ids": len(set(ids)), "duplicates": 0}
@@ -70,6 +122,10 @@ def third_tab_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
         line += [row.get(f"workflow_state_{code}_visits", 0) for code in WORKFLOW_STATES]
         line += [row.get("assigned_visits", 0), row.get("executed_visits_customer", 0), row.get("finished_visits", 0)]
         line += [row.get("workflow_covered_visits", 0), row.get("workflow_unclassified_visits", 0), row.get("workflow_multi_match_visits", 0)]
+        line += [row.get("successful_visits_current", 0), row.get("historically_approved_visits", 0),
+                 row.get("total_project_visits", row.get("project_visit_count", 0)),
+                 row.get("current_state_unresolved_visits", 0),
+                 row.get("execution_pct_successful"), row.get("gap_pp")]
         output.append(line)
     return output
 

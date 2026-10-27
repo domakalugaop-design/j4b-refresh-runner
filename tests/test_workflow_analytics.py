@@ -1,6 +1,6 @@
 import pytest
 
-from src.acquisition import ACTION_STATE_CODES, Reader, action_index, acquire_project
+from src.acquisition import ACTION_STATE_CODES, Reader, action_index, action_memberships, acquire_project, current_state_index
 from src.parsers import parse_action_table
 from src.workflow_analytics import WORKFLOW_STATE_CODES, deduplicate_memberships, project_workflow_metrics
 
@@ -53,12 +53,78 @@ def test_parser_and_aggregation_preserve_valid_15_20_overlap():
     html = "<!doctype html><html><body>" + action_row("1", [15, 20]) + "</body></html>"
     rows = parse_action_table(html, "42")
     assert rows[0]["workflow_state_codes"] == ["15", "20"]
+    assert rows[0]["current_state_code"] == ""
+    assert rows[0]["current_state_resolution"] == "AMBIGUOUS_LATEST_ACTION"
     memberships = [{"project_id": "42", "visit_id": "1", "workflow_state_code": int(code)} for code in rows[0]["workflow_state_codes"]]
     metrics = project_workflow_metrics("42", ["1"], memberships)
     assert metrics["workflow_state_15_visits"] == 1
     assert metrics["workflow_state_20_visits"] == 1
     assert metrics["assigned_visits"] == 1
     assert metrics["workflow_multi_match_visits"] == 1
+
+
+def test_action_index_uses_the_state_link_for_the_highest_action_id():
+    html = (
+        labeled_action_row("9", 40, "Анкета утверждена", action="100")
+        + labeled_action_row("9", 45, "В оплате отказано", action="200")
+    )
+    indexed = action_index(html, "42")["9"]
+    assert indexed["action_id"] == "200"
+    assert indexed["current_state_code"] == "45"
+    assert indexed["raw_status"] == "45"
+    assert indexed["current_state_resolution"] == "RESOLVED_LATEST_ACTION"
+
+
+def test_state_code_stays_paired_with_its_action_id_inside_one_portal_row():
+    html = (
+        '<tr class="table-success"><td><a href="/proj/42">P</a><a href="/visit/9">V</a>'
+        '<a href="/action/100">40</a><a href="/action/100">Анкета утверждена</a>'
+        '<a href="/action/200">45</a><a href="/action/200">В оплате отказано</a></td></tr>'
+    )
+    parsed = parse_action_table(html, "42")[0]
+    assert parsed["current_action_id"] == "200"
+    assert parsed["current_state_code"] == "45"
+    assert parsed["workflow_state_action_pairs"] == [
+        {"action_id": "100", "workflow_state_code": 40},
+        {"action_id": "200", "workflow_state_code": 45},
+    ]
+
+
+def test_action_row_with_multiple_codes_on_same_latest_action_fails_closed_for_current_state():
+    html = "<!doctype html><html><body>" + action_row("9", [40, 45], action="200") + "</body></html>"
+    indexed = action_index(html, "42")["9"]
+    assert indexed["action_id"] == "200"
+    assert indexed["current_state_code"] is None
+    assert indexed["raw_status"] == "45"  # legacy membership remains available but is not current success
+    assert indexed["current_state_resolution"] == "AMBIGUOUS_LATEST_ACTION"
+
+
+def test_current_state_index_uses_later_real_action_after_legacy_free_assignment_marker():
+    html = (
+        '<tr class="table-red"><td><a href="/proj/42">P</a>'
+        '<a href="/visit/9">V</a><a href="/action/0">0</a></td></tr>'
+        + labeled_action_row("9", 40, "Анкета утверждена", action="200")
+    )
+    # Preserve the separately-qualified assignment contract while current
+    # outcome resolves from the later action.
+    assert action_index(html, "42")["9"]["assignment_state"] == "UNASSIGNED_FREE"
+    current = current_state_index(html, "42")["9"]
+    assert current == {
+        "action_id": "200",
+        "current_state_code": 40,
+        "current_state_resolution": "RESOLVED_LATEST_ACTION",
+    }
+
+
+def test_memberships_keep_each_action_id_without_changing_visit_state_deduplication():
+    html = (
+        labeled_action_row("9", 40, "Анкета утверждена", action="100")
+        + labeled_action_row("9", 45, "В оплате отказано", action="200")
+    )
+    memberships = action_memberships(html, "42")
+    assert {(item["action_id"], item["workflow_state_code"]) for item in memberships} == {
+        ("100", 40), ("200", 45)
+    }
 
 
 def test_duplicate_membership_deduplicates_by_project_visit_state():
@@ -117,6 +183,22 @@ def test_all_fourteen_canonical_states_parse_as_state_controls():
 
 def test_unknown_code_in_state_control_fails_closed():
     html = labeled_action_row("1", 362206, "Оплачено")
+    with pytest.raises(ValueError, match="unknown workflow state code: 362206"):
+        parse_action_table(html, "42")
+
+
+def test_unknown_latest_state_does_not_fall_back_to_an_older_success():
+    html = (
+        labeled_action_row("1", 40, "Анкета утверждена", action="100")
+        + '<tr class="table-success"><td><a href="/proj/42">P</a><a href="/visit/1">V</a>'
+        '<a href="/action/200">362206</a><a href="/action/200">Оплачено</a></td></tr>'
+    )
+    with pytest.raises(ValueError, match="unknown workflow state code: 362206"):
+        parse_action_table(html, "42")
+
+
+def test_unknown_numeric_state_different_from_action_id_fails_even_without_a_label():
+    html = action_row("1", [40], action="100") + action_row("1", [362206], action="200")
     with pytest.raises(ValueError, match="unknown workflow state code: 362206"):
         parse_action_table(html, "42")
 
