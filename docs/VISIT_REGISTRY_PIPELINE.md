@@ -197,3 +197,17 @@ publication. Full evidence in
 research contract in
 [STATUS_39_HISTORY_DISCOVERY_2026-10-26.md](STATUS_39_HISTORY_DISCOVERY_2026-10-26.md).
 No production writes or deployment.
+
+## 2026-10-27 project/report/controller historical source completion
+
+The existing claims episodes and partial corrector snapshot were assessed
+against the requested three-month project/report/controller mart. Existing
+claims support episode-level counts for the captured window, but do not include
+the zero-claim project universe, all report/visit denominators, or a proven
+historical controller association. The approved MariaDB read-only connection
+could not be established with TLS certificate and hostname verification, so no
+database queries or new TEST publication were performed. Full source acceptance
+is blocked; see
+[PROJECT_CONTROLLER_CLAIMS_90D_DATA_ACCEPTANCE.md](PROJECT_CONTROLLER_CLAIMS_90D_DATA_ACCEPTANCE.md)
+for measured coverage, exact limitations, and release gates. No production
+write, refresh, or DataLens change.
