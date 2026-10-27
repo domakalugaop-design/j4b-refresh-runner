@@ -194,11 +194,21 @@ def test_workflow_diagnostic_samples_fingerprint_text_without_pii(capsys):
 def _rollback_fixture(expected, actual):
     from src.workflow_publication import backup_snapshot
 
-    backup = backup_snapshot("sheet", {THIRD_TAB_NAME: expected})
+    backup = backup_snapshot(
+        "sheet",
+        {THIRD_TAB_NAME: expected},
+        {"existing_tabs": [THIRD_TAB_NAME], "workflow_tab_grid": {"rowCount": 1000, "columnCount": len(expected[0])}},
+    )
 
     def api(url, _token, body=None, method=None):
-        if "fields=sheets.properties(title,sheetId)" in url:
-            return {"sheets": [{"properties": {"title": THIRD_TAB_NAME, "sheetId": 123}}]}
+        if "fields=sheets.properties(title" in url and "gridProperties" in url:
+            return {"sheets": [{"properties": {
+                "title": THIRD_TAB_NAME,
+                "sheetId": 123,
+                "gridProperties": {"rowCount": 1000, "columnCount": len(expected[0])},
+            }}]}
+        if "fields=sheets.properties(title)" in url:
+            return {"sheets": [{"properties": {"title": THIRD_TAB_NAME}}]}
         if ":clear" in url or ":batchUpdate" in url:
             return {}
         if "/values/" in url:
@@ -206,6 +216,76 @@ def _rollback_fixture(expected, actual):
         raise AssertionError("unexpected rollback test request")
 
     return backup, api
+
+
+def test_workflow_tab_publication_expands_existing_25_column_grid_before_writing(monkeypatch):
+    from src import production
+
+    rendered = third_tab_rows([materialized("1")])
+    grid_columns = [25]
+    mutation_requests = []
+
+    def fake_api(url, _token, body=None, method=None):
+        if "fields=sheets.properties(title,sheetId,gridProperties" in url:
+            return {"sheets": [{"properties": {
+                "title": THIRD_TAB_NAME,
+                "sheetId": 123,
+                "gridProperties": {"rowCount": 1000, "columnCount": grid_columns[0]},
+            }}]}
+        if ":batchUpdate" in url:
+            requests = body.get("requests", [])
+            mutation_requests.extend(requests)
+            for request in requests:
+                if "appendDimension" in request:
+                    grid_columns[0] += request["appendDimension"]["length"]
+            return {}
+        if ":clear" in url or "values:batchUpdate" in url:
+            return {}
+        if "valueRenderOption=UNFORMATTED_VALUE" in url:
+            return {"values": rendered}
+        raise AssertionError(f"unexpected workflow publication request: {url}")
+
+    monkeypatch.setattr(production, "api", fake_api)
+    production._publish_workflow_tab("opaque", "isolated-test-sheet", [materialized("1")], {})
+    append = next(request["appendDimension"] for request in mutation_requests if "appendDimension" in request)
+    assert append == {"sheetId": 123, "dimension": "COLUMNS", "length": 6}
+    assert grid_columns[0] == len(THIRD_TAB_COLUMNS)
+
+
+def test_workflow_rollback_shrinks_test_grid_back_to_original_25_columns(monkeypatch):
+    from src import production
+
+    expected = [[f"h{i}" for i in range(25)], ["1"] + [""] * 24]
+    backup = backup_snapshot(
+        "sheet",
+        {THIRD_TAB_NAME: expected},
+        {"existing_tabs": [THIRD_TAB_NAME], "workflow_tab_grid": {"rowCount": 1000, "columnCount": 25}},
+    )
+    seen = []
+    metadata_reads = [0]
+
+    def recording_api(url, _token, body=None, method=None):
+        if "fields=sheets.properties(title" in url and "gridProperties" in url:
+            metadata_reads[0] += 1
+            width = 31 if metadata_reads[0] == 1 else 25
+            return {"sheets": [{"properties": {
+                "title": THIRD_TAB_NAME,
+                "sheetId": 123,
+                "gridProperties": {"rowCount": 1000, "columnCount": width},
+            }}]}
+        if ":batchUpdate" in url and body:
+            seen.extend(body.get("requests", []))
+            return {}
+        if ":clear" in url:
+            return {}
+        if "valueRenderOption=UNFORMATTED_VALUE" in url:
+            return {"values": expected}
+        raise AssertionError(f"unexpected workflow rollback request: {url}")
+
+    monkeypatch.setattr(production, "api", recording_api)
+    production._rollback_workflow_tab("opaque", "isolated-test-sheet", backup)
+    delete = next(request["deleteDimension"]["range"] for request in seen if "deleteDimension" in request)
+    assert delete == {"sheetId": 123, "dimension": "COLUMNS", "startIndex": 25, "endIndex": 31}
 
 
 def test_workflow_rollback_success_is_explicit(monkeypatch, capsys):

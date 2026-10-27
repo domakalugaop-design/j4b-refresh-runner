@@ -183,7 +183,8 @@ def _prepare_regular_payment_publication(
     return previous, candidate, sheet_ids, grid_row_counts
 
 
-def _destination_preflight(token: str, sid: str, expected_title: str = PRODUCTION_TITLE) -> dict[str, Any]:
+def _destination_preflight(token: str, sid: str, expected_title: str | None = None) -> dict[str, Any]:
+    expected_title = expected_title or os.environ.get("EXPECTED_GOOGLE_SPREADSHEET_TITLE", PRODUCTION_TITLE)
     meta = api(
         f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=spreadsheetId,properties.title,sheets.properties(title,sheetId,gridProperties(columnCount,rowCount))",
         token,
@@ -509,9 +510,14 @@ def _capture_workflow_backup(token: str, sid: str, previous_raw: list[list[Any]]
     """Capture affected tabs before the first Phase-2 mutation."""
     existing = {s.get("properties", {}).get("title") for s in meta.get("sheets", [])}
     current = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == "projects_current"), {})
+    third_tab = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
     third: list[list[Any]] = []
-    if THIRD_TAB_NAME in existing:
-        encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
+    if third_tab:
+        width = third_tab.get("gridProperties", {}).get("columnCount")
+        if not isinstance(width, int) or width < 1:
+            raise RuntimeError("workflow tab grid column count is unavailable for backup")
+        end_column = col(width - 1)
+        encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:{end_column}", safe="!:")
         third = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
     return backup_snapshot(
         sid,
@@ -521,6 +527,7 @@ def _capture_workflow_backup(token: str, sid: str, previous_raw: list[list[Any]]
             "projects_current_headers": list(previous_raw[0]) if previous_raw else [],
             "projects_current_width": len(previous_raw[0]) if previous_raw else 0,
             "projects_current_grid": current.get("gridProperties", {}),
+            "workflow_tab_grid": third_tab.get("gridProperties", {}) if third_tab else None,
         },
     )
 
@@ -564,6 +571,25 @@ def _publish_workflow_tab(token: str, sid: str, rows: list[dict[str, Any]], back
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"addSheet": {"properties": {"title": THIRD_TAB_NAME, "gridProperties": {"rowCount": max(1000, len(rendered)), "columnCount": len(rendered[0]), "frozenRowCount": 1}}}}]})
         meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
         tab = next(s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME)
+    current_columns = tab.get("gridProperties", {}).get("columnCount")
+    required_columns = len(rendered[0])
+    if not isinstance(current_columns, int) or current_columns < 1:
+        raise RuntimeError("workflow tab grid column count is unavailable")
+    if current_columns < required_columns:
+        api(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate",
+            token,
+            {"requests": [{"appendDimension": {
+                "sheetId": tab["sheetId"],
+                "dimension": "COLUMNS",
+                "length": required_columns - current_columns,
+            }}]},
+        )
+        meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
+        tab = next(s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME)
+        current_columns = tab.get("gridProperties", {}).get("columnCount")
+        if not isinstance(current_columns, int) or current_columns < required_columns:
+            raise RuntimeError("workflow tab column expansion did not reach the target width")
     old_rows = int(tab.get("gridProperties", {}).get("rowCount", len(rendered)))
     end_column = col(len(rendered[0]) - 1)
     encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A1:{end_column}{max(len(rendered), 1)}", safe="!:")
@@ -620,11 +646,27 @@ def _rollback_workflow_tab_body(
     *,
     on_readback_start: Any,
 ) -> None:
-    sheets = backup["payload"]["sheets"]
-    meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId)", token)
+    payload = backup["payload"]
+    sheets = payload["sheets"]
+    metadata = payload.get("metadata", {})
+    was_present = THIRD_TAB_NAME in set(metadata.get("existing_tabs", []))
+    original_grid = metadata.get("workflow_tab_grid") or {}
+    original_columns = original_grid.get("columnCount")
+    original_rows = original_grid.get("rowCount")
+    if was_present and (not isinstance(original_columns, int) or original_columns < 1):
+        raise RuntimeError("workflow rollback backup is missing original grid column count")
+    if was_present and (not isinstance(original_rows, int) or original_rows < 1):
+        raise RuntimeError("workflow rollback backup is missing original grid row count")
+
+    meta = api(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))",
+        token,
+    )
     tab = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
     previous = sheets.get(THIRD_TAB_NAME, [])
-    if not previous:
+    if not was_present:
+        if previous:
+            raise RuntimeError("workflow rollback has rows for a tab that was absent before publication")
         if tab:
             api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"deleteSheet": {"sheetId": tab["sheetId"]}}]})
         on_readback_start()
@@ -632,21 +674,81 @@ def _rollback_workflow_tab_body(
         if any(s.get("properties", {}).get("title") == THIRD_TAB_NAME for s in verified.get("sheets", [])):
             raise RuntimeError("workflow rollback tab-removal readback mismatch")
         return
-    if not previous or not previous[0]:
-        raise RuntimeError("workflow rollback backup has no header")
-    width = len(previous[0])
+    if not tab:
+        raise RuntimeError("workflow rollback target tab is missing")
+    if previous and not previous[0]:
+        raise RuntimeError("workflow rollback backup has an empty header row")
+    width = len(previous[0]) if previous else 0
+    if width > original_columns:
+        raise RuntimeError("workflow rollback saved data exceeds its original grid width")
     normalized_previous: list[list[Any]] = []
     for row in previous:
         if len(row) > width:
             raise RuntimeError("workflow rollback backup row exceeds header width")
         normalized_previous.append(list(row) + [""] * (width - len(row)))
-    encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
-    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
-    end_column = col(width - 1)
-    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:{end_column}{len(normalized_previous)}", "majorDimension": "ROWS", "values": normalized_previous}]})
+
+    current_grid = tab.get("gridProperties", {})
+    current_columns = current_grid.get("columnCount")
+    current_rows = current_grid.get("rowCount")
+    if not isinstance(current_columns, int) or not isinstance(current_rows, int):
+        raise RuntimeError("workflow rollback current grid metadata is unavailable")
+    clear_columns = max(current_columns, original_columns)
+    clear_rows = max(current_rows, original_rows, len(normalized_previous), 1)
+    clear_range = urllib.parse.quote(
+        f"{THIRD_TAB_NAME}!A1:{col(clear_columns - 1)}{clear_rows}", safe="!:"
+    )
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{clear_range}:clear", token, {}, method="POST")
+    if normalized_previous:
+        end_column = col(width - 1)
+        api(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate",
+            token,
+            {"valueInputOption": "RAW", "data": [{
+                "range": f"{THIRD_TAB_NAME}!A1:{end_column}{len(normalized_previous)}",
+                "majorDimension": "ROWS",
+                "values": normalized_previous,
+            }]},
+        )
+
+    dimension_requests: list[dict[str, Any]] = []
+    if current_columns > original_columns:
+        dimension_requests.append({"deleteDimension": {"range": {
+            "sheetId": tab["sheetId"], "dimension": "COLUMNS",
+            "startIndex": original_columns, "endIndex": current_columns,
+        }}})
+    elif current_columns < original_columns:
+        dimension_requests.append({"appendDimension": {
+            "sheetId": tab["sheetId"], "dimension": "COLUMNS",
+            "length": original_columns - current_columns,
+        }})
+    if current_rows > original_rows:
+        dimension_requests.append({"deleteDimension": {"range": {
+            "sheetId": tab["sheetId"], "dimension": "ROWS",
+            "startIndex": original_rows, "endIndex": current_rows,
+        }}})
+    elif current_rows < original_rows:
+        dimension_requests.append({"appendDimension": {
+            "sheetId": tab["sheetId"], "dimension": "ROWS",
+            "length": original_rows - current_rows,
+        }})
+    if dimension_requests:
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": dimension_requests})
+
     on_readback_start()
-    actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
+    verify_end_column = col(original_columns - 1)
+    actual_range = urllib.parse.quote(
+        f"{THIRD_TAB_NAME}!A1:{verify_end_column}{max(original_rows, len(normalized_previous), 1)}", safe="!:"
+    )
+    actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{actual_range}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
     _validate_workflow_readback(actual, normalized_previous)
+    restored_meta = api(
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,gridProperties(rowCount,columnCount))",
+        token,
+    )
+    restored_tab = next((s.get("properties", {}) for s in restored_meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
+    restored_grid = restored_tab.get("gridProperties", {}) if restored_tab else {}
+    if restored_grid.get("columnCount") != original_columns or restored_grid.get("rowCount") != original_rows:
+        raise RuntimeError("workflow rollback grid-dimension readback mismatch")
 
 
 def _rollback_full_refresh(
@@ -734,9 +836,40 @@ def _require_production_gate() -> str:
     return sid
 
 
+def _require_write_gate() -> str:
+    """Use separate fail-closed authorization for production and TEST writes."""
+    run_mode = os.environ.get("RUN_MODE", "").strip().lower()
+    if run_mode == "production":
+        return _require_production_gate()
+    if run_mode != "test":
+        raise RuntimeError("write entrypoint requires RUN_MODE=production or test")
+    if os.environ.get("ALLOW_TEST_WRITE", "").strip().lower() != "true":
+        raise RuntimeError("test entrypoint requires ALLOW_TEST_WRITE=true")
+    if os.environ.get("TEST_CONFIRMATION", "").strip() != "J4B_ISOLATED_TEST":
+        raise RuntimeError("test entrypoint requires TEST_CONFIRMATION=J4B_ISOLATED_TEST")
+    if os.environ.get("ALLOW_PRODUCTION_WRITE", "").strip().lower() == "true":
+        raise RuntimeError("production write authorization is forbidden in RUN_MODE=test")
+    if os.environ.get("PRODUCTION_CONFIRMATION", "").strip():
+        raise RuntimeError("production confirmation is forbidden in RUN_MODE=test")
+    if any(os.environ.get(name, "").strip() for name in (
+        "PRODUCTION_GOOGLE_SPREADSHEET_ID", "PRODUCTION_SPREADSHEET_ID",
+    )):
+        raise RuntimeError("production spreadsheet ID must not be present in a TEST run")
+    sid = os.environ.get("GOOGLE_SPREADSHEET_ID", "").strip()
+    expected_test_sid = os.environ.get("TEST_SPREADSHEET_ID", "").strip()
+    if not sid or not expected_test_sid:
+        raise RuntimeError("test write requires GOOGLE_SPREADSHEET_ID and TEST_SPREADSHEET_ID")
+    if sid != expected_test_sid:
+        raise RuntimeError("test spreadsheet target does not match the pinned TEST_SPREADSHEET_ID")
+    return sid
+
+
 def _production_target() -> str:
-    if os.environ.get("RUN_MODE", "").strip().lower() != "production":
-        raise RuntimeError("production entrypoint requires RUN_MODE=production")
+    run_mode = os.environ.get("RUN_MODE", "").strip().lower()
+    if run_mode not in {"production", "test"}:
+        raise RuntimeError("entrypoint requires RUN_MODE=production or test")
+    if run_mode == "test":
+        return _require_write_gate()
     sid = os.environ.get("GOOGLE_SPREADSHEET_ID", "").strip()
     if not sid:
         raise RuntimeError("missing required environment variable: GOOGLE_SPREADSHEET_ID")
@@ -745,6 +878,32 @@ def _production_target() -> str:
 
 def _stage(name: str) -> None:
     print(name, flush=True)
+
+
+def _control_project_8314(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Expose only aggregate release-checkpoint metrics for the named project."""
+    row = next((item for item in rows if str(item.get("project_id", "")) == "8314"), None)
+    if row is None:
+        return None
+    return {
+        "project_id": "8314",
+        "plan": row.get("plan"),
+        "total_visits": row.get("total_project_visits", row.get("project_visit_count")),
+        "successful_visits_current": row.get("successful_visits_current"),
+        "historically_approved_visits": row.get("historically_approved_visits"),
+        "current_state_unresolved_visits": row.get("current_state_unresolved_visits"),
+        "execution_pct_successful": row.get("execution_pct_successful"),
+    }
+
+
+def _validate_test_baseline_retention(previous: list[list[Any]], candidate: list[list[Any]]) -> None:
+    """Refuse an isolated TEST publication that would drop any baseline project ID."""
+    if os.environ.get("RUN_MODE", "").strip().lower() != "test":
+        return
+    baseline_ids = {str(row[0]) for row in previous[1:] if row and row[0] not in (None, "")}
+    candidate_ids = {str(row[0]) for row in candidate[1:] if row and row[0] not in (None, "")}
+    if not baseline_ids.issubset(candidate_ids):
+        raise RuntimeError("isolated TEST candidate would drop baseline project IDs")
 
 
 def _payment_telemetry(event: str, fields: dict[str, Any]) -> None:
@@ -1127,6 +1286,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         candidate_summary = summary(candidate)
         if candidate_summary["duplicates"]:
             raise RuntimeError("candidate validation failed: duplicate project IDs")
+        _validate_test_baseline_retention(previous, candidate)
         _stage(f"MATERIALIZATION_PREFLIGHT_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
         return {"FINAL_STATUS": "MATERIALIZATION_PREFLIGHT_PASS", "CANDIDATE_ROWS": candidate_summary["rows"]}
     meta = _destination_preflight(token, sid)
@@ -1165,10 +1325,11 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     candidate_summary = summary(candidate)
     if candidate_summary["duplicates"]:
         raise RuntimeError("candidate validation failed: duplicate project IDs")
+    _validate_test_baseline_retention(previous, candidate)
     _validate_project_type_state_materialization(merged, state, project_type_applicable_ids(universe))
     _stage(f"MATERIALIZATION_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
     _stage("CANDIDATE_VALIDATION_PASS")
-    _require_production_gate()
+    _require_write_gate()
     _require_persistent_backup_upload()
     backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, meta) if workflow_enabled else None
     _assert_prepublication_baseline_unchanged(token, sid, previous_raw, previous_state_rows)
@@ -1220,7 +1381,8 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     _stage("READBACK_PASS")
     _stage("TYPE_VALIDATION=EXTERNAL_POSTCHECK_REQUIRED")
     return {
-        "RUN_ID": checkpoint.get("run_id"), "FINAL_STATUS": "SUCCESS",
+        "RUN_ID": checkpoint.get("run_id"),
+        "FINAL_STATUS": "TEST_SUCCESS" if os.environ.get("RUN_MODE", "").strip().lower() == "test" else "SUCCESS",
         "SELECTED_COUNT": len(selected), "REGULAR_SELECTOR": scope_counts,
         "SUCCESS_COUNT": sum(p.get("acquisition_state") not in {"FAILED", "SEMANTIC_FAILURE"} for p in projects),
         "SEMANTIC_FAILURE_COUNT": sum(p.get("acquisition_state") == "SEMANTIC_FAILURE" for p in projects),
@@ -1233,14 +1395,17 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         "SERVICE_INFORMATION_REFRESH_TIMESTAMP": now(),
         "FINAL_ROWS": candidate_summary["rows"],
         "FINAL_UNIQUE_IDS": candidate_summary["unique"], "FINAL_DUPLICATES": candidate_summary["duplicates"],
+        "CONTROL_PROJECT_8314": _control_project_8314(merged),
     }
 
 
 def run() -> dict[str, Any]:
     run_mode = os.environ.get("RUN_MODE", "test").strip().lower()
     dry_run = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
-    if run_mode != "production":
-        raise RuntimeError("RUN_MODE must be production")
+    if run_mode not in {"production", "test"}:
+        raise RuntimeError("RUN_MODE must be production or test")
+    if run_mode == "test":
+        _require_write_gate()
     if os.environ.get("PREPUBLICATION_BACKUP_ONLY", "false").strip().lower() == "true":
         return create_persistent_prepublication_backup()
     if os.environ.get("REPLAY_ACQUISITION_CHECKPOINT", "false").strip().lower() == "true":
@@ -1507,6 +1672,7 @@ def run() -> dict[str, Any]:
         candidate_summary = summary(candidate)
         if candidate_summary["duplicates"] != 0:
             raise RuntimeError("candidate contains duplicate project IDs")
+        _validate_test_baseline_retention(previous, candidate)
         # A smaller current-state set is valid only after the complete,
         # fail-closed authoritative-universe reconciliation above.
         if project_type_enabled:
@@ -1544,7 +1710,7 @@ def run() -> dict[str, Any]:
         # Authorization is deliberately late: all acquisition, candidate validation,
         # bootstrap validation, and diff planning above are read-only.
         if project_type_enabled:
-            _require_production_gate()
+            _require_write_gate()
             _require_persistent_backup_upload()
             if workflow_enabled:
                 workflow_backup = _capture_workflow_backup(token, sid, previous_raw, previous_state_rows, destination_meta)
@@ -1598,8 +1764,7 @@ def run() -> dict[str, Any]:
                 )
                 raise
         else:
-            if run_mode == "production":
-                _require_production_gate()
+            _require_write_gate()
             publish(token, sid, candidate, previous, columns=columns)
             if payment_publication is not None:
                 old_payment, new_payment, payment_sheet_ids, payment_grid_rows = payment_publication
@@ -1679,9 +1844,10 @@ def run() -> dict[str, Any]:
             "PAYMENT_REFRESH_ENABLED": payment_enabled,
             "PAYMENT_PUBLICATION": bool(payment_publication),
             "FINAL_MASTER_UNIQUE_IDS": candidate_summary["unique"],
-            "FINAL_STATUS": "SUCCESS",
+            "FINAL_STATUS": "TEST_SUCCESS" if run_mode == "test" else "SUCCESS",
+            "CONTROL_PROJECT_8314": _control_project_8314(merged),
         }
-        print("FINAL_STATUS=SUCCESS", flush=True)
+        _stage(report["FINAL_STATUS"])
         return report
     finally:
         session.close()

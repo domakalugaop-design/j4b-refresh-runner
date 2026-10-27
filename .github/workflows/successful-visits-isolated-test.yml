@@ -1,0 +1,151 @@
+name: Successful Visits isolated TEST refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Confirm the isolated TEST workbook write
+        required: true
+        type: choice
+        options:
+          - J4B_ISOLATED_TEST
+
+permissions:
+  contents: read
+
+concurrency:
+  group: j4b-successful-visits-isolated-test
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TEST_SPREADSHEET_ID: 13pPltgzR6HceIW4OjtLyzOrXwNdEcDQ1RBxR0L7ZCK8
+      EXPECTED_GOOGLE_SPREADSHEET_TITLE: J4B Portal — Successful Visits — TEST — 2026-10-27
+      TEST_BACKUP_FOLDER_ID: ${{ secrets.TEST_SUCCESSFUL_VISITS_BACKUP_FOLDER_ID }}
+      GOOGLE_WORKSHEET: projects_current
+      PORTAL_REQUEST_DELAY: "0.15"
+      J4B_TEST_BASELINE_IDS_PATH: ${{ github.workspace }}/.j4b-test-baseline-ids.json
+      J4B_PERSISTENT_BACKUP_DIR: ${{ github.workspace }}/.j4b-test-prepublication-backup
+      J4B_PERSISTENT_BACKUP_UPLOAD_MARKER: ${{ github.workspace }}/.j4b-test-prepublication-backup/upload.ok
+
+    steps:
+      - name: Checkout successful-visits feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/portal-001-3-successful-visits-current-20261027
+
+      - name: Guard selected feature branch
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/codex/portal-001-3-successful-visits-current-20261027" ]]; then
+            echo "TEST_BRANCH_GUARD=FAIL"
+            exit 1
+          fi
+          echo "TEST_BRANCH_GUARD=PASS"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Public repository safety check
+        run: python scripts/public_repo_safety_check.py
+
+      - name: Unit and portability tests
+        run: python -m pytest -q
+
+      - name: Validate pinned TEST target and 58/25 baseline
+        env:
+          RUN_MODE: test
+          GOOGLE_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          PRODUCTION_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          J4B_TEST_VALIDATION_PHASE: preflight
+        run: python scripts/validate_successful_visits_test.py
+
+      - name: Acquire read-only Portal snapshot and save checkpoint
+        env:
+          RUN_MODE: test
+          ALLOW_TEST_WRITE: "true"
+          TEST_CONFIRMATION: ${{ inputs.confirmation }}
+          GOOGLE_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
+          ACQUISITION_ONLY: "true"
+          ACQUISITION_CHECKPOINT_PATH: /tmp/j4b-successful-visits-test-checkpoint.json
+        run: python -m src.production
+
+      - name: Materialization preflight with no Sheet publication
+        env:
+          RUN_MODE: test
+          ALLOW_TEST_WRITE: "true"
+          TEST_CONFIRMATION: ${{ inputs.confirmation }}
+          GOOGLE_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
+          REPLAY_ACQUISITION_CHECKPOINT: "true"
+          MATERIALIZATION_PREFLIGHT: "true"
+          ACQUISITION_CHECKPOINT_PATH: /tmp/j4b-successful-visits-test-checkpoint.json
+        run: python -m src.production
+
+      - name: Create private local prepublication checkpoint
+        env:
+          RUN_MODE: test
+          ALLOW_TEST_WRITE: "true"
+          TEST_CONFIRMATION: ${{ inputs.confirmation }}
+          GOOGLE_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
+          PREPUBLICATION_BACKUP_ONLY: "true"
+        run: python -m src.production
+
+      - name: Create and verify private Drive rollback copy
+        id: private_rollback
+        env:
+          GOOGLE_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          TEST_BACKUP_FOLDER_ID: ${{ env.TEST_BACKUP_FOLDER_ID }}
+        run: python scripts/create_successful_visits_test_backup.py
+
+      - name: Publish feature payload to the pinned isolated TEST workbook
+        env:
+          RUN_MODE: test
+          ALLOW_TEST_WRITE: "true"
+          TEST_CONFIRMATION: ${{ inputs.confirmation }}
+          TEST_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          GOOGLE_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          EXPECTED_GOOGLE_SPREADSHEET_TITLE: ${{ env.EXPECTED_GOOGLE_SPREADSHEET_TITLE }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PORTAL_BASE_URL: ${{ secrets.PORTAL_BASE_URL }}
+          PORTAL_LOGIN: ${{ secrets.PORTAL_LOGIN }}
+          PORTAL_PASSWORD: ${{ secrets.PORTAL_PASSWORD }}
+          PORTAL_REQUEST_DELAY: "0.15"
+          ENABLE_WORKFLOW_ANALYTICS_PUBLICATION: "true"
+          REPLAY_ACQUISITION_CHECKPOINT: "true"
+          ACQUISITION_CHECKPOINT_PATH: /tmp/j4b-successful-visits-test-checkpoint.json
+          J4B_PERSISTENT_BACKUP_DIR: ${{ env.J4B_PERSISTENT_BACKUP_DIR }}
+          J4B_PERSISTENT_BACKUP_UPLOAD_MARKER: ${{ env.J4B_PERSISTENT_BACKUP_UPLOAD_MARKER }}
+        run: python -m src.production
+
+      - name: Independent TEST Sheets readback
+        env:
+          RUN_MODE: test
+          TEST_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          GOOGLE_SPREADSHEET_ID: ${{ env.TEST_SPREADSHEET_ID }}
+          PRODUCTION_SPREADSHEET_ID: ${{ secrets.PRODUCTION_GOOGLE_SPREADSHEET_ID }}
+          EXPECTED_GOOGLE_SPREADSHEET_TITLE: ${{ env.EXPECTED_GOOGLE_SPREADSHEET_TITLE }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          J4B_TEST_VALIDATION_PHASE: readback
+          J4B_TEST_BASELINE_IDS_PATH: ${{ env.J4B_TEST_BASELINE_IDS_PATH }}
+        run: python scripts/validate_successful_visits_test.py

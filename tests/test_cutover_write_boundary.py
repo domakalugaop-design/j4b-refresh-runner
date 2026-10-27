@@ -203,10 +203,22 @@ def test_persistent_prepublication_backup_round_trips_and_rejects_temporary_path
 
 
 def test_workflow_rollback_normalizes_short_backup_rows(monkeypatch):
-    backup = {"payload": {"sheets": {production.THIRD_TAB_NAME: [["id", "name"], ["8110"]]}}}
+    backup = {"payload": {
+        "sheets": {production.THIRD_TAB_NAME: [["id", "name"], ["8110"]]},
+        "metadata": {
+            "existing_tabs": [production.THIRD_TAB_NAME],
+            "workflow_tab_grid": {"rowCount": 1000, "columnCount": 2},
+        },
+    }}
     calls = []
     def fake_api(url, token, body=None, method=None):
         calls.append((url, body, method))
+        if "fields=sheets.properties(title" in url and "gridProperties" in url:
+            return {"sheets": [{"properties": {
+                "title": production.THIRD_TAB_NAME,
+                "sheetId": 123,
+                "gridProperties": {"rowCount": 1000, "columnCount": 2},
+            }}]}
         if "values/" in url and method is None:
             return {"values": [["id", "name"], ["8110"]]}
         return {}
@@ -315,6 +327,51 @@ def test_main_workflow_uploads_backup_before_replay_publication():
     assert "python scripts/public_repo_safety_check.py" in by_name["Public repository safety check"]["run"]
 
 
+def test_successful_visits_test_workflow_is_pinned_gated_and_has_private_backup_before_write():
+    import yaml
+
+    workflow = Path(__file__).parents[1] / ".github/workflows/successful-visits-isolated-test.yml"
+    parsed = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    job = parsed["jobs"]["refresh"]
+    pinned_id = "13pPltgzR6HceIW4OjtLyzOrXwNdEcDQ1RBxR0L7ZCK8"
+    assert job["env"]["TEST_SPREADSHEET_ID"] == pinned_id
+    steps = job["steps"]
+    names = [step.get("name") for step in steps]
+    publish_index = names.index("Publish feature payload to the pinned isolated TEST workbook")
+    backup_index = names.index("Create and verify private Drive rollback copy")
+    readback_index = names.index("Independent TEST Sheets readback")
+    assert backup_index < publish_index < readback_index
+    workflow_text = workflow.read_text(encoding="utf-8")
+    verify_script = (Path(__file__).parents[1] / "scripts/validate_successful_visits_test.py").read_text(encoding="utf-8")
+    backup_script = (Path(__file__).parents[1] / "scripts/create_successful_visits_test_backup.py").read_text(encoding="utf-8")
+    assert workflow_text.count(pinned_id) == 1
+    assert pinned_id in verify_script and pinned_id in backup_script
+    assert "test-refresh.yml" not in workflow_text
+    assert "manual-production-dispatch.yml" not in workflow_text
+    assert "ALLOW_PRODUCTION_WRITE" not in workflow_text
+    assert "PRODUCTION_CONFIRMATION" not in workflow_text
+    assert "actions/upload-artifact" not in workflow_text
+    assert "TEST_CONFIRMATION" in workflow_text
+    assert "TEST_SUCCESSFUL_VISITS_BACKUP_FOLDER_ID" in workflow_text
+    assert "TEST_SPREADSHEET_ID" in workflow_text
+    step_map = {step.get("name"): step for step in steps}
+    write_steps = (
+        "Acquire read-only Portal snapshot and save checkpoint",
+        "Materialization preflight with no Sheet publication",
+        "Create private local prepublication checkpoint",
+        "Publish feature payload to the pinned isolated TEST workbook",
+    )
+    for name in write_steps:
+        env = step_map[name].get("env", {})
+        assert env.get("RUN_MODE") == "test"
+        assert env.get("ALLOW_TEST_WRITE") == "true"
+        assert env.get("GOOGLE_SPREADSHEET_ID") == "${{ env.TEST_SPREADSHEET_ID }}"
+        assert "ALLOW_PRODUCTION_WRITE" not in env
+        assert "PRODUCTION_CONFIRMATION" not in env
+        assert "PRODUCTION_GOOGLE_SPREADSHEET_ID" not in env
+        assert "PRODUCTION_SPREADSHEET_ID" not in env
+
+
 def test_workflow_unit_environment_isolated_from_production_state(monkeypatch):
     """The CI test step has no inherited production mode, credentials, or backup state."""
     import yaml
@@ -372,7 +429,8 @@ def test_dry_run_api_guard_allows_google_sheets_reads(monkeypatch):
         assert api("https://sheets.googleapis.com/v4/spreadsheets/sheet-1", "token") == {"ok": True}
 
 
-def test_full_production_dry_run_uses_candidate_path_and_never_mutates(tmp_path, monkeypatch):
+@pytest.mark.parametrize("run_mode", ["production", "test"])
+def test_full_refresh_dry_run_uses_candidate_path_and_never_mutates(tmp_path, monkeypatch, run_mode):
     path, digest = _seed_file(tmp_path, [_entry()])
     baseline = [BASE_COLUMNS, ["8110"] + [""] * (len(BASE_COLUMNS) - 1)]
     row = {column: "" for column in PROJECT_TYPE_COLUMNS}
@@ -392,7 +450,7 @@ def test_full_production_dry_run_uses_candidate_path_and_never_mutates(tmp_path,
             pass
 
     for key, value in {
-        "RUN_MODE": "production",
+        "RUN_MODE": run_mode,
         "DRY_RUN": "true",
         "GOOGLE_SPREADSHEET_ID": "sheet-1",
         "PROJECT_TYPE_BOOTSTRAP_PATH": str(path),
@@ -400,8 +458,15 @@ def test_full_production_dry_run_uses_candidate_path_and_never_mutates(tmp_path,
         "PORTAL_REQUEST_DELAY": "0",
     }.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.delenv("ALLOW_PRODUCTION_WRITE", raising=False)
-    monkeypatch.delenv("PRODUCTION_CONFIRMATION", raising=False)
+    for key in (
+        "ALLOW_PRODUCTION_WRITE", "PRODUCTION_CONFIRMATION", "PRODUCTION_GOOGLE_SPREADSHEET_ID",
+        "PRODUCTION_SPREADSHEET_ID", "ALLOW_TEST_WRITE", "TEST_CONFIRMATION", "TEST_SPREADSHEET_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    if run_mode == "test":
+        monkeypatch.setenv("ALLOW_TEST_WRITE", "true")
+        monkeypatch.setenv("TEST_CONFIRMATION", "J4B_ISOLATED_TEST")
+        monkeypatch.setenv("TEST_SPREADSHEET_ID", "sheet-1")
 
     with patch("src.production.google_token", return_value="opaque"), \
          patch("src.production._destination_preflight", return_value=_meta()), \
@@ -506,3 +571,59 @@ def test_project_type_state_rejects_immutable_value_change_in_candidate():
     rows = [{"project_id": "8110", "project_type_code": "0002", "project_type_name": PROJECT_TYPE_DICTIONARY["0002"]}]
     with pytest.raises(RuntimeError, match="immutable Project Type"):
         production._validate_project_type_state_materialization(rows, state, {"8110"})
+
+
+def test_isolated_test_write_gate_requires_the_pinned_target_and_no_production_gate(monkeypatch):
+    for key in (
+        "ALLOW_PRODUCTION_WRITE", "PRODUCTION_CONFIRMATION", "PRODUCTION_GOOGLE_SPREADSHEET_ID",
+        "PRODUCTION_SPREADSHEET_ID",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("RUN_MODE", "test")
+    monkeypatch.setenv("ALLOW_TEST_WRITE", "true")
+    monkeypatch.setenv("TEST_CONFIRMATION", "J4B_ISOLATED_TEST")
+    monkeypatch.setenv("GOOGLE_SPREADSHEET_ID", "isolated-test-sheet")
+    monkeypatch.setenv("TEST_SPREADSHEET_ID", "isolated-test-sheet")
+    assert production._require_write_gate() == "isolated-test-sheet"
+
+    monkeypatch.setenv("TEST_SPREADSHEET_ID", "different-sheet")
+    with pytest.raises(RuntimeError, match="pinned TEST_SPREADSHEET_ID"):
+        production._require_write_gate()
+
+    monkeypatch.setenv("TEST_SPREADSHEET_ID", "isolated-test-sheet")
+    monkeypatch.setenv("PRODUCTION_GOOGLE_SPREADSHEET_ID", "production-sheet")
+    with pytest.raises(RuntimeError, match="must not be present"):
+        production._require_write_gate()
+
+    monkeypatch.delenv("PRODUCTION_GOOGLE_SPREADSHEET_ID", raising=False)
+    monkeypatch.setenv("PRODUCTION_SPREADSHEET_ID", "production-sheet")
+    with pytest.raises(RuntimeError, match="must not be present"):
+        production._require_write_gate()
+
+
+def test_isolated_test_candidate_fails_before_write_if_baseline_project_id_would_drop(monkeypatch):
+    monkeypatch.setenv("RUN_MODE", "test")
+    previous = [["project_id", "name"], ["8314", "control"], ["9001", "preserve"]]
+    candidate = [["project_id", "name"], ["8314", "control"]]
+    with pytest.raises(RuntimeError, match="drop baseline project IDs"):
+        production._validate_test_baseline_retention(previous, candidate)
+
+    monkeypatch.setenv("RUN_MODE", "production")
+    production._validate_test_baseline_retention(previous, candidate)
+
+
+def test_destination_preflight_accepts_only_explicit_test_title_override(monkeypatch):
+    test_title = "J4B Portal — Successful Visits — TEST — 2026-10-27"
+    monkeypatch.setenv("EXPECTED_GOOGLE_SPREADSHEET_TITLE", test_title)
+    expected = {
+        "spreadsheetId": "isolated-test-sheet",
+        "properties": {"title": test_title},
+        "sheets": [],
+    }
+    with patch("src.production.api", return_value=expected):
+        assert production._destination_preflight("token", "isolated-test-sheet") == expected
+
+    wrong = {**expected, "properties": {"title": production.PRODUCTION_TITLE}}
+    with patch("src.production.api", return_value=wrong):
+        with pytest.raises(RuntimeError, match="destination title verification failed"):
+            production._destination_preflight("token", "isolated-test-sheet")

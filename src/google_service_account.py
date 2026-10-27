@@ -10,6 +10,7 @@ from google.auth.transport.requests import Request
 from google.oauth2 import service_account
 
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 
 
 def _service_account_info() -> dict[str, Any]:
@@ -49,10 +50,11 @@ def _service_account_info() -> dict[str, Any]:
     return info
 
 
-def google_token() -> str:
+def google_token(scopes: list[str] | None = None) -> str:
+    requested_scopes = scopes or [SHEETS_SCOPE]
     credentials = service_account.Credentials.from_service_account_info(
         _service_account_info(),
-        scopes=[SHEETS_SCOPE],
+        scopes=requested_scopes,
     )
     credentials.refresh(Request())
 
