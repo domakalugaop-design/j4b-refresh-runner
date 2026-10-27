@@ -26,6 +26,10 @@ fetched live by these scripts.
 | `scripts/run_visit_registry_snapshot.py` | Offline HTML → snapshot JSON runner |
 | `scripts/publish_visit_registry_test.py` | Gated TEST publication planner/executor |
 | `tests/test_visit_registry.py` | Parser, grain, snapshot, gate and runner tests |
+| `src/project_controller_claims_mart.py` | Project/visit/claim grains and explicit availability states |
+| `scripts/extract_project_controller_completion_cohort.py` | Bounded read-only MariaDB →40 project/visit cohort extractor |
+| `scripts/publish_project_controller_claims_test.py` | TEST-only append-only source publisher with grain verification |
+| `tests/test_project_controller_claims_mart.py` | Project mart grain, denominator, zero-claim, and `NOT_AVAILABLE` tests |
 
 ## Parsing contract (`parse_action_fact_rows`)
 
@@ -200,14 +204,27 @@ No production writes or deployment.
 
 ## 2026-10-27 project/report/controller historical source completion
 
-The existing claims episodes and partial corrector snapshot were assessed
-against the requested three-month project/report/controller mart. Existing
-claims support episode-level counts for the captured window, but do not include
-the zero-claim project universe, all report/visit denominators, or a proven
-historical controller association. The approved MariaDB read-only connection
-could not be established with TLS certificate and hostname verification, so no
-database queries or new TEST publication were performed. Full source acceptance
-is blocked; see
-[PROJECT_CONTROLLER_CLAIMS_90D_DATA_ACCEPTANCE.md](PROJECT_CONTROLLER_CLAIMS_90D_DATA_ACCEPTANCE.md)
-for measured coverage, exact limitations, and release gates. No production
-write, refresh, or DataLens change.
+The first assessment used the wrong TLS connection contract and is superseded.
+After owner confirmation, direct TCP/no-TLS/no-SSH read-only MariaDB access was
+verified (`watch`, MariaDB 10.11.19, empty `Ssl_cipher`, grants `SELECT, SHOW
+VIEW`). The bounded typ-140 completion cohort contains 31,170 distinct
+`(project_id, visit_id)` pairs, 31,206 mapped action IDs, six actions without a
+`my` mapping, and 739 named projects. Joined with the existing claims source,
+the TEST mart includes 767 projects total (28 claim-only), including 272
+zero-claim projects.
+
+Six new append-only, versioned TEST tabs are published and read-back verified;
+current DataLens-ready publication is v2
+`pcclaims90-v2-20261027T062709.087947+0000-801fc34e05` (numeric cells; filter
+all tabs to this publication ID; v1 is retained as history):
+`project_directory`, `project_monthly_metrics`, `project_period_metrics`,
+`controller_monthly_metrics`, `report_controller_claim_links`, and
+`project_controller_claims_manifest`. The existing `claims_mart_90d` tab was
+not changed. All 7,576 episodes remain in the link grain; seven rows have no
+project/visit attribution. The source capture manifest predates 36 claim event
+timestamps, so rate fields are blank/`NOT_AVAILABLE`. `typ=140` action counts
+are a completion-transition proxy, not a proven all-report denominator;
+historical controller attribution remains `NOT_AVAILABLE` and no person-level
+workload is asserted. Full evidence and recommended DataLens semantics are in
+[PROJECT_CONTROLLER_CLAIMS_90D_DATA_ACCEPTANCE.md](PROJECT_CONTROLLER_CLAIMS_90D_DATA_ACCEPTANCE.md).
+Full suite: 622 passed. No production writes/deployment and no DataLens edits.

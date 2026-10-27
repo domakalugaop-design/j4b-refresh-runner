@@ -90,6 +90,42 @@ class GoogleSheetsGateway:
         )
         self._request("POST", url, {"requests": [{"addSheet": {"properties": {"title": title}}}]})
 
+    def ensure_grid_capacity(self, title: str, min_rows: int, min_columns: int) -> None:
+        """Grow a sheet's grid when append-only data exceeds its current bounds."""
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}"
+            "?fields=sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))"
+        )
+        payload = self._request("GET", url)
+        target = None
+        for sheet in payload.get("sheets") or []:
+            props = (sheet or {}).get("properties") or {}
+            if props.get("title") == title:
+                target = props
+                break
+        if target is None:
+            raise MartError(f"sheet not found while checking grid capacity: {title}")
+        grid = target.get("gridProperties") or {}
+        current_rows = int(grid.get("rowCount", 1000))
+        current_columns = int(grid.get("columnCount", 26))
+        new_rows = max(current_rows, int(min_rows))
+        new_columns = max(current_columns, int(min_columns))
+        if new_rows == current_rows and new_columns == current_columns:
+            return
+        self._request(
+            "POST",
+            f"https://sheets.googleapis.com/v4/spreadsheets/{self.spreadsheet_id}:batchUpdate",
+            {"requests": [{
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": int(target["sheetId"]),
+                        "gridProperties": {"rowCount": new_rows, "columnCount": new_columns},
+                    },
+                    "fields": "gridProperties.rowCount,gridProperties.columnCount",
+                }
+            }]},
+        )
+
     def ensure_headers(self, title: str, header: list[str]) -> None:
         """Write the header row only when the tab is empty."""
         existing = self.read_range(title, "A1:Z1")
