@@ -52,6 +52,7 @@ from src.portal_mariadb_etl import (
     _outside_repository,
     _safe_file,
     connect_postgres,
+    exclusive_run_lock,
     open_postgres_tunnel,
     validate_project_ids,
 )
@@ -227,13 +228,16 @@ def keychain_credential(account: str) -> str:
 
 def live_portal_session() -> PortalSession:
     if os.environ.get("PORTAL_LOGIN") and os.environ.get("PORTAL_PASSWORD"):
-        return PortalSession(timeout=PER_REQUEST_TIMEOUT)
-    return PortalSession(
-        base_url=os.environ.get("PORTAL_BASE_URL", "https://lk.j4b.ru"),
-        login=keychain_credential("login"),
-        password=keychain_credential("password"),
-        timeout=PER_REQUEST_TIMEOUT,
-    )
+        session = PortalSession(timeout=PER_REQUEST_TIMEOUT)
+    else:
+        session = PortalSession(
+            base_url=os.environ.get("PORTAL_BASE_URL", "https://lk.j4b.ru"),
+            login=keychain_credential("login"),
+            password=keychain_credential("password"),
+            timeout=PER_REQUEST_TIMEOUT,
+        )
+    session.login()
+    return session
 
 
 @dataclass(frozen=True)
@@ -253,8 +257,9 @@ class ReferenceConfig:
     target_known_hosts_file: Path
     target_ssh_host_fingerprints: tuple[str, ...]
     target_ssh_jump_fingerprints: tuple[str, ...]
-    compose_project_dir: Path
-    compose_file: Path
+    target_ssh_identity_file: Optional[Path] = None
+    compose_project_dir: Path = Path("/home/service/app/j4b-analytics")
+    compose_file: Path = Path("/home/service/app/j4b-analytics/j4b-analytics-compose.yaml")
 
 
 def load_reference_config(path: Path) -> ReferenceConfig:
@@ -269,6 +274,8 @@ def load_reference_config(path: Path) -> ReferenceConfig:
         password_file = _safe_file(Path(target["password_file"]))
         _outside_repository(password_file)
         known_hosts = _safe_file(Path(target["known_hosts_file"]), require_private=False)
+        identity_text = target.get("ssh_identity_file", "").strip()
+        identity_file = _safe_file(Path(identity_text)) if identity_text else None
         host_fingerprints = _fingerprints(target.get("ssh_host_fingerprints", ""))
         jump_fingerprints = _fingerprints(target.get("ssh_jump_fingerprints", ""))
         project_dir = Path(guard["compose_project_dir"])
@@ -301,6 +308,7 @@ def load_reference_config(path: Path) -> ReferenceConfig:
             target_known_hosts_file=known_hosts,
             target_ssh_host_fingerprints=host_fingerprints,
             target_ssh_jump_fingerprints=jump_fingerprints,
+            target_ssh_identity_file=identity_file,
             compose_project_dir=project_dir,
             compose_file=compose_file,
         )
@@ -311,8 +319,6 @@ def load_reference_config(path: Path) -> ReferenceConfig:
 
 
 _DDL = (
-    "CREATE SCHEMA IF NOT EXISTS reference",
-    "CREATE SCHEMA IF NOT EXISTS ops",
     """CREATE TABLE IF NOT EXISTS reference.portal_clients (
         client_id BIGINT PRIMARY KEY, label TEXT, label_state TEXT NOT NULL,
         first_seen_run UUID NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
@@ -359,16 +365,27 @@ class ReferenceTarget:
             cursor.execute("SELECT current_database(), current_user")
             row = cursor.fetchone()
             cursor.execute(
-                "SELECT schema_name FROM information_schema.schemata WHERE schema_name=%s",
-                (TARGET_DATABASE,),
+                "SELECT schema_name FROM information_schema.schemata"
+                " WHERE schema_name = ANY(%s) ORDER BY schema_name",
+                ([OPS_SCHEMA, REFERENCE_SCHEMA],),
             )
-            schema = cursor.fetchone()
-        if row != (TARGET_DATABASE, TARGET_USER) or schema is None:
+            schemas = [result[0] for result in cursor.fetchall()]
+        if row != (TARGET_DATABASE, TARGET_USER) or schemas != sorted((OPS_SCHEMA, REFERENCE_SCHEMA)):
             raise SecurityGateError("target is not the dedicated Analytics loader endpoint")
 
     def ensure_tables(self, reader_role: Optional[str] = None) -> None:
         with self.connection:
             with self.connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT schema_name FROM information_schema.schemata"
+                    " WHERE schema_name = ANY(%s) ORDER BY schema_name",
+                    ([OPS_SCHEMA, REFERENCE_SCHEMA],),
+                )
+                schemas = [row[0] for row in cursor.fetchall()]
+                if schemas != sorted((OPS_SCHEMA, REFERENCE_SCHEMA)):
+                    raise SecurityGateError(
+                        "reference and ops schemas must be pre-provisioned by the administrator"
+                    )
                 for statement in _DDL:
                     cursor.execute(statement)
                 for statement in _HARDENING:
@@ -663,19 +680,20 @@ def run_live(
     max_age_hours: float,
     reader_role: Optional[str],
 ) -> ReferenceRunSummary:
-    with open_postgres_tunnel(config) as endpoint:
-        connection = connect_postgres(config, endpoint)
-        try:
-            runner = ReferenceETLRunner(
-                PortalReferenceClient(live_portal_session()),
-                ReferenceTarget(connection),
-                ComposeStorageGuard(config),
-                max_age_hours=max_age_hours,
-                reader_role=reader_role,
-            )
-            return runner.run(project_ids)
-        finally:
-            connection.close()
+    with exclusive_run_lock("portal-reference-etl"):
+        with open_postgres_tunnel(config) as endpoint:
+            connection = connect_postgres(config, endpoint)
+            try:
+                runner = ReferenceETLRunner(
+                    PortalReferenceClient(live_portal_session()),
+                    ReferenceTarget(connection),
+                    ComposeStorageGuard(config),
+                    max_age_hours=max_age_hours,
+                    reader_role=reader_role,
+                )
+                return runner.run(project_ids)
+            finally:
+                connection.close()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

@@ -457,3 +457,140 @@ def test_storage_guard_requires_remote_allow_token(monkeypatch):
         assert ComposeStorageGuard(config).check() is False
     with patch("src.portal_mariadb_etl.run_approved_ssh_command", side_effect=SecurityGateError("x")):
         assert ComposeStorageGuard(config).check() is False
+
+
+# --- deployment hardening: legacy opt-in, identity files, run lock ----------
+
+
+def _legacy_config(tmp_path, *, opt_in=True, user="watch", identity_file=None):
+    source_password = tmp_path / "source.pass"
+    target_password = tmp_path / "target.pass"
+    known_hosts = tmp_path / "known_hosts"
+    source_password.write_text("synthetic-only\n", encoding="utf-8")
+    target_password.write_text("synthetic-only\n", encoding="utf-8")
+    known_hosts.write_text("", encoding="utf-8")
+    source_password.chmod(0o600)
+    target_password.chmod(0o600)
+    known_hosts.chmod(0o600)
+    identity_line = ""
+    if identity_file is not None:
+        identity_line = "ssh_identity_file=%s\n" % identity_file
+    config_path = tmp_path / "legacy.ini"
+    config_path.write_text(
+        "[source]\ntransport=legacy-plain\nlegacy_plain_opt_in=%s\nhost=lk.j4b.ru\nport=3306\n"
+        "database=j4b\nuser=%s\npassword_file=%s\n%s\n"
+        "[target]\ntransport=ssh-tunnel\nhost=postgres\nport=5432\ndatabase=j4b_analytics\n"
+        "user=j4b_analytics_loader\npassword_file=%s\nssh_host=example-vps\nssh_user=etl\n"
+        "known_hosts_file=%s\nssh_host_fingerprints=SHA256:approved-placeholder\n\n"
+        "[guard]\ncompose_project_dir=/home/service/app/j4b-analytics\n"
+        "compose_file=j4b-analytics-compose.yaml\n"
+        % (
+            "true" if opt_in else "false", user, source_password,
+            identity_line, target_password, known_hosts,
+        ),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    return config_path
+
+
+def test_legacy_plain_requires_explicit_config_opt_in(tmp_path):
+    from src.portal_mariadb_etl import load_runtime_config
+    with pytest.raises(SecurityGateError):
+        load_runtime_config(_legacy_config(tmp_path, opt_in=False))
+    loaded = load_runtime_config(_legacy_config(tmp_path, opt_in=True))
+    assert loaded.source_transport == "legacy-plain"
+
+
+def test_legacy_plain_is_restricted_to_approved_readonly_account(tmp_path):
+    from src.portal_mariadb_etl import load_runtime_config
+    with pytest.raises(SecurityGateError):
+        load_runtime_config(_legacy_config(tmp_path, opt_in=True, user="root"))
+
+
+def test_legacy_plain_cli_gate_blocks_without_second_opt_in(tmp_path, capsys):
+    from src.portal_mariadb_etl import main
+    config_path = _legacy_config(tmp_path, opt_in=True)
+    assert main(["--config", str(config_path), "--project-id", "8181"]) == 2
+    assert "error_class=SecurityGateError" in capsys.readouterr().err
+    assert main(["--config", str(config_path), "--project-id", "8181", "--allow-legacy-plain"]) == 0
+    assert "PREPARATION_ONLY=YES" in capsys.readouterr().out
+
+
+def test_legacy_plain_connection_rejects_non_challenge_response_auth():
+    from src.portal_mariadb_etl import LegacyPlainConnection
+
+    class _FakeAuthBase:
+        plugin = ""
+
+        def _request_authentication(self):
+            self._auth_plugin_name = self.plugin
+
+    class _NativeBase(_FakeAuthBase):
+        plugin = "mysql_native_password"
+
+    class _ClearTextBase(_FakeAuthBase):
+        plugin = "mysql_clear_password"
+
+    native_cls = type("_NativeConn", (LegacyPlainConnection, _NativeBase), {})
+    clear_cls = type("_ClearConn", (LegacyPlainConnection, _ClearTextBase), {})
+    assert native_cls().set_character_set("utf8mb4") is None  # no implicit SET NAMES
+    native_cls()._request_authentication()  # challenge-response: accepted
+    with pytest.raises(SecurityGateError):
+        clear_cls()._request_authentication()
+
+
+def test_exclusive_run_lock_blocks_parallel_and_allows_sequential():
+    from src.portal_mariadb_etl import exclusive_run_lock
+    with exclusive_run_lock("test-channel-lock"):
+        with pytest.raises(ETLError):
+            with exclusive_run_lock("test-channel-lock"):
+                pass
+    with exclusive_run_lock("test-channel-lock"):
+        pass
+    with pytest.raises(ETLError):
+        with exclusive_run_lock("../escape"):
+            pass
+
+
+def test_ssh_identity_file_is_validated_and_injected(tmp_path):
+    import src.portal_mariadb_etl as etl
+    key_file = tmp_path / "deploy_key"
+    key_file.write_text("synthetic\n", encoding="utf-8")
+    key_file.chmod(0o600)
+    config = etl.load_runtime_config(_legacy_config(tmp_path, identity_file=key_file))
+    assert config.ssh_identity_file == key_file.resolve()
+    assert config.target_ssh_identity_file is None
+    missing = tmp_path / "missing_key"
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub2").mkdir()
+    with pytest.raises(SecurityGateError):
+        etl.load_runtime_config(_legacy_config(tmp_path / "sub", identity_file=missing))
+    loose = tmp_path / "loose_key"
+    loose.write_text("synthetic\n", encoding="utf-8")
+    loose.chmod(0o644)
+    with pytest.raises(SecurityGateError):
+        etl.load_runtime_config(_legacy_config(tmp_path / "sub2", identity_file=loose))
+    known_hosts = tmp_path / "known_hosts"
+    known_hosts.write_text("synthetic\n", encoding="utf-8")
+    known_hosts.chmod(0o600)
+    with patch.object(etl, "verify_known_host_fingerprints", lambda *a, **k: None):
+        args = etl._approved_ssh_args(
+            "dbhost", 22, "dbuser", known_hosts, ["SHA256:approved"],
+            identity_file=key_file,
+        )
+    assert args[args.index("-i") + 1] == str(key_file)
+    assert "IdentitiesOnly=yes" in args
+
+
+def test_bounded_full_scan_allowed_only_within_explicit_bound():
+    columns = ("type", "rows")
+    assert validate_explain_plan(columns, [("ALL", 14_843)], allow_bounded_full_scan=True) is None
+    with pytest.raises(SourceValidationError):
+        validate_explain_plan(columns, [("ALL", 14_843)])
+    with pytest.raises(SourceValidationError):
+        validate_explain_plan(
+            columns, [("ALL", 50_001)], allow_bounded_full_scan=True
+        )
+    with pytest.raises(SourceValidationError):
+        validate_explain_plan(columns, [("ALL", -1)], allow_bounded_full_scan=True)

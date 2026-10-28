@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import base64
 import configparser
+import fcntl
 import hashlib
 import ipaddress
 import os
@@ -17,6 +18,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -169,10 +171,20 @@ def require_mysql_tls_capability(server_capabilities: int) -> None:
 
 
 def validate_explain_plan(
-    column_names: Sequence[str], rows: Iterable[Sequence[Any]],
+    column_names: Sequence[str],
+    rows: Iterable[Sequence[Any]],
     max_estimated_rows: int = MAX_ESTIMATED_ROWS_PER_QUERY,
+    *,
+    allow_bounded_full_scan: bool = False,
 ) -> None:
-    """Reject full scans, unknown plan shapes, or excessive estimated work."""
+    """Reject full scans, unknown plan shapes, or excessive estimated work.
+
+    allow_bounded_full_scan admits an unindexed access path only while its
+    estimated row work stays within max_estimated_rows; the bound is
+    re-validated on every run, so growth beyond it fails closed. Used solely
+    for the claim entity, whose production table has no project index and
+    stays far below the bound (verified 2026-10-28: ~14.8k rows).
+    """
     indexes = {name.lower(): index for index, name in enumerate(column_names)}
     if "type" not in indexes or "rows" not in indexes:
         raise SourceValidationError("MariaDB EXPLAIN result lacks access-cost fields")
@@ -185,6 +197,8 @@ def validate_explain_plan(
             estimate = int(estimate_value)
         except (TypeError, ValueError):
             raise SourceValidationError("MariaDB EXPLAIN row estimate is unavailable") from None
+        if access == "ALL" and allow_bounded_full_scan and 0 <= estimate <= max_estimated_rows:
+            continue
         if access not in ALLOWED_ACCESS_TYPES:
             raise SourceValidationError("MariaDB query plan uses an unapproved access path")
         if estimate < 0 or estimate > max_estimated_rows:
@@ -241,21 +255,23 @@ class RuntimeConfig:
     known_hosts_file: Optional[Path]
     ssh_host_fingerprints: Tuple[str, ...]
     ssh_jump_fingerprints: Tuple[str, ...]
-    target_host: str
-    target_port: int
-    target_database: str
-    target_user: str
-    target_password_file: Path
-    target_ssh_host: str
-    target_ssh_port: int
-    target_ssh_user: str
-    target_ssh_jump_host: Optional[str]
-    target_ssh_jump_user: Optional[str]
-    target_known_hosts_file: Path
-    target_ssh_host_fingerprints: Tuple[str, ...]
-    target_ssh_jump_fingerprints: Tuple[str, ...]
-    compose_project_dir: Path
-    compose_file: Path
+    ssh_identity_file: Optional[Path] = None
+    target_host: str = "postgres"
+    target_port: int = 5432
+    target_database: str = TARGET_DATABASE
+    target_user: str = TARGET_USER
+    target_password_file: Path = Path("/dev/null")
+    target_ssh_host: str = ""
+    target_ssh_port: int = 22
+    target_ssh_user: str = ""
+    target_ssh_jump_host: Optional[str] = None
+    target_ssh_jump_user: Optional[str] = None
+    target_known_hosts_file: Path = Path("/dev/null")
+    target_ssh_host_fingerprints: Tuple[str, ...] = ()
+    target_ssh_jump_fingerprints: Tuple[str, ...] = ()
+    target_ssh_identity_file: Optional[Path] = None
+    compose_project_dir: Path = Path("/home/service/app/j4b-analytics")
+    compose_file: Path = Path("/home/service/app/j4b-analytics/j4b-analytics-compose.yaml")
 
 
 def load_runtime_config(path: Path) -> RuntimeConfig:
@@ -274,16 +290,28 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         _outside_repository(source_password)
         _outside_repository(target_password)
         transport = source.get("transport", "").strip().lower()
-        if transport not in {"tls", "ssh-tunnel"}:
-            raise SecurityGateError("source transport must be TLS or a verified SSH tunnel")
+        if transport == "legacy-plain":
+            # Owner-approved exception: plaintext legacy SQL for the allowlisted
+            # dataset only. Requires the explicit config opt-in AND the approved
+            # read-only account; the CLI adds its own --allow-legacy-plain gate.
+            if source.getboolean("legacy_plain_opt_in", fallback=False) is not True:
+                raise SecurityGateError("legacy plaintext transport requires an explicit owner opt-in in the config")
+            if source["user"] != "watch":
+                raise SecurityGateError("legacy plaintext transport is restricted to the approved read-only account")
+        if transport not in {"tls", "ssh-tunnel", "legacy-plain"}:
+            raise SecurityGateError("source transport must be TLS, a verified SSH tunnel, or the approved legacy opt-in")
         ca_text = source.get("ca_file", "").strip()
         ca_file = _safe_file(Path(ca_text), require_private=False) if ca_text else None
         known_text = source.get("known_hosts_file", "").strip()
         known_hosts = _safe_file(Path(known_text), require_private=False) if known_text else None
+        identity_text = source.get("ssh_identity_file", "").strip()
+        identity_file = _safe_file(Path(identity_text)) if identity_text else None
         host_fingerprints = _fingerprints(source.get("ssh_host_fingerprints", ""))
         jump_fingerprints = _fingerprints(source.get("ssh_jump_fingerprints", ""))
         target_known_text = target.get("known_hosts_file", "").strip()
         target_known_hosts = _safe_file(Path(target_known_text), require_private=False) if target_known_text else None
+        target_identity_text = target.get("ssh_identity_file", "").strip()
+        target_identity_file = _safe_file(Path(target_identity_text)) if target_identity_text else None
         target_host_fingerprints = _fingerprints(target.get("ssh_host_fingerprints", ""))
         target_jump_fingerprints = _fingerprints(target.get("ssh_jump_fingerprints", ""))
         project_dir = Path(guard["compose_project_dir"])
@@ -307,7 +335,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
         if transport == "tls":
             if source.getboolean("verify_identity", fallback=False) is not True:
                 raise SecurityGateError("TLS certificate and hostname verification are mandatory")
-        else:
+        elif transport == "ssh-tunnel":
             if known_hosts is None or not host_fingerprints or not source.get("ssh_host") or not source.get("ssh_user"):
                 raise SecurityGateError("SSH tunnel requires a trusted host key, fingerprint, and target identity")
             if source.get("ssh_host", "").strip() != source.get("host", "lk.j4b.ru").strip():
@@ -330,6 +358,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
             known_hosts_file=known_hosts,
             ssh_host_fingerprints=host_fingerprints,
             ssh_jump_fingerprints=jump_fingerprints,
+            ssh_identity_file=identity_file,
             target_host=target["host"],
             target_port=int(target.get("port", "5432")),
             target_database=target["database"],
@@ -343,6 +372,7 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
             target_known_hosts_file=target_known_hosts,
             target_ssh_host_fingerprints=target_host_fingerprints,
             target_ssh_jump_fingerprints=target_jump_fingerprints,
+            target_ssh_identity_file=target_identity_file,
             compose_project_dir=project_dir,
             compose_file=compose_file,
         )
@@ -368,6 +398,7 @@ def _approved_ssh_args(
     jump_host: Optional[str] = None,
     jump_user: Optional[str] = None,
     jump_fingerprints: Sequence[str] = (),
+    identity_file: Optional[Path] = None,
 ) -> List[str]:
     verify_known_host_fingerprints(host, known_hosts_file, fingerprints, port=port)
     if jump_host:
@@ -378,6 +409,8 @@ def _approved_ssh_args(
         "-o", "ConnectTimeout=8", "-o", "GlobalKnownHostsFile=/dev/null",
         "-o", "UserKnownHostsFile=" + str(known_hosts_file), "-p", str(port),
     ]
+    if identity_file is not None:
+        args.extend(["-i", str(identity_file), "-o", "IdentitiesOnly=yes"])
     if jump_host:
         jump = jump_user + "@" + jump_host if jump_user else jump_host
         args.extend(["-J", jump])
@@ -396,11 +429,12 @@ def run_approved_ssh_command(
     jump_host: Optional[str] = None,
     jump_user: Optional[str] = None,
     jump_fingerprints: Sequence[str] = (),
+    identity_file: Optional[Path] = None,
     timeout: int = 20,
 ) -> str:
     args = _approved_ssh_args(
         host, port, user, known_hosts_file, fingerprints,
-        jump_host, jump_user, jump_fingerprints,
+        jump_host, jump_user, jump_fingerprints, identity_file=identity_file,
     )
     try:
         result = subprocess.run(
@@ -427,12 +461,13 @@ def open_ssh_forward(
     jump_host: Optional[str] = None,
     jump_user: Optional[str] = None,
     jump_fingerprints: Sequence[str] = (),
+    identity_file: Optional[Path] = None,
 ) -> Iterator[Tuple[str, int]]:
     if not fingerprints:
         raise SecurityGateError("independently approved SSH fingerprint is required")
     args = _approved_ssh_args(
         host, port, user, known_hosts_file, fingerprints,
-        jump_host, jump_user, jump_fingerprints,
+        jump_host, jump_user, jump_fingerprints, identity_file=identity_file,
     )
     reservation = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     reservation.bind(("127.0.0.1", 0))
@@ -544,6 +579,7 @@ def open_ssh_tunnel(config: RuntimeConfig) -> Iterator[Tuple[str, int]]:
         config.ssh_host_fingerprints, "127.0.0.1", config.source_port,
         jump_host=config.ssh_jump_host, jump_user=config.ssh_jump_user,
         jump_fingerprints=config.ssh_jump_fingerprints,
+        identity_file=getattr(config, "ssh_identity_file", None),
     ) as endpoint:
         yield endpoint
 
@@ -569,6 +605,26 @@ class NoImplicitSourceSQL:
         return None
 
 
+class LegacyPlainConnection:
+    """Owner-approved legacy plaintext session with a hard auth-plugin gate.
+
+    The dataset travels unencrypted by explicit owner decision; the reusable
+    secret must not. mysql_native_password performs a server-nonce SHA1
+    challenge-response, so the password itself is never transmitted in a
+    reusable clear form. Any other plugin (for example a clear-text password
+    plugin) fails the connection before credentials are accepted.
+    """
+
+    def set_character_set(self, charset: str, collation: Optional[str] = None) -> None:
+        return None
+
+    def _request_authentication(self) -> None:
+        super()._request_authentication()
+        plugin = str(getattr(self, "_auth_plugin_name", "") or "")
+        if plugin != "mysql_native_password":
+            raise SecurityGateError("legacy plaintext session must use challenge-response native authentication")
+
+
 def connect_mariadb(config: RuntimeConfig) -> Any:
     """Open a read-only-capable source session; never fall back to plaintext."""
     import pymysql
@@ -592,6 +648,8 @@ def connect_mariadb(config: RuntimeConfig) -> Any:
         base_cls = pymysql.connections.Connection
         if config.source_transport == "tls":
             connection_cls = type("_StrictTLSConnection", (FailClosedTLSConnection, base_cls), {})
+        elif config.source_transport == "legacy-plain":
+            connection_cls = type("_LegacyPlainConnection", (LegacyPlainConnection, base_cls), {})
         else:
             connection_cls = type("_SSHOnlyConnection", (NoImplicitSourceSQL, base_cls), {})
         conn = connection_cls(
@@ -757,7 +815,10 @@ class MariaDBSource:
                 with self.connection.cursor() as cursor:
                     cursor.execute("EXPLAIN " + query, params)
                     columns = [description[0] for description in cursor.description]
-                    validate_explain_plan(columns, cursor.fetchall())
+                    validate_explain_plan(
+                        columns, cursor.fetchall(),
+                        allow_bounded_full_scan=(entity == "claim"),
+                    )
 
     def preflight(self, project_ids: Sequence[int]) -> Dict[str, int]:
         marks = _in_placeholders(len(project_ids))
@@ -1039,6 +1100,7 @@ class ComposeStorageGuard:
                 jump_host=self.config.target_ssh_jump_host,
                 jump_user=self.config.target_ssh_jump_user,
                 jump_fingerprints=self.config.target_ssh_jump_fingerprints,
+                identity_file=getattr(self.config, "target_ssh_identity_file", None),
                 timeout=self.timeout,
             )
         except SecurityGateError:
@@ -1060,6 +1122,7 @@ def resolve_postgres_container_ip(config: RuntimeConfig) -> str:
         "jump_host": config.target_ssh_jump_host,
         "jump_user": config.target_ssh_jump_user,
         "jump_fingerprints": config.target_ssh_jump_fingerprints,
+        "identity_file": getattr(config, "target_ssh_identity_file", None),
         "timeout": 15,
     }
     network_template = "{{.Internal}}|{{range .IPAM.Config}}{{.Subnet}};{{end}}"
@@ -1117,6 +1180,7 @@ def open_postgres_tunnel(config: RuntimeConfig) -> Iterator[Tuple[str, int]]:
         jump_host=config.target_ssh_jump_host,
         jump_user=config.target_ssh_jump_user,
         jump_fingerprints=config.target_ssh_jump_fingerprints,
+        identity_file=getattr(config, "target_ssh_identity_file", None),
     ) as endpoint:
         yield endpoint
 
@@ -1227,6 +1291,29 @@ def _json_dumps(value: Mapping[str, Any]) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+@contextmanager
+def exclusive_run_lock(channel: str) -> Iterator[None]:
+    """Host-local mutex so scheduled runs never overlap for the same channel."""
+    if not channel or "/" in channel or channel.startswith("."):
+        raise ETLError("invalid ETL channel lock name")
+    lock_dir = Path(tempfile.gettempdir()) / "j4b-etl-locks"
+    lock_dir.mkdir(mode=0o700, exist_ok=True)
+    lock_path = lock_dir / (channel + ".lock")
+    handle = open(lock_path, "a+")
+    try:
+        os.fchmod(handle.fileno(), 0o600)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ETLError("another run of this ETL channel is already active") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
 def connect_postgres(config: RuntimeConfig, endpoint: Tuple[str, int]) -> Any:
     """Connect only through the host-key-verified forward to the private container."""
     password = read_password(config.target_password_file)
@@ -1271,15 +1358,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--config", required=True, type=Path, help="external owner-only INI; never store in Git")
     parser.add_argument("--project-id", action="append", required=True, type=int, help="explicit selected project ID; repeatable")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--allow-legacy-plain", action="store_true", help="second opt-in for the owner-approved legacy plaintext transport")
     parser.add_argument("--run-live", action="store_true", help="explicitly allow source read and Analytics writes")
     args = parser.parse_args(argv)
     try:
         project_ids = validate_project_ids(args.project_id)
         config = load_runtime_config(args.config)
+        if config.source_transport == "legacy-plain" and not args.allow_legacy_plain:
+            raise SecurityGateError("legacy plaintext transport requires the explicit --allow-legacy-plain opt-in")
         if not args.run_live:
             print("PREPARATION_ONLY=YES project_id_count=%d live_connections=NO" % len(project_ids))
             return 0
-        summary = run_live(config, project_ids, args.batch_size)
+        with exclusive_run_lock("portal-mariadb-etl"):
+            summary = run_live(config, project_ids, args.batch_size)
         print(
             "ETL_STATUS=%s run_id=%s projects=%d read=%s written=%s skipped=%s qa=%s"
             % (

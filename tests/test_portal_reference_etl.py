@@ -86,7 +86,12 @@ class FakeCursor:
 class FakeConnection:
     """In-memory emulation of the loader-side SQL semantics."""
 
-    def __init__(self, roles=("analytics_reader",), identity=("j4b_analytics", "j4b_analytics_loader")):
+    def __init__(
+        self,
+        roles=("analytics_reader",),
+        identity=("j4b_analytics", "j4b_analytics_loader"),
+        schemas=("ops", "reference"),
+    ):
         self.clients: dict[int, tuple[str | None, str]] = {}
         self.users: dict[int, tuple[str | None, str]] = {}
         self.projects: dict[int, tuple[int | None, int | None, int]] = {}
@@ -95,6 +100,7 @@ class FakeConnection:
         self.runs: dict[str, dict] = {}
         self.roles = set(roles)
         self.identity = identity
+        self.schemas = tuple(sorted(schemas))
         self.executed: list[tuple[str, object]] = []
 
     def cursor(self):
@@ -113,7 +119,7 @@ class FakeConnection:
         if "current_database()" in sql:
             return [self.identity]
         if "information_schema.schemata" in sql:
-            return [("j4b_analytics",)]
+            return [(name,) for name in self.schemas]
         if "FROM pg_roles" in sql:
             return [(1,)] if params[0] in self.roles else []
         if "FROM ops.reference_sync_state" in sql:
@@ -544,3 +550,16 @@ def test_runner_rejects_negative_max_age():
             AllowGuard(),
             max_age_hours=-1.0,
         )
+
+
+def test_verify_target_rejects_missing_reference_schemas():
+    connection = FakeConnection(schemas=("ops",))
+    with pytest.raises(SecurityGateError):
+        ReferenceTarget(connection).verify_target()
+
+
+def test_ensure_tables_requires_preprovisioned_schemas():
+    connection = FakeConnection(schemas=("reference",))
+    with pytest.raises(SecurityGateError):
+        ReferenceTarget(connection).ensure_tables()
+    assert not any(sql.startswith("CREATE TABLE") for sql, _ in connection.executed)
