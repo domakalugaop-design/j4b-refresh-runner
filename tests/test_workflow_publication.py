@@ -474,6 +474,54 @@ def test_workflow_extended_425_row_shape_accepts_only_named_nullable_tail():
     assert rejected["mismatch_by_class"].get("MISSING_TRAILING_VALUE", 0) == 1
 
 
+def test_sheets_readback_8100_by_31_accepts_only_trailing_empty_omissions():
+    """Reproduce Values.get trimming trailing blanks on a large sparse tab."""
+    from src.workflow_publication import NULLABLE_WORKFLOW_COLUMNS
+
+    width = 31
+    header = [f"column_{index}" for index in range(width)]
+    expected = [header]
+    for project_index in range(1, 8100):
+        row = [f"project_{project_index}", "name", "client", "manager"] + [""] * (width - 4)
+        if project_index <= 629:
+            # Dense rows retain internal blanks, numeric fields, and text.
+            row[4:25] = [0] * 21
+            row[8] = ""
+            row[25:29] = [0, 0, 0, 0]
+            row[29] = 1.25
+            row[30] = "tail"
+        elif project_index == 630:
+            # Explicit nulls at the end are also represented as omitted tail.
+            row[29:] = [None, None]
+        expected.append(row)
+
+    # Sheets Values.get preserves interior blanks but omits trailing empty
+    # cells separately for each row.
+    actual = []
+    for row in expected:
+        trimmed = list(row)
+        while trimmed and trimmed[-1] in (None, ""):
+            trimmed.pop()
+        actual.append(trimmed)
+
+    result = diagnose_workflow_readback(
+        expected, actual, nullable_columns=NULLABLE_WORKFLOW_COLUMNS,
+    )
+    assert result["matches"]
+    assert result["expected_rows"] == result["actual_rows"] == 8100
+    assert result["expected_columns"] == result["actual_columns"] == 31
+    assert result["trailing_blank_omissions_accepted"] > 180_000
+
+    # Dropping a populated trailing value remains a hard mismatch.
+    broken = [list(row) for row in actual]
+    broken[1] = broken[1][:-1]
+    rejected = diagnose_workflow_readback(
+        expected, broken, nullable_columns=NULLABLE_WORKFLOW_COLUMNS,
+    )
+    assert not rejected["matches"]
+    assert rejected["mismatch_by_class"].get("MISSING_TRAILING_VALUE", 0) == 1
+
+
 def test_production_workflow_readback_uses_only_declared_nullable_columns():
     from src.production import _validate_workflow_readback
     from src.workflow_publication import THIRD_TAB_COLUMNS

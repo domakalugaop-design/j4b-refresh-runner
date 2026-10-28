@@ -304,12 +304,17 @@ def _nullable_empty_equivalent(
     nullable_indexes: set[int],
     column_index: int,
 ) -> bool:
-    return (
-        column_index in nullable_indexes
-        and expected_present
-        and expected in (None, "")
-        and (not actual_present or actual in (None, ""))
-    )
+    if not expected_present or expected not in (None, ""):
+        return False
+    # Sheets Values.get omits trailing empty cells from each returned row.
+    # That is a transport representation of any expected blank, independent
+    # of schema nullability; it must not make a blank candidate cell look like
+    # a lost value. A missing non-empty cell still fails. When the API does
+    # return an explicit empty/None value, keep the stricter nullable-column
+    # contract for equivalence between those two explicit representations.
+    if not actual_present:
+        return True
+    return column_index in nullable_indexes and actual in (None, "")
 
 
 def _workflow_row_matches_with_trailing_blanks(
