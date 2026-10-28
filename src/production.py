@@ -83,6 +83,7 @@ from .refresh import (
 from .workflow_publication import (
     PRIMARY_ANALYTICS_COLUMNS,
     THIRD_TAB_NAME,
+    NULLABLE_WORKFLOW_COLUMNS,
     backup_snapshot,
     primary_columns,
     third_tab_rows,
@@ -95,6 +96,10 @@ from .workflow_publication import (
 PRODUCTION_TITLE = "J4B Portal — DataLens Materialized Layer"
 PAYMENT_VISIT_TAB = "Выплаты по визитам"
 PAYMENT_PROJECT_TAB = "Выплаты по проектам"
+PRODUCTION_TARGET_TABS = (
+    "projects_current", "project_types", THIRD_TAB_NAME,
+    PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB,
+)
 
 
 def _payment_refresh_enabled() -> bool:
@@ -225,7 +230,7 @@ def _prepare_regular_payment_publication(
 
 def _destination_preflight(token: str, sid: str, expected_title: str = PRODUCTION_TITLE) -> dict[str, Any]:
     meta = api(
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=spreadsheetId,properties.title,sheets.properties(title,sheetId,gridProperties(columnCount,rowCount))",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=spreadsheetId,properties.title,sheets.properties(title,sheetId,index,hidden,gridProperties(columnCount,rowCount,frozenRowCount))",
         token,
     )
     title = meta.get("properties", {}).get("title")
@@ -547,23 +552,67 @@ def _select_reporting_year_scope(catalogue: list[dict[str, Any]], current_rows: 
     return sorted(selected, key=lambda row: int(row["project_id"]))
 
 
-def _capture_workflow_backup(token: str, sid: str, previous_raw: list[list[Any]], previous_state_rows: list[list[Any]], meta: dict[str, Any]) -> dict[str, Any]:
-    """Capture affected tabs before the first Phase-2 mutation."""
-    existing = {s.get("properties", {}).get("title") for s in meta.get("sheets", [])}
-    current = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == "projects_current"), {})
-    third: list[list[Any]] = []
-    if THIRD_TAB_NAME in existing:
-        encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
-        third = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
+def _capture_target_tab_snapshot(
+    token: str,
+    sid: str,
+    meta: dict[str, Any],
+    target_tabs: set[str] | None = None,
+) -> dict[str, Any]:
+    """Capture raw values and layout for target tabs at their actual grid width."""
+    target_tabs = set(target_tabs or PRODUCTION_TARGET_TABS)
+    structures: dict[str, dict[str, Any] | None] = {}
+    values: dict[str, list[list[Any]]] = {}
+    properties = {
+        item.get("properties", {}).get("title"): item.get("properties", {})
+        for item in meta.get("sheets", [])
+        if item.get("properties", {}).get("title") in target_tabs
+    }
+    for title in target_tabs:
+        props = properties.get(title)
+        if props is None:
+            structures[title] = None
+            continue
+        grid = props.get("gridProperties", {})
+        width, height = grid.get("columnCount"), grid.get("rowCount")
+        if not isinstance(width, int) or width < 1 or not isinstance(height, int) or height < 1:
+            raise RuntimeError(f"target tab grid metadata unavailable: {title}")
+        escaped_title = title.replace("'", "''")
+        encoded = urllib.parse.quote(f"'{escaped_title}'!A:{col(width - 1)}", safe="!:'")
+        values[title] = api_get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE",
+            token,
+        ).get("values", [])
+        structures[title] = {
+            "title": title, "index": props.get("index"), "hidden": props.get("hidden", False),
+            "gridProperties": {"rowCount": height, "columnCount": width,
+                               "frozenRowCount": grid.get("frozenRowCount", 0)},
+        }
+    missing = sorted(title for title in target_tabs if structures.get(title) is None)
+    if missing:
+        raise RuntimeError("prepublication target tabs are missing: " + ",".join(missing))
+    return {"values": values, "structures": structures}
+
+
+def _capture_workflow_backup(
+    token: str,
+    sid: str,
+    previous_raw: list[list[Any]],
+    previous_state_rows: list[list[Any]],
+    meta: dict[str, Any],
+    *,
+    target_tabs: set[str] | None = None,
+) -> dict[str, Any]:
+    """Capture affected tabs and full layout before the first mutation."""
+    snapshot = _capture_target_tab_snapshot(token, sid, meta, target_tabs)
+    existing = {title for title, structure in snapshot["structures"].items() if structure is not None}
+    sheets = dict(snapshot["values"])
     return backup_snapshot(
         sid,
-        {"projects_current": previous_raw, "project_types": previous_state_rows, THIRD_TAB_NAME: third},
-        {
-            "existing_tabs": sorted(existing),
-            "projects_current_headers": list(previous_raw[0]) if previous_raw else [],
-            "projects_current_width": len(previous_raw[0]) if previous_raw else 0,
-            "projects_current_grid": current.get("gridProperties", {}),
-        },
+        sheets,
+        {"existing_tabs": sorted(existing),
+         "projects_current_headers": list(previous_raw[0]) if previous_raw else [],
+         "projects_current_width": len(previous_raw[0]) if previous_raw else 0,
+         "target_tab_snapshot": {"structures": snapshot["structures"]}},
     )
 
 
@@ -603,13 +652,19 @@ def _publish_workflow_tab(token: str, sid: str, rows: list[dict[str, Any]], back
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": [{"addSheet": {"properties": {"title": THIRD_TAB_NAME, "gridProperties": {"rowCount": max(1000, len(rendered)), "columnCount": len(rendered[0]), "frozenRowCount": 1}}}}]})
         meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
         tab = next(s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME)
-    old_rows = int(tab.get("gridProperties", {}).get("rowCount", len(rendered)))
+    old_grid = tab.get("gridProperties", {})
+    old_rows = int(old_grid.get("rowCount", len(rendered)))
+    old_width = int(old_grid.get("columnCount", len(rendered[0])))
+    clear_width = max(old_width, len(rendered[0]))
     end_column = col(len(rendered[0]) - 1)
+    clear_end_column = col(clear_width - 1)
+    clear_end_row = max(old_rows, len(rendered), 1)
+    clear_encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A1:{clear_end_column}{clear_end_row}", safe="!:")
     encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A1:{end_column}{max(len(rendered), 1)}", safe="!:")
-    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{clear_encoded}:clear", token, {}, method="POST")
     api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:{end_column}{len(rendered)}", "majorDimension": "ROWS", "values": rendered}]})
     if old_rows > len(rendered):
-        tail = urllib.parse.quote(f"{THIRD_TAB_NAME}!A{len(rendered)+1}:{end_column}{old_rows}", safe="!:")
+        tail = urllib.parse.quote(f"{THIRD_TAB_NAME}!A{len(rendered)+1}:{clear_end_column}{old_rows}", safe="!:")
         api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{tail}:clear", token, {}, method="POST")
     actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
     _validate_workflow_readback(actual, rendered, candidate_manifest=candidate_manifest)
@@ -622,14 +677,18 @@ def _validate_workflow_readback(
     *,
     candidate_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    diagnostic = diagnose_workflow_readback(expected, actual)
+    diagnostic = diagnose_workflow_readback(
+        expected, actual, nullable_columns=NULLABLE_WORKFLOW_COLUMNS,
+    )
     if not diagnostic["matches"]:
         if candidate_manifest:
             diagnostic["candidate_sha256"] = candidate_manifest["candidate_sha256"]
             diagnostic["schema_sha256"] = candidate_manifest["schema_sha256"]
         print("WORKFLOW_READBACK_DIAGNOSTIC=" + json.dumps(diagnostic, ensure_ascii=False, sort_keys=True), flush=True)
         raise ValueError("workflow publication readback mismatch")
-    result = validate_readback(actual, expected)
+    result = validate_readback(
+        actual, expected, nullable_columns=NULLABLE_WORKFLOW_COLUMNS,
+    )
     _stage(f"TRAILING_BLANK_OMISSIONS_ACCEPTED={result['trailing_blank_omissions_accepted']}")
     _stage(f"ROWS_WITH_TRAILING_BLANK_OMISSIONS={result['rows_with_trailing_blank_omissions']}")
     return result
@@ -660,7 +719,16 @@ def _rollback_workflow_tab_body(
     on_readback_start: Any,
 ) -> None:
     sheets = backup["payload"]["sheets"]
-    meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId)", token)
+    target_snapshot = backup.get("payload", {}).get("metadata", {}).get("target_tab_snapshot")
+    if target_snapshot is not None:
+        on_readback_start()
+        _restore_target_tabs_from_snapshot(
+            token, sid,
+            {"values": {THIRD_TAB_NAME: sheets.get(THIRD_TAB_NAME, [])},
+             "structures": {THIRD_TAB_NAME: target_snapshot.get("structures", {}).get(THIRD_TAB_NAME)}},
+        )
+        return
+    meta = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,gridProperties(rowCount,columnCount))", token)
     tab = next((s.get("properties", {}) for s in meta.get("sheets", []) if s.get("properties", {}).get("title") == THIRD_TAB_NAME), None)
     previous = sheets.get(THIRD_TAB_NAME, [])
     if not previous:
@@ -679,13 +747,143 @@ def _rollback_workflow_tab_body(
         if len(row) > width:
             raise RuntimeError("workflow rollback backup row exceeds header width")
         normalized_previous.append(list(row) + [""] * (width - len(row)))
-    encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:Z", safe="!:")
-    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}:clear", token, {}, method="POST")
+    live_grid = (tab or {}).get("gridProperties", {})
+    live_width = int(live_grid.get("columnCount", width))
+    live_rows = int(live_grid.get("rowCount", len(normalized_previous)))
+    clear_end_column = col(max(live_width, width) - 1)
+    clear_end_row = max(live_rows, len(normalized_previous), 1)
+    clear_range = urllib.parse.quote(f"{THIRD_TAB_NAME}!A1:{clear_end_column}{clear_end_row}", safe="!:")
+    api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{clear_range}:clear", token, {}, method="POST")
     end_column = col(width - 1)
     api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {"valueInputOption": "RAW", "data": [{"range": f"{THIRD_TAB_NAME}!A1:{end_column}{len(normalized_previous)}", "majorDimension": "ROWS", "values": normalized_previous}]})
     on_readback_start()
+    encoded = urllib.parse.quote(f"{THIRD_TAB_NAME}!A:{end_column}", safe="!:")
     actual = api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE", token).get("values", [])
     _validate_workflow_readback(actual, normalized_previous)
+
+
+def _sheet_values_equal(expected: list[list[Any]], actual: list[list[Any]], width: int) -> bool:
+    def normalize(matrix: list[list[Any]]) -> list[list[Any]]:
+        rows = [list(row[:width]) + [""] * max(0, width - len(row)) for row in matrix]
+        while rows and all(value in (None, "") for value in rows[-1]):
+            rows.pop()
+        return rows
+    left, right = normalize(expected), normalize(actual)
+    if len(left) != len(right):
+        return False
+    for left_row, right_row in zip(left, right):
+        for left_value, right_value in zip(left_row, right_row):
+            if left_value in (None, "") and right_value in (None, ""):
+                continue
+            if left_value != right_value:
+                return False
+    return True
+
+
+def _restore_target_tabs_from_snapshot(token: str, sid: str, snapshot: dict[str, Any]) -> None:
+    """Restore values, grid dimensions and tab order from a verified pre-write snapshot."""
+    values_by_tab = snapshot.get("values", {})
+    structures = snapshot.get("structures", {})
+    if not isinstance(values_by_tab, dict) or not isinstance(structures, dict) or not structures:
+        raise RuntimeError("rollback target snapshot is incomplete")
+    meta_url = f"https://sheets.googleapis.com/v4/spreadsheets/{sid}?fields=sheets.properties(title,sheetId,index,hidden,gridProperties(rowCount,columnCount,frozenRowCount))"
+
+    def current_properties() -> dict[str, dict[str, Any]]:
+        meta = api(meta_url, token)
+        return {item.get("properties", {}).get("title"): item.get("properties", {})
+                for item in meta.get("sheets", [])}
+
+    current = current_properties()
+    delete_requests = []
+    for title, structure in structures.items():
+        if structure is None and title in current:
+            delete_requests.append({"deleteSheet": {"sheetId": current[title]["sheetId"]}})
+    if delete_requests:
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": delete_requests})
+    current = current_properties()
+    add_requests = []
+    for title, structure in structures.items():
+        if structure is not None and title not in current:
+            grid = structure["gridProperties"]
+            properties = {"title": title, "hidden": structure.get("hidden", False),
+                          "gridProperties": dict(grid)}
+            if isinstance(structure.get("index"), int):
+                properties["index"] = structure["index"]
+            add_requests.append({"addSheet": {"properties": properties}})
+    if add_requests:
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {"requests": add_requests})
+    current = current_properties()
+
+    for title, structure in structures.items():
+        if structure is None:
+            continue
+        if title not in current:
+            raise RuntimeError(f"rollback tab missing after add: {title}")
+        target_grid = structure.get("gridProperties", {})
+        target_rows, target_width = target_grid.get("rowCount"), target_grid.get("columnCount")
+        if not isinstance(target_rows, int) or target_rows < 1 or not isinstance(target_width, int) or target_width < 1:
+            raise RuntimeError(f"rollback grid snapshot invalid: {title}")
+        prior_values = values_by_tab.get(title)
+        if not isinstance(prior_values, list):
+            raise RuntimeError(f"rollback values missing: {title}")
+        if len(prior_values) > target_rows or any(len(row) > target_width for row in prior_values):
+            raise RuntimeError(f"rollback values exceed saved grid: {title}")
+        live = current[title]
+        live_grid = live.get("gridProperties", {})
+        clear_rows = max(int(live_grid.get("rowCount", 0)), len(prior_values), 1)
+        clear_width = max(int(live_grid.get("columnCount", 0)), target_width, 1)
+        escaped = title.replace("'", "''")
+        clear_range = urllib.parse.quote(
+            f"'{escaped}'!A1:{col(clear_width - 1)}{clear_rows}", safe="!:'"
+        )
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{clear_range}:clear", token, {}, method="POST")
+        properties = {
+            "sheetId": live["sheetId"],
+            "index": structure.get("index", live.get("index", 0)),
+            "hidden": structure.get("hidden", False),
+            "gridProperties": {
+                "rowCount": target_rows,
+                "columnCount": target_width,
+                "frozenRowCount": target_grid.get("frozenRowCount", 0),
+            },
+        }
+        api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}:batchUpdate", token, {
+            "requests": [{"updateSheetProperties": {"properties": properties,
+                         "fields": "index,hidden,gridProperties.rowCount,gridProperties.columnCount,gridProperties.frozenRowCount"}}]
+        })
+        if prior_values:
+            padded = [list(row) + [""] * (target_width - len(row)) for row in prior_values]
+            write_range = f"'{escaped}'!A1:{col(target_width - 1)}{len(padded)}"
+            api(f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values:batchUpdate", token, {
+                "valueInputOption": "RAW",
+                "data": [{"range": write_range, "majorDimension": "ROWS", "values": padded}],
+            })
+
+    verified = current_properties()
+    for title, structure in structures.items():
+        if structure is None:
+            if title in verified:
+                raise RuntimeError(f"rollback unexpected tab remains: {title}")
+            continue
+        actual_props = verified.get(title)
+        if actual_props is None:
+            raise RuntimeError(f"rollback tab readback missing: {title}")
+        expected_grid = structure["gridProperties"]
+        actual_grid = actual_props.get("gridProperties", {})
+        for key in ("rowCount", "columnCount", "frozenRowCount"):
+            if actual_grid.get(key, 0) != expected_grid.get(key, 0):
+                raise RuntimeError(f"rollback structure readback mismatch: {title}:{key}")
+        if actual_props.get("index") != structure.get("index") or actual_props.get("hidden", False) != structure.get("hidden", False):
+            raise RuntimeError(f"rollback tab order/visibility readback mismatch: {title}")
+        width = expected_grid["columnCount"]
+        escaped = title.replace("'", "''")
+        encoded = urllib.parse.quote(f"'{escaped}'!A:{col(width - 1)}", safe="!:'")
+        actual_values = api_get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sid}/values/{encoded}?valueRenderOption=UNFORMATTED_VALUE",
+            token,
+        ).get("values", [])
+        if not _sheet_values_equal(values_by_tab[title], actual_values, width):
+            raise RuntimeError(f"rollback values readback mismatch: {title}")
 
 
 def _rollback_full_refresh(
@@ -702,6 +900,19 @@ def _rollback_full_refresh(
     failed_candidate: list[list[Any]] | None = None,
 ) -> None:
     """Best-effort restore every target snapshot; report any unverifiable tab."""
+    target_snapshot = (
+        workflow_backup.get("payload", {}).get("metadata", {}).get("target_tab_snapshot")
+        if workflow_backup else None
+    )
+    if target_snapshot is not None:
+        _stage("FULL_TARGET_ROLLBACK_ATTEMPTED=YES")
+        _restore_target_tabs_from_snapshot(
+            token, sid,
+            {"structures": target_snapshot.get("structures", {}),
+             "values": workflow_backup.get("payload", {}).get("sheets", {})},
+        )
+        _stage("FULL_TARGET_ROLLBACK_READBACK=PASS | tabs=" + str(sum(v is not None for v in target_snapshot["structures"].values())))
+        return
     errors: list[str] = []
     if payment_publication is not None:
         old_payment, _candidate, sheet_ids, _grid_rows = payment_publication[:4]
@@ -1101,7 +1312,8 @@ def _persist_prepublication_backup(
     metadata["non_target_fingerprints"] = non_target_fingerprints
     if payment_publication is not None:
         payment_previous = payment_publication[0]
-        sheets.update(payment_previous)
+        for tab, rows in payment_previous.items():
+            sheets.setdefault(tab, rows)
     payload = {"version": 1, "run_id": run_id, "spreadsheet_id": sid,
                "created_at": now(), "sheets": sheets, "metadata": metadata}
 
@@ -1149,6 +1361,13 @@ def _persist_prepublication_backup(
         required.update({PAYMENT_VISIT_TAB, PAYMENT_PROJECT_TAB})
     if not required.issubset(sheets):
         raise RuntimeError("private prepublication backup is missing a target tab")
+    if workflow_backup is not None:
+        snapshot = metadata.get("target_tab_snapshot")
+        structures = snapshot.get("structures", {}) if isinstance(snapshot, dict) else {}
+        if not required.issubset(structures) or any(structures.get(tab) is None for tab in required):
+            raise RuntimeError("private prepublication backup is missing target tab structure")
+        if not required.issubset(sheets):
+            raise RuntimeError("private prepublication backup is missing full-width target values")
     return {"path": target, "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(),
             "tabs": sorted(required)}
 

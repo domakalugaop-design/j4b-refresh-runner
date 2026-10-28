@@ -31,6 +31,13 @@ THIRD_TAB_COLUMNS += [
     "Всего уникальных визитов", "Состояние не разрешено", "Выполнение плана (успешные визиты)",
     "Разница с графиком, п.п.",
 ]
+# These are the only customer-facing workflow columns whose missing value is
+# part of the published contract. Keep the exception tied to schema names;
+# unrelated or required columns remain strict.
+NULLABLE_WORKFLOW_COLUMNS = {
+    "Выполнение плана (успешные визиты)",
+    "Разница с графиком, п.п.",
+}
 SUCCESS_METRIC_COLUMNS = (
     "successful_visits_current", "historically_approved_visits",
     "total_project_visits", "current_state_unresolved_visits",
@@ -289,26 +296,59 @@ def _workflow_mismatch_class(expected: Any, actual: Any, *, missing_cell: bool =
     return "OTHER"
 
 
-def _workflow_row_matches_with_trailing_blanks(expected: list[Any], actual: list[Any], width: int) -> bool:
-    if expected == actual:
-        return True
+def _nullable_empty_equivalent(
+    expected_present: bool,
+    expected: Any,
+    actual_present: bool,
+    actual: Any,
+    nullable_indexes: set[int],
+    column_index: int,
+) -> bool:
     return (
-        len(actual) < width
-        and len(expected) == width
-        and expected[:len(actual)] == actual
-        and all(value == "" for value in expected[len(actual):])
+        column_index in nullable_indexes
+        and expected_present
+        and expected in (None, "")
+        and (not actual_present or actual in (None, ""))
     )
 
 
-def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]]) -> dict[str, Any]:
-    """Compare fixed-width rows, allowing only omitted expected-empty suffixes.
+def _workflow_row_matches_with_trailing_blanks(
+    expected: list[Any],
+    actual: list[Any],
+    width: int,
+    nullable_indexes: set[int] | None = None,
+) -> bool:
+    nullable_indexes = nullable_indexes or set()
+    if len(expected) != width or len(actual) > width:
+        return False
+    for column_index in range(width):
+        expected_present = column_index < len(expected)
+        actual_present = column_index < len(actual)
+        expected_value = expected[column_index] if expected_present else None
+        actual_value = actual[column_index] if actual_present else None
+        if expected_present == actual_present and expected_value == actual_value:
+            continue
+        if _nullable_empty_equivalent(
+            expected_present, expected_value, actual_present, actual_value,
+            nullable_indexes, column_index,
+        ):
+            continue
+        return False
+    return True
 
-    Google Sheets Values API may trim physically blank cells at the end of a
-    row. This is a directional transport normalization: a shortened actual
-    row is equivalent only when every omitted expected cell is the explicit
-    empty string. It does not equate None with blank, pad interior holes, or
-    forgive row/schema differences. Payment tabs intentionally retain their
-    separate, previously qualified nullable-money contract.
+
+def diagnose_workflow_readback(
+    expected: list[list[Any]],
+    actual: list[list[Any]],
+    *,
+    nullable_columns: Iterable[str] = (),
+) -> dict[str, Any]:
+    """Compare a fixed schema, allowing only schema-declared empty cells.
+
+    Google Sheets may return a blank nullable cell as ``""``, ``None`` or an
+    omitted trailing cell. This equivalence is deliberately limited to named
+    nullable columns. Required cells, values, row counts, key order and headers
+    remain exact.
     """
     expected_rows, actual_rows = len(expected), len(actual)
     expected_columns = len(expected[0]) if expected else 0
@@ -320,6 +360,8 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
     first: dict[str, Any] | None = None
     trailing_blank_omissions_accepted = 0
     rows_with_trailing_blank_omissions: set[int] = set()
+    nullable_empty_equivalences_accepted = 0
+    rows_with_nullable_empty_equivalences: set[int] = set()
     max_rows = max(expected_rows, actual_rows)
     max_columns = max(expected_columns, actual_columns,
                       max((len(row) for row in expected), default=0),
@@ -338,32 +380,31 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
     if expected and actual and actual_header_width != expected_columns:
         by_class["SCHEMA_WIDTH"] = abs(expected_columns - actual_header_width)
 
+    expected_header = expected[0] if expected else []
+    nullable_names = set(nullable_columns)
+    nullable_indexes = {
+        index for index, header in enumerate(expected_header)
+        if header in nullable_names
+    }
+
     for row_index in range(max_rows):
         expected_row = expected[row_index] if row_index < expected_rows else []
         actual_row = actual[row_index] if row_index < actual_rows else []
-        # Accept omissions as one complete row suffix only. Do not normalize
-        # short expected rows, header/schema width, or any suffix containing
-        # a non-empty or None expected value.
-        valid_omitted_suffix = (
-            row_index > 0
-            and row_index < expected_rows
-            and row_index < actual_rows
-            and len(expected_row) == expected_columns
-            and actual_header_width == expected_columns
-            and len(expected_widths) == 1
-            and len(actual_row) < expected_columns
-            and all(value == "" for value in expected_row[len(actual_row):])
-        )
-        if valid_omitted_suffix:
-            omitted = expected_columns - len(actual_row)
-            trailing_blank_omissions_accepted += omitted
-            rows_with_trailing_blank_omissions.add(row_index + 1)
         for column_index in range(max_columns):
             expected_present = column_index < len(expected_row)
             actual_present = column_index < len(actual_row)
             expected_value = expected_row[column_index] if expected_present else None
             actual_value = actual_row[column_index] if actual_present else None
-            if valid_omitted_suffix and column_index >= len(actual_row) and column_index < expected_columns:
+            if _nullable_empty_equivalent(
+                expected_present, expected_value, actual_present, actual_value,
+                nullable_indexes, column_index,
+            ):
+                if not actual_present:
+                    trailing_blank_omissions_accepted += 1
+                    rows_with_trailing_blank_omissions.add(row_index + 1)
+                else:
+                    nullable_empty_equivalences_accepted += 1
+                    rows_with_nullable_empty_equivalences.add(row_index + 1)
                 continue
             if expected_present == actual_present and expected_value == actual_value:
                 continue
@@ -403,7 +444,9 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
 
     shift_count = 0
     for index, expected_row in enumerate(expected):
-        if index < len(actual) and not _workflow_row_matches_with_trailing_blanks(expected_row, actual[index], expected_columns):
+        if index < len(actual) and not _workflow_row_matches_with_trailing_blanks(
+            expected_row, actual[index], expected_columns, nullable_indexes,
+        ):
             if ((index > 0 and expected_row == actual[index - 1]) or
                     (index + 1 < len(actual) and expected_row == actual[index + 1])):
                 shift_count += 1
@@ -424,11 +467,18 @@ def diagnose_workflow_readback(expected: list[list[Any]], actual: list[list[Any]
         "mismatch_by_class": by_class,
         "trailing_blank_omissions_accepted": trailing_blank_omissions_accepted,
         "rows_with_trailing_blank_omissions": len(rows_with_trailing_blank_omissions),
+        "nullable_empty_equivalences_accepted": nullable_empty_equivalences_accepted,
+        "rows_with_nullable_empty_equivalences": len(rows_with_nullable_empty_equivalences),
     }
 
 
-def validate_readback(actual: list[list[Any]], expected: list[list[Any]]) -> dict[str, Any]:
-    diagnostic = diagnose_workflow_readback(expected, actual)
+def validate_readback(
+    actual: list[list[Any]],
+    expected: list[list[Any]],
+    *,
+    nullable_columns: Iterable[str] = (),
+) -> dict[str, Any]:
+    diagnostic = diagnose_workflow_readback(expected, actual, nullable_columns=nullable_columns)
     if not diagnostic["matches"]:
         raise ValueError("publication readback mismatch")
     if not actual or actual[0] != expected[0]:
@@ -442,4 +492,6 @@ def validate_readback(actual: list[list[Any]], expected: list[list[Any]]) -> dic
         "columns": len(expected[0]),
         "trailing_blank_omissions_accepted": diagnostic["trailing_blank_omissions_accepted"],
         "rows_with_trailing_blank_omissions": diagnostic["rows_with_trailing_blank_omissions"],
+        "nullable_empty_equivalences_accepted": diagnostic["nullable_empty_equivalences_accepted"],
+        "rows_with_nullable_empty_equivalences": diagnostic["rows_with_nullable_empty_equivalences"],
     }

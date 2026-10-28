@@ -160,7 +160,25 @@ def test_prepublication_backup_is_private_integrity_checked_and_covers_all_targe
                 "projects_current": [["project_id"], ["8110"]],
                 "project_types": [STATE_COLUMNS, ["8110", "0005", PROJECT_TYPE_DICTIONARY["0005"]]],
             },
-            "metadata": {"projects_current_width": 1},
+            "metadata": {
+                "projects_current_width": 1,
+                "target_tab_snapshot": {
+                    "structures": {
+                        tab: {"title": tab, "index": index, "hidden": False,
+                              "gridProperties": {"rowCount": 10, "columnCount": 2, "frozenRowCount": 1}}
+                        for index, tab in enumerate(production.PRODUCTION_TARGET_TABS)
+                    },
+                    "values": {
+                        **{
+                            "Статусы проектов": [["project_id"], ["8110"]],
+                            "projects_current": [["project_id"], ["8110"]],
+                            "project_types": [STATE_COLUMNS, ["8110", "0005", PROJECT_TYPE_DICTIONARY["0005"]]],
+                        },
+                        production.PAYMENT_VISIT_TAB: [["project_id", "amount"], ["8110", 1.25]],
+                        production.PAYMENT_PROJECT_TAB: [["project_id", "amount"], ["8110", 1.25]],
+                    },
+                },
+            },
         }
     }
     payments = {
@@ -203,17 +221,18 @@ def test_persistent_prepublication_backup_round_trips_and_rejects_temporary_path
 
 
 def test_workflow_rollback_normalizes_short_backup_rows(monkeypatch):
-    backup = {"payload": {"sheets": {production.THIRD_TAB_NAME: [["id", "name"], ["8110"]]}}}
+    nullable = next(iter(production.NULLABLE_WORKFLOW_COLUMNS))
+    backup = {"payload": {"sheets": {production.THIRD_TAB_NAME: [["id", nullable], ["8110"]]}}}
     calls = []
     def fake_api(url, token, body=None, method=None):
         calls.append((url, body, method))
         if "values/" in url and method is None:
-            return {"values": [["id", "name"], ["8110"]]}
+            return {"values": [["id", nullable], ["8110"]]}
         return {}
     monkeypatch.setattr(production, "api", fake_api)
     production._rollback_workflow_tab_body("token", "sheet", backup, on_readback_start=lambda: None)
     writes = [body for _url, body, _method in calls if isinstance(body, dict) and "data" in body]
-    assert writes and writes[-1]["data"][0]["values"] == [["id", "name"], ["8110", ""]]
+    assert writes and writes[-1]["data"][0]["values"] == [["id", nullable], ["8110", ""]]
 
 
 def test_persistent_backup_upload_marker_is_a_hard_gate(tmp_path, monkeypatch):
@@ -516,3 +535,108 @@ def test_project_type_state_rejects_immutable_value_change_in_candidate():
     rows = [{"project_id": "8110", "project_type_code": "0002", "project_type_name": PROJECT_TYPE_DICTIONARY["0002"]}]
     with pytest.raises(RuntimeError, match="immutable Project Type"):
         production._validate_project_type_state_materialization(rows, state, {"8110"})
+
+
+def test_full_target_snapshot_restores_five_tabs_width_order_and_values_beyond_z(monkeypatch):
+    import copy
+    from urllib.parse import unquote
+
+    titles = list(production.PRODUCTION_TARGET_TABS)
+    baseline_values = {}
+    structures = {}
+    live_properties = {}
+    live_values = {}
+    widths = [34, 3, 31, 12, 15]
+    for index, (title, width) in enumerate(zip(titles, widths)):
+        header = [f"{title}-h{column}" for column in range(width)]
+        row = [f"{title}-v{column}" for column in range(width)]
+        baseline_values[title] = [header, row]
+        structures[title] = {
+            "title": title, "index": index, "hidden": False,
+            "gridProperties": {"rowCount": 1000 + index, "columnCount": width, "frozenRowCount": 1},
+        }
+        live_width = width + (1 if title == production.THIRD_TAB_NAME else 0)
+        live_properties[title] = {
+            "title": title, "sheetId": index + 10, "index": index, "hidden": False,
+            "gridProperties": {"rowCount": 1200 + index, "columnCount": live_width, "frozenRowCount": 1},
+        }
+        live_values[title] = copy.deepcopy(baseline_values[title])
+        live_values[title][1][0] = "changed"
+        if live_width > width:
+            live_values[title][0].append("added-column")
+            live_values[title][1].append("stale-tail")
+
+    calls = []
+
+    def fake_api(url, token, body=None, method=None):
+        calls.append((url, body, method))
+        if url.endswith("/values:batchUpdate"):
+            for item in body["data"]:
+                decoded = unquote(item["range"])
+                title = decoded.split("'!", 1)[0].lstrip("'")
+                live_values[title] = copy.deepcopy(item["values"])
+            return {}
+        if url.endswith(":batchUpdate") and isinstance(body, dict):
+            for request in body.get("requests", []):
+                update = request.get("updateSheetProperties")
+                if update:
+                    props = update["properties"]
+                    target = next(item for item in live_properties.values() if item["sheetId"] == props["sheetId"])
+                    target.update({key: value for key, value in props.items() if key != "gridProperties"})
+                    target["gridProperties"].update(props.get("gridProperties", {}))
+            return {}
+        if "/values/" in url and url.endswith(":clear"):
+            decoded = unquote(url.split("/values/", 1)[1][:-len(":clear")])
+            title = decoded.split("'!", 1)[0].lstrip("'")
+            live_values[title] = []
+            return {}
+        if "?fields=sheets.properties" in url:
+            return {"sheets": [{"properties": copy.deepcopy(item)} for item in live_properties.values()]}
+        return {}
+
+    def fake_api_get(url, token):
+        decoded = unquote(url.split("/values/", 1)[1].split("?", 1)[0])
+        title = decoded.split("'!", 1)[0].lstrip("'")
+        return {"values": copy.deepcopy(live_values[title])}
+
+    monkeypatch.setattr(production, "api", fake_api)
+    monkeypatch.setattr(production, "api_get", fake_api_get)
+    production._restore_target_tabs_from_snapshot(
+        "token", "sheet", {"structures": structures, "values": baseline_values}
+    )
+    # Reapplying the same verified snapshot must be harmless and converge identically.
+    production._restore_target_tabs_from_snapshot(
+        "token", "sheet", {"structures": structures, "values": baseline_values}
+    )
+
+    for title in titles:
+        props = live_properties[title]
+        assert props["gridProperties"] == structures[title]["gridProperties"]
+        assert props["index"] == structures[title]["index"]
+        assert live_values[title] == [
+            row + [""] * (widths[titles.index(title)] - len(row))
+            for row in baseline_values[title]
+        ]
+    assert any("AF" in url for url, _body, _method in calls if "/values/" in url)
+    assert not any("A:Z" in url for url, _body, _method in calls)
+
+
+def test_capture_target_snapshot_uses_actual_grid_width_including_columns_after_z(monkeypatch):
+    from urllib.parse import unquote
+
+    meta = {"sheets": [{"properties": {
+        "title": production.THIRD_TAB_NAME, "sheetId": 3, "index": 2, "hidden": False,
+        "gridProperties": {"rowCount": 900, "columnCount": 31, "frozenRowCount": 1},
+    }}]}
+    seen = []
+
+    def fake_api_get(url, _token):
+        seen.append(unquote(url))
+        return {"values": [["header"]]}
+
+    monkeypatch.setattr(production, "api_get", fake_api_get)
+    snapshot = production._capture_target_tab_snapshot(
+        "token", "sheet", meta, {production.THIRD_TAB_NAME}
+    )
+    assert "'Статусы проектов'!A:AE" in seen[0]
+    assert snapshot["structures"][production.THIRD_TAB_NAME]["gridProperties"]["columnCount"] == 31
