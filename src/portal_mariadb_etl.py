@@ -1397,23 +1397,95 @@ def run_live(config: RuntimeConfig, project_ids: Sequence[int], batch_size: int)
                 target_connection.close()
 
 
+def run_cohort_live(config: RuntimeConfig, batch_size: int, *, backfill: bool = False) -> "CohortRunSummary":
+    """Dynamic 12-month cohort run: discover, persist, chunk, run, checkpoint.
+
+    Each chunk is a complete guarded ETL run (own run_id, storage guard before
+    every write batch, idempotent upserts). In backfill mode chunks already
+    recorded as SUCCEEDED for the current cohort hash are skipped, so an
+    interrupted backfill resumes from the last confirmed checkpoint.
+    """
+    import time
+
+    from .portal_cohort import (
+        CohortRunSummary, chunk_project_ids, cohort_hash, cohort_window_start,
+        completed_chunks, discover_cohort, ensure_cohort_tables, record_chunk,
+        upsert_cohort,
+    )
+
+    with open_postgres_tunnel(config) as target_endpoint:
+        source_connection = connect_mariadb(config)
+        target_connection = None
+        try:
+            target_connection = connect_postgres(config, target_endpoint)
+            source = MariaDBSource(source_connection)
+            target = PostgresTarget(target_connection)
+            guard = ComposeStorageGuard(config)
+            window_start = cohort_window_start()
+            now_ts = int(time.time())
+            project_ids, stats = discover_cohort(source, window_start, now_ts)
+            if not project_ids:
+                raise ETLError("dynamic cohort discovery returned no projects")
+            digest = cohort_hash(project_ids, window_start)
+            summary = CohortRunSummary(
+                cohort_size=len(project_ids), window_start=window_start, digest=digest, stats=stats
+            )
+            ensure_cohort_tables(target_connection)
+            target.verify_target()
+            guard.check()
+            upsert_cohort(target_connection, project_ids, window_start)
+            chunks = list(chunk_project_ids(project_ids))
+            summary.chunk_count = len(chunks)
+            done = completed_chunks(target_connection, "sql", digest) if backfill else set()
+            for index, chunk_ids in chunks:
+                if index in done:
+                    summary.chunks_skipped += 1
+                    continue
+                runner = ETLRunner(source, target, guard, batch_size=batch_size)
+                chunk_summary = runner.run(chunk_ids)
+                status = "SUCCEEDED" if chunk_summary.status == "SUCCEEDED" else chunk_summary.status
+                record_chunk(target_connection, "sql", digest, index, chunk_summary.run_id, status)
+                if chunk_summary.status == "SUCCEEDED":
+                    summary.chunks_succeeded += 1
+                else:
+                    summary.chunks_failed += 1
+                    summary.status = chunk_summary.status
+                    break
+            if not summary.chunks_failed and not summary.status.startswith("STOPPED"):
+                summary.status = "SUCCEEDED"
+            return summary
+        finally:
+            close_mariadb(source_connection)
+            if target_connection is not None:
+                target_connection.close()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Bounded, guarded Portal MariaDB ETL")
     parser.add_argument("--config", required=True, type=Path, help="external owner-only INI; never store in Git")
-    parser.add_argument("--project-id", action="append", required=True, type=int, help="explicit selected project ID; repeatable")
+    parser.add_argument("--project-id", action="append", type=int, help="explicit selected project ID; repeatable")
+    parser.add_argument("--cohort-dynamic", action="store_true", help="discover the rolling 12-month cohort from the source instead of an explicit project list")
+    parser.add_argument("--backfill", action="store_true", help="with --cohort-dynamic: resume from confirmed chunk checkpoints")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--allow-legacy-plain", action="store_true", help="second opt-in for the owner-approved legacy plaintext transport")
     parser.add_argument("--run-live", action="store_true", help="explicitly allow source read and Analytics writes")
     args = parser.parse_args(argv)
+    if bool(args.project_id) == args.cohort_dynamic:
+        print("ETL_STATUS=BLOCKED error_class=UsageError", file=sys.stderr)
+        return 2
     try:
-        project_ids = validate_project_ids(args.project_id)
         config = load_runtime_config(args.config)
         if config.source_transport == "legacy-plain" and not args.allow_legacy_plain:
             raise SecurityGateError("legacy plaintext transport requires the explicit --allow-legacy-plain opt-in")
         if not args.run_live:
-            print("PREPARATION_ONLY=YES project_id_count=%d live_connections=NO" % len(project_ids))
+            print("PREPARATION_ONLY=YES live_connections=NO")
             return 0
         with exclusive_run_lock("portal-mariadb-etl"):
+            if args.cohort_dynamic:
+                summary = run_cohort_live(config, args.batch_size, backfill=args.backfill)
+                print(summary.as_line("COHORT_ETL_STATUS"))
+                return 0
+            project_ids = validate_project_ids(args.project_id)
             summary = run_live(config, project_ids, args.batch_size)
         print(
             "ETL_STATUS=%s run_id=%s projects=%d read=%s written=%s skipped=%s qa=%s"

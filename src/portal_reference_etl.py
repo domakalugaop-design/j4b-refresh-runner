@@ -731,22 +731,88 @@ def run_live(
                 connection.close()
 
 
+def run_cohort_live(
+    config: ReferenceConfig,
+    *,
+    max_age_hours: float,
+    reader_role: Optional[str],
+    backfill: bool = False,
+) -> "CohortRunSummary":
+    """Dynamic cohort reference run: project list comes from ops.portal_cohort.
+
+    Chunks respect MAX_PROJECT_IDS; each chunk reuses the TTL logic, so only
+    stale projects are fetched. In backfill mode completed chunks are skipped
+    (resume from the last confirmed checkpoint).
+    """
+    from .portal_cohort import (
+        CohortRunSummary, chunk_project_ids, cohort_hash, completed_chunks,
+        ensure_cohort_tables, load_active_cohort, record_chunk,
+    )
+
+    with exclusive_run_lock("portal-reference-etl"):
+        with open_postgres_tunnel(config) as endpoint:
+            connection = connect_postgres(config, endpoint)
+            try:
+                ensure_cohort_tables(connection)
+                project_ids = load_active_cohort(connection)
+                digest = cohort_hash(project_ids, 0)
+                summary = CohortRunSummary(cohort_size=len(project_ids), digest=digest)
+                runner = ReferenceETLRunner(
+                    PortalReferenceClient(live_portal_session(config)),
+                    ReferenceTarget(connection),
+                    ComposeStorageGuard(config),
+                    max_age_hours=max_age_hours,
+                    reader_role=reader_role,
+                )
+                chunks = list(chunk_project_ids(project_ids))
+                summary.chunk_count = len(chunks)
+                done = completed_chunks(connection, "reference", digest) if backfill else set()
+                for index, chunk_ids in chunks:
+                    if index in done:
+                        summary.chunks_skipped += 1
+                        continue
+                    chunk_summary = runner.run(chunk_ids)
+                    status = "SUCCEEDED" if chunk_summary.status in ("SUCCEEDED", "SUCCEEDED_WITH_ERRORS") else chunk_summary.status
+                    record_chunk(connection, "reference", digest, index, chunk_summary.run_id, status)
+                    if chunk_summary.status in ("SUCCEEDED", "SUCCEEDED_WITH_ERRORS"):
+                        summary.chunks_succeeded += 1
+                    else:
+                        summary.chunks_failed += 1
+                        summary.status = chunk_summary.status
+                        break
+                if not summary.chunks_failed and not summary.status.startswith("STOPPED"):
+                    summary.status = "SUCCEEDED"
+                return summary
+            finally:
+                connection.close()
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Bounded, guarded Portal reference ETL")
     parser.add_argument("--config", required=True, type=Path, help="external owner-only INI; never store in Git")
-    parser.add_argument("--project-id", action="append", required=True, type=int, help="explicit selected project ID; repeatable")
+    parser.add_argument("--project-id", action="append", type=int, help="explicit selected project ID; repeatable")
+    parser.add_argument("--cohort-dynamic", action="store_true", help="load the project list from ops.portal_cohort instead of an explicit list")
+    parser.add_argument("--backfill", action="store_true", help="with --cohort-dynamic: resume from confirmed chunk checkpoints")
     parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     parser.add_argument("--reader-role", type=str, default=None, help="analytics reader role to explicitly restrict")
     parser.add_argument("--run-live", action="store_true", help="explicitly allow portal reads and Analytics writes")
     args = parser.parse_args(argv)
+    if bool(args.project_id) == args.cohort_dynamic:
+        print("REFERENCE_ETL_STATUS=BLOCKED error_class=UsageError", file=sys.stderr)
+        return 2
     try:
-        project_ids = validate_project_ids(args.project_id)
         config = load_reference_config(args.config)
         if not args.run_live:
-            print(
-                "PREPARATION_ONLY=YES project_id_count=%d live_connections=NO" % len(project_ids)
-            )
+            print("PREPARATION_ONLY=YES live_connections=NO")
             return 0
+        if args.cohort_dynamic:
+            summary = run_cohort_live(
+                config, max_age_hours=args.max_age_hours, reader_role=args.reader_role,
+                backfill=args.backfill,
+            )
+            print(summary.as_line("REFERENCE_COHORT_STATUS"))
+            return 0
+        project_ids = validate_project_ids(args.project_id)
         summary = run_live(
             config, project_ids, max_age_hours=args.max_age_hours, reader_role=args.reader_role
         )

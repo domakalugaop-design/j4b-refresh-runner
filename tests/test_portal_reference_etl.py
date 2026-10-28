@@ -613,3 +613,14 @@ def test_portal_files_must_come_together(tmp_path):
     config_path.chmod(0o600)
     with pytest.raises(SecurityGateError):
         load_reference_config(config_path)
+
+
+def test_reference_cli_rejects_project_list_and_cohort_together_or_neither(tmp_path, capsys):
+    from src.portal_reference_etl import main
+    config_path = _server_reference_config(tmp_path)
+    assert main(["--config", str(config_path), "--project-id", "8181", "--cohort-dynamic"]) == 2
+    assert "error_class=UsageError" in capsys.readouterr().err
+    assert main(["--config", str(config_path)]) == 2
+    assert "error_class=UsageError" in capsys.readouterr().err
+    assert main(["--config", str(config_path), "--cohort-dynamic"]) == 0
+    assert "PREPARATION_ONLY=YES" in capsys.readouterr().out

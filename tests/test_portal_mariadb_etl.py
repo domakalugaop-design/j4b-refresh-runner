@@ -517,6 +517,17 @@ def test_legacy_plain_cli_gate_blocks_without_second_opt_in(tmp_path, capsys):
     assert "PREPARATION_ONLY=YES" in capsys.readouterr().out
 
 
+def test_cli_rejects_project_list_and_cohort_together_or_neither(tmp_path, capsys):
+    from src.portal_mariadb_etl import main
+    config_path = _legacy_config(tmp_path, opt_in=True)
+    assert main(["--config", str(config_path), "--project-id", "8181", "--cohort-dynamic"]) == 2
+    assert "error_class=UsageError" in capsys.readouterr().err
+    assert main(["--config", str(config_path)]) == 2
+    assert "error_class=UsageError" in capsys.readouterr().err
+    assert main(["--config", str(_server_config(tmp_path)), "--cohort-dynamic", "--allow-legacy-plain"]) == 0
+    assert "PREPARATION_ONLY=YES" in capsys.readouterr().out
+
+
 def test_legacy_plain_connection_rejects_non_challenge_response_auth():
     from src.portal_mariadb_etl import LegacyPlainConnection
 
