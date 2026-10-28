@@ -270,6 +270,8 @@ class RuntimeConfig:
     target_ssh_host_fingerprints: Tuple[str, ...] = ()
     target_ssh_jump_fingerprints: Tuple[str, ...] = ()
     target_ssh_identity_file: Optional[Path] = None
+    target_transport: str = "ssh-tunnel"
+    guard_transport: str = "ssh"
     compose_project_dir: Path = Path("/home/service/app/j4b-analytics")
     compose_file: Path = Path("/home/service/app/j4b-analytics/j4b-analytics-compose.yaml")
 
@@ -326,12 +328,17 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
             raise SecurityGateError("target must be the dedicated Analytics loader identity")
         if target["host"] != "postgres" or int(target.get("port", "5432")) != 5432:
             raise SecurityGateError("target must use the private PostgreSQL Compose service endpoint")
-        if target.get("transport", "") != "ssh-tunnel":
-            raise SecurityGateError("PostgreSQL must be reached through the approved private SSH tunnel")
-        if target_known_hosts is None or not target_host_fingerprints or not target.get("ssh_host") or not target.get("ssh_user"):
-            raise SecurityGateError("target tunnel requires a trusted host key and independently approved fingerprint")
-        if target.get("ssh_jump_host", "").strip() and not target_jump_fingerprints:
-            raise SecurityGateError("target jump-host fingerprints must be independently approved")
+        target_transport = target.get("transport", "ssh-tunnel").strip().lower()
+        if target_transport not in {"ssh-tunnel", "direct"}:
+            raise SecurityGateError("target transport must be the approved SSH tunnel or direct private-network access")
+        guard_transport = guard.get("transport", "ssh").strip().lower()
+        if guard_transport not in {"ssh", "local"}:
+            raise SecurityGateError("guard transport must be ssh or local")
+        if target_transport == "ssh-tunnel":
+            if target_known_hosts is None or not target_host_fingerprints or not target.get("ssh_host") or not target.get("ssh_user"):
+                raise SecurityGateError("target tunnel requires a trusted host key and independently approved fingerprint")
+            if target.get("ssh_jump_host", "").strip() and not target_jump_fingerprints:
+                raise SecurityGateError("target jump-host fingerprints must be independently approved")
         if transport == "tls":
             if source.getboolean("verify_identity", fallback=False) is not True:
                 raise SecurityGateError("TLS certificate and hostname verification are mandatory")
@@ -364,15 +371,17 @@ def load_runtime_config(path: Path) -> RuntimeConfig:
             target_database=target["database"],
             target_user=target["user"],
             target_password_file=target_password,
-            target_ssh_host=target["ssh_host"].strip(),
+            target_ssh_host=target.get("ssh_host", "").strip(),
             target_ssh_port=int(target.get("ssh_port", "22")),
-            target_ssh_user=target["ssh_user"].strip(),
+            target_ssh_user=target.get("ssh_user", "").strip(),
             target_ssh_jump_host=target.get("ssh_jump_host", "").strip() or None,
             target_ssh_jump_user=target.get("ssh_jump_user", "").strip() or None,
             target_known_hosts_file=target_known_hosts,
             target_ssh_host_fingerprints=target_host_fingerprints,
             target_ssh_jump_fingerprints=target_jump_fingerprints,
             target_ssh_identity_file=target_identity_file,
+            target_transport=target_transport,
+            guard_transport=guard_transport,
             compose_project_dir=project_dir,
             compose_file=compose_file,
         )
@@ -1087,6 +1096,22 @@ class ComposeStorageGuard:
         self.timeout = timeout
 
     def check(self) -> bool:
+        if getattr(self.config, "guard_transport", "ssh") == "local":
+            try:
+                result = subprocess.run(
+                    [
+                        "docker", "compose", "-f", str(self.config.compose_file),
+                        "--profile", "operations", "run", "--rm", "storage-guard",
+                    ],
+                    capture_output=True, text=True, timeout=self.timeout, check=False,
+                    cwd=str(self.config.compose_project_dir),
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            if result.returncode != 0:
+                return False
+            lines = [line.strip() for line in (result.stdout + result.stderr).splitlines()]
+            return any(line.startswith("STORAGE_GUARD=ALLOW ") for line in lines)
         try:
             output = run_approved_ssh_command(
                 self.config.target_ssh_host,
@@ -1111,29 +1136,46 @@ class ComposeStorageGuard:
 
 def resolve_postgres_container_ip(config: RuntimeConfig) -> str:
     """Read-only inspect: require healthy PG on the existing internal network only."""
-    host_args = (
-        config.target_ssh_host,
-        config.target_ssh_port,
-        config.target_ssh_user,
-        config.target_known_hosts_file,
-        config.target_ssh_host_fingerprints,
-    )
-    common = {
-        "jump_host": config.target_ssh_jump_host,
-        "jump_user": config.target_ssh_jump_user,
-        "jump_fingerprints": config.target_ssh_jump_fingerprints,
-        "identity_file": getattr(config, "target_ssh_identity_file", None),
-        "timeout": 15,
-    }
+    if getattr(config, "target_transport", "ssh-tunnel") == "direct":
+
+        def run_inspect(command: str) -> str:
+            try:
+                result = subprocess.run(
+                    shlex.split(command), capture_output=True, text=True,
+                    timeout=15, check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                raise SecurityGateError("local docker inspect failed or timed out") from None
+            if result.returncode != 0:
+                raise SecurityGateError("local docker inspect failed; details suppressed")
+            return result.stdout.strip()
+
+    else:
+        host_args = (
+            config.target_ssh_host,
+            config.target_ssh_port,
+            config.target_ssh_user,
+            config.target_known_hosts_file,
+            config.target_ssh_host_fingerprints,
+        )
+        common = {
+            "jump_host": config.target_ssh_jump_host,
+            "jump_user": config.target_ssh_jump_user,
+            "jump_fingerprints": config.target_ssh_jump_fingerprints,
+            "identity_file": getattr(config, "target_ssh_identity_file", None),
+            "timeout": 15,
+        }
+
+        def run_inspect(command: str) -> str:
+            return run_approved_ssh_command(*host_args, command, **common)
+
     network_template = "{{.Internal}}|{{range .IPAM.Config}}{{.Subnet}};{{end}}"
     ip_template = (
         '{{range $name, $network := .NetworkSettings.Networks}}'
         '{{if eq $name "j4b_analytics_internal"}}{{$network.IPAddress}}{{end}}{{end}}'
     )
-    network_info = run_approved_ssh_command(
-        *host_args,
-        "docker network inspect --format " + shlex.quote(network_template) + " j4b_analytics_internal",
-        **common,
+    network_info = run_inspect(
+        "docker network inspect --format " + shlex.quote(network_template) + " j4b_analytics_internal"
     )
     try:
         internal, raw_subnets = network_info.split("|", 1)
@@ -1142,10 +1184,8 @@ def resolve_postgres_container_ip(config: RuntimeConfig) -> str:
         raise SecurityGateError("Analytics internal network metadata is invalid") from None
     if internal.lower() != "true" or not subnets:
         raise SecurityGateError("Analytics PostgreSQL network is not verified internal")
-    ip_text = run_approved_ssh_command(
-        *host_args,
-        "docker inspect --format " + shlex.quote(ip_template) + " j4b-analytics-postgres-1",
-        **common,
+    ip_text = run_inspect(
+        "docker inspect --format " + shlex.quote(ip_template) + " j4b-analytics-postgres-1"
     )
     try:
         container_ip = ipaddress.ip_address(ip_text)
@@ -1153,14 +1193,12 @@ def resolve_postgres_container_ip(config: RuntimeConfig) -> str:
         raise SecurityGateError("Analytics PostgreSQL private address is invalid") from None
     if not any(container_ip in subnet for subnet in subnets):
         raise SecurityGateError("Analytics PostgreSQL address is outside its private network")
-    health = run_approved_ssh_command(
-        *host_args,
-        "docker inspect --format " + shlex.quote("{{.State.Health.Status}}") + " j4b-analytics-postgres-1",
-        **common,
+    health = run_inspect(
+        "docker inspect --format " + shlex.quote("{{.State.Health.Status}}") + " j4b-analytics-postgres-1"
     )
     if health != "healthy":
         raise SecurityGateError("Analytics PostgreSQL is not healthy")
-    ports = run_approved_ssh_command(*host_args, "docker port j4b-analytics-postgres-1", **common)
+    ports = run_inspect("docker port j4b-analytics-postgres-1")
     if ports.strip():
         raise SecurityGateError("Analytics PostgreSQL has an unexpected published port")
     return str(container_ip)
@@ -1168,6 +1206,12 @@ def resolve_postgres_container_ip(config: RuntimeConfig) -> str:
 
 @contextmanager
 def open_postgres_tunnel(config: RuntimeConfig) -> Iterator[Tuple[str, int]]:
+    """Yield the verified private PostgreSQL endpoint (tunnel or direct in-network)."""
+    if getattr(config, "target_transport", "ssh-tunnel") == "direct":
+        # Server mode: the ETL runs on the Analytics host itself and reaches the
+        # container through the same validated internal network checks.
+        yield (resolve_postgres_container_ip(config), config.target_port)
+        return
     container_ip = resolve_postgres_container_ip(config)
     with open_ssh_forward(
         config.target_ssh_host,

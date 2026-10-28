@@ -100,5 +100,9 @@ dashboard is published.
 - A run that fails QA or the storage guard exits non-zero and writes nothing
   beyond its journal.
 - Backups: `j4b-analytics-backup-rotate.sh` / restore test on the VPS.
-- Schedules: OpenWork Desktop Automations (proposals rendered 2026-10-28);
-  they run only while the signed-in desktop runner is connected.
+- Schedules: **server-side systemd timers on the Analytics VPS** (deployed
+  2026-10-28, `deploy/` in this repository): SQL ETL every 6 h
+  (`*-*-* 00,06,12,18:00:00 Europe/Moscow`), Reference ETL daily 05:30 MSK;
+  both `Persistent=true` (catch-up after reboot), enabled, independent of any
+  Mac or OpenWork Desktop. OpenWork Desktop Automations remain unapproved
+  proposals only.

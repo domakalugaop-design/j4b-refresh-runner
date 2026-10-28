@@ -594,3 +594,55 @@ def test_bounded_full_scan_allowed_only_within_explicit_bound():
         )
     with pytest.raises(SourceValidationError):
         validate_explain_plan(columns, [("ALL", -1)], allow_bounded_full_scan=True)
+
+
+def _server_config(tmp_path, *, target_transport="direct", guard_transport="local"):
+    source_password = tmp_path / "source.pass"
+    target_password = tmp_path / "target.pass"
+    source_password.write_text("synthetic-only\n", encoding="utf-8")
+    target_password.write_text("synthetic-only\n", encoding="utf-8")
+    source_password.chmod(0o600)
+    target_password.chmod(0o600)
+    config_path = tmp_path / "server.ini"
+    config_path.write_text(
+        "[source]\ntransport=legacy-plain\nlegacy_plain_opt_in=true\nhost=lk.j4b.ru\nport=3306\n"
+        "database=j4b\nuser=watch\npassword_file=%s\n\n"
+        "[target]\ntransport=%s\nhost=postgres\nport=5432\ndatabase=j4b_analytics\n"
+        "user=j4b_analytics_loader\npassword_file=%s\n\n"
+        "[guard]\ntransport=%s\ncompose_project_dir=/home/service/app/j4b-analytics\n"
+        "compose_file=j4b-analytics-compose.yaml\n"
+        % (source_password, target_transport, target_password, guard_transport),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    return config_path
+
+
+def test_direct_target_and_local_guard_accepted_without_ssh_fields(tmp_path):
+    from src.portal_mariadb_etl import load_runtime_config
+    loaded = load_runtime_config(_server_config(tmp_path))
+    assert loaded.target_transport == "direct"
+    assert loaded.guard_transport == "local"
+
+
+def test_direct_target_rejects_unknown_transport(tmp_path):
+    from src.portal_mariadb_etl import load_runtime_config
+    with pytest.raises(SecurityGateError):
+        load_runtime_config(_server_config(tmp_path, target_transport="public-internet"))
+
+
+def test_local_guard_runs_compose_without_ssh(tmp_path):
+    from src.portal_mariadb_etl import ComposeStorageGuard, load_runtime_config
+    loaded = load_runtime_config(_server_config(tmp_path))
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((tuple(args), kwargs.get("cwd")))
+        return SimpleNamespace(returncode=0, stdout="STORAGE_GUARD=ALLOW free=1\n", stderr="")
+
+    with patch("src.portal_mariadb_etl.subprocess.run", side_effect=fake_run):
+        assert ComposeStorageGuard(loaded).check() is True
+    args, cwd = calls[0]
+    assert args[:2] == ("docker", "compose")
+    assert "--profile" in args and "storage-guard" in args
+    assert cwd == str(loaded.compose_project_dir)

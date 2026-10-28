@@ -1,0 +1,9 @@
+[Unit]
+Description=Schedule Portal SQL Operational ETL every 6 hours (Moscow time)
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:00:00 Europe/Moscow
+Persistent=true
+
+[Install]
+WantedBy=timers.target

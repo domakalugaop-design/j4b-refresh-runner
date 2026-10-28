@@ -1,0 +1,11 @@
+[Unit]
+Description=Just for Busy Portal HTTPS Reference ETL (Analytics PostgreSQL)
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/service/app/j4b-analytics/etl
+ExecStart=/home/service/app/j4b-analytics/etl/venv/bin/python -m src.portal_reference_etl --config /home/service/app/j4b-analytics/portal-etl/portal-reference-etl.ini --project-id 8181 --project-id 8187 --project-id 8188 --project-id 8189 --run-live
+TimeoutStartSec=900
+Nice=10

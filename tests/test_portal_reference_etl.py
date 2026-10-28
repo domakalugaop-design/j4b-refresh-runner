@@ -524,7 +524,7 @@ def test_load_reference_config_accepts_approved_shape(tmp_path):
         {"database": "postgres"},
         {"user": "postgres"},
         {"host": "localhost"},
-        {"transport": "direct"},
+        {"transport": "public-internet"},
         {"ssh_host_fingerprints": ""},
         {"compose_project_dir": "/home/service/app/other"},
         {"compose_file": "docker-compose.yaml"},
@@ -563,3 +563,53 @@ def test_ensure_tables_requires_preprovisioned_schemas():
     with pytest.raises(SecurityGateError):
         ReferenceTarget(connection).ensure_tables()
     assert not any(sql.startswith("CREATE TABLE") for sql, _ in connection.executed)
+
+
+def _server_reference_config(tmp_path):
+    target_password = tmp_path / "target.pass"
+    portal_login = tmp_path / "portal_login.pass"
+    portal_password = tmp_path / "portal_password.pass"
+    for path in (target_password, portal_login, portal_password):
+        path.write_text("synthetic-only\n", encoding="utf-8")
+        path.chmod(0o600)
+    config_path = tmp_path / "server-reference.ini"
+    config_path.write_text(
+        "[target]\ntransport=direct\nhost=postgres\nport=5432\ndatabase=j4b_analytics\n"
+        "user=j4b_analytics_loader\npassword_file=%s\n\n"
+        "[portal]\nlogin_file=%s\npassword_file=%s\n\n"
+        "[guard]\ntransport=local\ncompose_project_dir=/home/service/app/j4b-analytics\n"
+        "compose_file=j4b-analytics-compose.yaml\n"
+        % (target_password, portal_login, portal_password),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    return config_path
+
+
+def test_server_reference_config_direct_local_and_portal_files(tmp_path):
+    loaded = load_reference_config(_server_reference_config(tmp_path))
+    assert loaded.target_transport == "direct"
+    assert loaded.guard_transport == "local"
+    assert loaded.portal_login_file is not None
+    assert loaded.portal_password_file is not None
+
+
+def test_portal_files_must_come_together(tmp_path):
+    target_password = tmp_path / "target.pass"
+    portal_login = tmp_path / "portal_login.pass"
+    target_password.write_text("synthetic-only\n", encoding="utf-8")
+    portal_login.write_text("synthetic-only\n", encoding="utf-8")
+    target_password.chmod(0o600)
+    portal_login.chmod(0o600)
+    config_path = tmp_path / "half.ini"
+    config_path.write_text(
+        "[target]\ntransport=direct\nhost=postgres\nport=5432\ndatabase=j4b_analytics\n"
+        "user=j4b_analytics_loader\npassword_file=%s\n\n"
+        "[portal]\nlogin_file=%s\n\n"
+        "[guard]\ntransport=local\ncompose_project_dir=/home/service/app/j4b-analytics\n"
+        "compose_file=j4b-analytics-compose.yaml\n" % (target_password, portal_login),
+        encoding="utf-8",
+    )
+    config_path.chmod(0o600)
+    with pytest.raises(SecurityGateError):
+        load_reference_config(config_path)

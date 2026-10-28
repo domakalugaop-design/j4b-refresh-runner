@@ -53,6 +53,7 @@ from src.portal_mariadb_etl import (
     _safe_file,
     connect_postgres,
     exclusive_run_lock,
+    read_password,
     open_postgres_tunnel,
     validate_project_ids,
 )
@@ -226,8 +227,16 @@ def keychain_credential(account: str) -> str:
     return value
 
 
-def live_portal_session() -> PortalSession:
-    if os.environ.get("PORTAL_LOGIN") and os.environ.get("PORTAL_PASSWORD"):
+def live_portal_session(config: Optional[ReferenceConfig] = None) -> PortalSession:
+    if config is not None and config.portal_login_file is not None:
+        # Server mode: credentials come from owner-only 0600 files on the host.
+        session = PortalSession(
+            base_url=os.environ.get("PORTAL_BASE_URL", "https://lk.j4b.ru"),
+            login=read_password(config.portal_login_file),
+            password=read_password(config.portal_password_file),
+            timeout=PER_REQUEST_TIMEOUT,
+        )
+    elif os.environ.get("PORTAL_LOGIN") and os.environ.get("PORTAL_PASSWORD"):
         session = PortalSession(timeout=PER_REQUEST_TIMEOUT)
     else:
         session = PortalSession(
@@ -258,6 +267,10 @@ class ReferenceConfig:
     target_ssh_host_fingerprints: tuple[str, ...]
     target_ssh_jump_fingerprints: tuple[str, ...]
     target_ssh_identity_file: Optional[Path] = None
+    target_transport: str = "ssh-tunnel"
+    guard_transport: str = "ssh"
+    portal_login_file: Optional[Path] = None
+    portal_password_file: Optional[Path] = None
     compose_project_dir: Path = Path("/home/service/app/j4b-analytics")
     compose_file: Path = Path("/home/service/app/j4b-analytics/j4b-analytics-compose.yaml")
 
@@ -273,7 +286,8 @@ def load_reference_config(path: Path) -> ReferenceConfig:
         guard = parser["guard"]
         password_file = _safe_file(Path(target["password_file"]))
         _outside_repository(password_file)
-        known_hosts = _safe_file(Path(target["known_hosts_file"]), require_private=False)
+        known_text = target.get("known_hosts_file", "").strip()
+        known_hosts = _safe_file(Path(known_text), require_private=False) if known_text else None
         identity_text = target.get("ssh_identity_file", "").strip()
         identity_file = _safe_file(Path(identity_text)) if identity_text else None
         host_fingerprints = _fingerprints(target.get("ssh_host_fingerprints", ""))
@@ -288,27 +302,48 @@ def load_reference_config(path: Path) -> ReferenceConfig:
             raise SecurityGateError("target must be the dedicated Analytics loader identity")
         if target["host"] != "postgres" or int(target.get("port", "5432")) != 5432:
             raise SecurityGateError("target must use the private PostgreSQL Compose service endpoint")
-        if target.get("transport", "") != "ssh-tunnel":
-            raise SecurityGateError("PostgreSQL must be reached through the approved private SSH tunnel")
-        if not host_fingerprints or not target.get("ssh_host") or not target.get("ssh_user"):
-            raise SecurityGateError("target tunnel requires a trusted host key and independently approved fingerprint")
-        if target.get("ssh_jump_host", "").strip() and not jump_fingerprints:
-            raise SecurityGateError("target jump-host fingerprints must be independently approved")
+        target_transport = target.get("transport", "ssh-tunnel").strip().lower()
+        if target_transport not in {"ssh-tunnel", "direct"}:
+            raise SecurityGateError("target transport must be the approved SSH tunnel or direct private-network access")
+        guard_transport = guard.get("transport", "ssh").strip().lower()
+        if guard_transport not in {"ssh", "local"}:
+            raise SecurityGateError("guard transport must be ssh or local")
+        if target_transport == "ssh-tunnel":
+            if not host_fingerprints or not target.get("ssh_host") or not target.get("ssh_user"):
+                raise SecurityGateError("target tunnel requires a trusted host key and independently approved fingerprint")
+            if target.get("ssh_jump_host", "").strip() and not jump_fingerprints:
+                raise SecurityGateError("target jump-host fingerprints must be independently approved")
+        portal_login_file: Optional[Path] = None
+        portal_password_file: Optional[Path] = None
+        if parser.has_section("portal"):
+            login_text = parser["portal"].get("login_file", "").strip()
+            password_text = parser["portal"].get("password_file", "").strip()
+            if bool(login_text) != bool(password_text):
+                raise SecurityGateError("portal credential files must be provided together")
+            if login_text:
+                portal_login_file = _safe_file(Path(login_text))
+                portal_password_file = _safe_file(Path(password_text))
+                _outside_repository(portal_login_file)
+                _outside_repository(portal_password_file)
         return ReferenceConfig(
             target_host=target["host"],
             target_port=int(target.get("port", "5432")),
             target_database=target["database"],
             target_user=target["user"],
             target_password_file=password_file,
-            target_ssh_host=target["ssh_host"].strip(),
+            target_ssh_host=target.get("ssh_host", "").strip(),
             target_ssh_port=int(target.get("ssh_port", "22")),
-            target_ssh_user=target["ssh_user"].strip(),
+            target_ssh_user=target.get("ssh_user", "").strip(),
             target_ssh_jump_host=target.get("ssh_jump_host", "").strip() or None,
             target_ssh_jump_user=target.get("ssh_jump_user", "").strip() or None,
             target_known_hosts_file=known_hosts,
             target_ssh_host_fingerprints=host_fingerprints,
             target_ssh_jump_fingerprints=jump_fingerprints,
             target_ssh_identity_file=identity_file,
+            target_transport=target_transport,
+            guard_transport=guard_transport,
+            portal_login_file=portal_login_file,
+            portal_password_file=portal_password_file,
             compose_project_dir=project_dir,
             compose_file=compose_file,
         )
@@ -685,7 +720,7 @@ def run_live(
             connection = connect_postgres(config, endpoint)
             try:
                 runner = ReferenceETLRunner(
-                    PortalReferenceClient(live_portal_session()),
+                    PortalReferenceClient(live_portal_session(config)),
                     ReferenceTarget(connection),
                     ComposeStorageGuard(config),
                     max_age_hours=max_age_hours,

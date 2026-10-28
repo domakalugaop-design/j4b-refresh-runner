@@ -1,0 +1,9 @@
+[Unit]
+Description=Schedule Portal HTTPS Reference ETL daily at 05:30 Moscow time
+
+[Timer]
+OnCalendar=*-*-* 05:30:00 Europe/Moscow
+Persistent=true
+
+[Install]
+WantedBy=timers.target
