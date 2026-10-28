@@ -395,13 +395,6 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
         for linked_action_id, text in links:
             if not text.isdigit():
                 labels_by_action.setdefault(str(linked_action_id), set()).add(" ".join(text.split()).casefold())
-        for linked_action_id, text in links:
-            if (
-                text.isdigit()
-                and int(text) not in WORKFLOW_STATES
-                and (not str(linked_action_id).isdigit() or int(text) != int(linked_action_id))
-            ):
-                raise ValueError(f"unknown workflow state code: {text}")
         # In the red unassigned branch /action/0 is a sentinel link, not a
         # my.state=0 membership (state-0 invitation rows use their my.i ID).
         state_controls = []

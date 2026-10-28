@@ -870,6 +870,63 @@ def _acquire_current_types_with_diagnostics(
         raise
 
 
+def _pre_materialization_exception_diagnostic(
+    exc: Exception,
+    validation_step: str,
+    inputs: dict[str, Any],
+    project_index: int,
+    project_total: int,
+) -> dict[str, Any]:
+    frames = traceback.extract_tb(exc.__traceback__)
+    frame = frames[-1] if frames else None
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    filename = os.path.abspath(frame.filename) if frame else "unknown"
+    try:
+        in_repo = os.path.commonpath((repo_root, filename)) == repo_root
+    except ValueError:
+        in_repo = False
+    return {
+        "stage": "PRE_MATERIALIZATION_VALIDATION",
+        "validation_step": validation_step,
+        "exception_type": type(exc).__name__,
+        "file": os.path.relpath(filename, repo_root) if in_repo else os.path.basename(filename),
+        "line": frame.lineno if frame else None,
+        "function": frame.name if frame else "unknown",
+        "input_classes": {name: type(value).__name__ for name, value in sorted(inputs.items())},
+        "project_index": project_index,
+        "project_total": project_total,
+    }
+
+
+def _emit_pre_materialization_exception(
+    exc: Exception, validation_step: str, inputs: dict[str, Any], project_index: int, project_total: int
+) -> None:
+    diagnostic = _pre_materialization_exception_diagnostic(
+        exc, validation_step, inputs, project_index, project_total
+    )
+    _stage("PRE_MATERIALIZATION_VALIDATION_EXCEPTION " + json.dumps(diagnostic, sort_keys=True))
+
+
+def _acquire_project_with_diagnostics(
+    reader: Reader,
+    spec: dict[str, Any],
+    delay: float,
+    project_index: int,
+    project_total: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    try:
+        return acquire_project(reader, spec, delay)
+    except Exception as exc:
+        _emit_pre_materialization_exception(
+            exc,
+            "OPERATIONAL_PROJECT_ACQUISITION",
+            {"reader": reader, "project_spec": spec, "request_delay": delay},
+            project_index,
+            project_total,
+        )
+        raise
+
+
 def _payment_telemetry(event: str, fields: dict[str, Any]) -> None:
     """Emit allowlisted payment transport diagnostics without payloads."""
     allowed = {
@@ -1757,20 +1814,44 @@ def run() -> dict[str, Any]:
             f"deferred_project_type_failures={len(type_failed_ids & {str(item['project_id']) for item in selected_scope})}"
         )
         # Budget for one full retry sequence plus one failed-project-only recovery pass.
-        reader = Reader(
-            session,
-            max(3 * (MAX_REQUEST_RETRIES + 1) * 2 * len(selected_for_acquisition), 3),
-            expected_projects=len(selected_for_acquisition),
-        )
+        raw_request_delay = os.environ.get("PORTAL_REQUEST_DELAY", "0.15")
+        try:
+            project_request_delay = float(raw_request_delay)
+        except Exception as exc:
+            _emit_pre_materialization_exception(
+                exc,
+                "REQUEST_DELAY_CONFIGURATION",
+                {"request_delay_config": raw_request_delay},
+                0,
+                len(selected_for_acquisition),
+            )
+            raise
+        try:
+            reader = Reader(
+                session,
+                max(3 * (MAX_REQUEST_RETRIES + 1) * 2 * len(selected_for_acquisition), 3),
+                expected_projects=len(selected_for_acquisition),
+            )
+        except Exception as exc:
+            _emit_pre_materialization_exception(
+                exc,
+                "OPERATIONAL_READER_INITIALIZATION",
+                {"session": session, "selected_scope": selected_for_acquisition},
+                0,
+                len(selected_for_acquisition),
+            )
+            raise
         projects: list[dict[str, Any]] = []
         visits: list[dict[str, Any]] = []
         acquisition_started = time.monotonic()
 
         for index, spec in enumerate(selected_for_acquisition, start=1):
-            project, project_visits = acquire_project(
+            project, project_visits = _acquire_project_with_diagnostics(
                 reader,
                 spec,
-                float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")),
+                project_request_delay,
+                index,
+                len(selected_for_acquisition),
             )
             projects.append(project)
             visits.extend(project_visits)

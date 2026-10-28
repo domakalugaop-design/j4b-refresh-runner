@@ -197,10 +197,18 @@ def test_unknown_latest_state_does_not_fall_back_to_an_older_success():
         parse_action_table(html, "42")
 
 
-def test_unknown_numeric_state_different_from_action_id_fails_even_without_a_label():
-    html = action_row("1", [40], action="100") + action_row("1", [362206], action="200")
-    with pytest.raises(ValueError, match="unknown workflow state code: 362206"):
-        parse_action_table(html, "42")
+def test_unrelated_numeric_link_does_not_poison_a_row_with_known_state_code():
+    html = (
+        '<tr class="table-success"><td><a href="/proj/42">P</a>'
+        '<a href="/visit/1">V</a>'
+        '<a href="/action/900">40</a>'
+        '<a href="/action/888">2026</a><a href="/action/888">Дополнительная ссылка</a>'
+        '</td></tr>'
+    )
+    parsed = parse_action_table(html, "42")[0]
+    assert parsed["workflow_state_codes"] == ["40"]
+    assert parsed["current_state_code"] == "40"
+    assert parsed["current_state_resolution"] == "RESOLVED_LATEST_ACTION"
 
 
 def test_unrelated_numeric_control_with_non_state_label_is_ignored():
