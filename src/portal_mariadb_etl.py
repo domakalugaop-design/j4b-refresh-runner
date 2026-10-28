@@ -1397,6 +1397,73 @@ def run_live(config: RuntimeConfig, project_ids: Sequence[int], batch_size: int)
                 target_connection.close()
 
 
+def run_incremental_live(config: RuntimeConfig, batch_size: int) -> "ChangeDetectionResult":
+    """Incremental run: detect changed projects since last checkpoint, run ETL on them.
+
+    - Reads checkpoint from ops.etl_checkpoint
+    - Detects changes via log table + new projects
+    - Runs cohort ETL on changed projects only
+    - Updates checkpoint on success
+    - Falls back to full cohort if detection fails or too many changes
+    """
+    import time
+
+    from .portal_change_detector import (
+        ChangeDetectionResult, detect_changes_incremental, get_checkpoint,
+        update_checkpoint,
+    )
+    from .portal_cohort import cohort_hash, cohort_window_start
+
+    with open_postgres_tunnel(config) as target_endpoint:
+        source_connection = connect_mariadb(config)
+        target_connection = None
+        try:
+            target_connection = connect_postgres(config, target_endpoint)
+            source = MariaDBSource(source_connection)
+            target = PostgresTarget(target_connection)
+            guard = ComposeStorageGuard(config)
+
+            # Get checkpoint
+            last_run_ts, last_full_ts, cohort_hash_val = get_checkpoint(target_connection, "sql")
+            now_ts = int(time.time())
+
+            # Detect changes
+            detection = detect_changes_incremental(source, last_run_ts, now_ts)
+            if not detection.project_ids:
+                # No changes - update checkpoint to now and return success
+                update_checkpoint(target_connection, "sql", now_ts, cohort_hash_val)
+                detection.details["action"] = "skipped_no_changes"
+                return detection
+
+            # Safety: if too many changes, fall back to full cohort
+            MAX_INCREMENTAL_PROJECTS = 1000
+            if len(detection.project_ids) > MAX_INCREMENTAL_PROJECTS:
+                detection.details["action"] = "fallback_full_cohort"
+                # Run full cohort instead
+                return run_cohort_live(config, batch_size, backfill=False)
+
+            # Run ETL on changed projects
+            runner = ETLRunner(source, target, guard, batch_size=batch_size)
+            summary = runner.run(detection.project_ids)
+
+            if summary.status == "SUCCEEDED":
+                update_checkpoint(target_connection, "sql", now_ts, cohort_hash_val)
+                detection.details["action"] = "incremental_run"
+                detection.details["etl_run_id"] = summary.run_id
+                detection.details["etl_written"] = summary.written
+                detection.details["etl_skipped"] = summary.skipped
+            else:
+                detection.details["action"] = "failed"
+                detection.details["etl_status"] = summary.status
+                # Don't update checkpoint on failure
+
+            return detection
+        finally:
+            close_mariadb(source_connection)
+            if target_connection is not None:
+                target_connection.close()
+
+
 def run_cohort_live(config: RuntimeConfig, batch_size: int, *, backfill: bool = False) -> "CohortRunSummary":
     """Dynamic 12-month cohort run: discover, persist, chunk, run, checkpoint.
 
@@ -1465,12 +1532,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--config", required=True, type=Path, help="external owner-only INI; never store in Git")
     parser.add_argument("--project-id", action="append", type=int, help="explicit selected project ID; repeatable")
     parser.add_argument("--cohort-dynamic", action="store_true", help="discover the rolling 12-month cohort from the source instead of an explicit project list")
+    parser.add_argument("--incremental", action="store_true", help="run incremental update: detect changed projects since last checkpoint")
     parser.add_argument("--backfill", action="store_true", help="with --cohort-dynamic: resume from confirmed chunk checkpoints")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--allow-legacy-plain", action="store_true", help="second opt-in for the owner-approved legacy plaintext transport")
     parser.add_argument("--run-live", action="store_true", help="explicitly allow source read and Analytics writes")
     args = parser.parse_args(argv)
-    if bool(args.project_id) == args.cohort_dynamic:
+    modes = sum([bool(args.project_id), args.cohort_dynamic, args.incremental])
+    if modes != 1:
         print("ETL_STATUS=BLOCKED error_class=UsageError", file=sys.stderr)
         return 2
     try:
@@ -1481,6 +1550,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("PREPARATION_ONLY=YES live_connections=NO")
             return 0
         with exclusive_run_lock("portal-mariadb-etl"):
+            if args.incremental:
+                result = run_incremental_live(config, args.batch_size)
+                print(result.as_line("INCREMENTAL_ETL_STATUS"))
+                return 0
             if args.cohort_dynamic:
                 summary = run_cohort_live(config, args.batch_size, backfill=args.backfill)
                 print(summary.as_line("COHORT_ETL_STATUS"))
