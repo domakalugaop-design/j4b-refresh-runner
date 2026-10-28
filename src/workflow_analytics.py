@@ -28,7 +28,7 @@ WORKFLOW_STATES = {
 }
 WORKFLOW_STATE_CODES = tuple(WORKFLOW_STATES)
 WORKFLOW_COUNTER_FIELDS = tuple(f"workflow_state_{code}_visits" for code in WORKFLOW_STATE_CODES)
-SUCCESSFUL_CURRENT_STATE_CODES = frozenset({40, 50})
+SUCCESSFUL_CURRENT_STATE_CODES = frozenset({37, 40, 50})
 
 
 def _unwrap(value: Any) -> Any:
@@ -47,16 +47,15 @@ def _integer(value: Any) -> int | None:
 def resolve_current_visit_states(
     project_id: str,
     visit_rows: Iterable[Mapping[str, Any]],
-) -> tuple[dict[str, int | None], int]:
-    """Resolve one current action state per unique Visit, failing closed on ties.
+) -> tuple[dict[str, frozenset[int] | None], int]:
+    """Resolve current workflow predicate memberships per unique Visit.
 
-    The Portal action collector selects the highest action ID for a Visit. That
-    ordering was qualified against the target's read-only MariaDB action IDs
-    and creation timestamps. Repeated rows are reduced by that same action ID;
-    conflicting latest states or a state with no usable value remain unresolved.
-    An /action/0 free marker is non-success unless a later positive action exists.
+    A Visit may match several workflow predicates on the same action. Keep that
+    set, and use the highest action ID to distinguish current memberships from
+    older ones. A missing status remains unresolved. An explicit free marker is
+    excluded unless a later positive action is explicitly marked assigned.
     """
-    grouped: dict[str, list[tuple[int | None, int | None, bool]]] = defaultdict(list)
+    grouped: dict[str, list[tuple[int | None, frozenset[int], str, str]]] = defaultdict(list)
     target = str(project_id)
     for row in visit_rows:
         row_project = _unwrap(row.get("project_id"))
@@ -67,38 +66,50 @@ def resolve_current_visit_states(
             continue
         visit_id = str(visit_value)
         action_id = _integer(row.get("action_id"))
-        state_value = row.get("current_state_code", row.get("raw_status"))
-        state_code = _integer(state_value)
-        if state_code not in WORKFLOW_STATES:
-            state_code = None
+        state_values = _unwrap(row.get("current_state_codes")) if "current_state_codes" in row else None
+        if state_values is None or state_values == []:
+            state_value = row.get("current_state_code", row.get("raw_status"))
+            state_values = [state_value]
+        elif not isinstance(state_values, (list, tuple, set, frozenset)):
+            state_values = [state_values]
+        state_codes = frozenset(
+            code for code in (_integer(value) for value in state_values)
+            if code in WORKFLOW_STATES
+        )
         assignment = str(_unwrap(row.get("assignment_state")) or "")
         resolution = str(_unwrap(row.get("current_state_resolution")) or "")
-        explicitly_free = resolution == "EXPLICIT_UNASSIGNED" or (
-            assignment == "UNASSIGNED_FREE" and action_id == 0
-        )
-        grouped[visit_id].append((action_id, state_code, explicitly_free))
+        grouped[visit_id].append((action_id, state_codes, assignment, resolution))
 
-    resolved: dict[str, int | None] = {}
+    resolved: dict[str, frozenset[int] | None] = {}
     unresolved = 0
     for visit_id, rows in grouped.items():
-        ranked = [(action_id, state) for action_id, state, _ in rows if action_id is not None and action_id > 0]
+        free_action_ids = [
+            action_id for action_id, _, assignment, resolution in rows
+            if assignment == "UNASSIGNED_FREE" or resolution == "EXPLICIT_UNASSIGNED"
+        ]
+        latest_free_action_id = max((action_id or 0) for action_id in free_action_ids) if free_action_ids else None
+        has_later_explicit_assignment = any(
+            assignment == "ASSIGNED" and action_id is not None
+            and action_id > (latest_free_action_id if latest_free_action_id is not None else 0)
+            for action_id, _, assignment, _ in rows
+        )
+        if free_action_ids and not has_later_explicit_assignment:
+            resolved[visit_id] = frozenset()
+            continue
+
+        ranked = [(action_id, codes) for action_id, codes, _, _ in rows
+                  if action_id is not None and action_id > 0]
         if ranked:
             newest_action_id = max(action_id for action_id, _ in ranked)
-            latest_states = {state for action_id, state in ranked if action_id == newest_action_id}
+            latest_states = frozenset(
+                code for action_id, codes in ranked if action_id == newest_action_id
+                for code in codes
+            )
         else:
-            if any(explicitly_free for _, _, explicitly_free in rows):
-                resolved[visit_id] = None
-                continue
-            # A single legacy row without an action ID may still carry a
-            # qualified Portal status. Conflicting rows without IDs cannot.
-            latest_states = {state for _, state, _ in rows}
-            if len(rows) > 1 and len(latest_states) > 1:
-                latest_states = {None}
+            latest_states = frozenset(code for _, codes, _, _ in rows for code in codes)
 
-        if len(latest_states) == 1:
-            resolved[visit_id] = next(iter(latest_states))
-            if resolved[visit_id] is None:
-                unresolved += 1
+        if latest_states:
+            resolved[visit_id] = latest_states
         else:
             resolved[visit_id] = None
             unresolved += 1
@@ -112,14 +123,15 @@ def successful_visit_metrics(
 ) -> dict[str, int | float | None]:
     """Calculate current successful completion on unique Visit IDs.
 
-    Only current states 40 (approved questionnaire) and 50 (paid) count. State
-    37 is review-only; 45 is payment refusal. A prior membership cannot qualify
-    a Visit after its current action moved to a non-success state. Percentages
-    are stored as ratios (1.0 == 100%) to preserve the Sheets/DataLens numeric
-    contract; values over 1.0 are intentionally allowed.
+    Current predicate memberships 37, 40, and 50 count. State 45 is a payment
+    refusal. A prior membership cannot qualify a Visit after its current action
+    moved to a non-success state. Percentages are stored as ratios (1.0 == 100%)
+    to preserve the Sheets/DataLens numeric contract; values over 1.0 are
+    intentionally allowed.
     """
     current_states, unresolved = resolve_current_visit_states(project_id, visit_rows)
-    successful = sum(state in SUCCESSFUL_CURRENT_STATE_CODES for state in current_states.values())
+    successful = sum(bool(states and states & SUCCESSFUL_CURRENT_STATE_CODES)
+                     for states in current_states.values())
     plan = _unwrap(planned_visit_count)
     execution_pct: float | None = None
     if (unresolved == 0 and isinstance(plan, (int, float)) and not isinstance(plan, bool)

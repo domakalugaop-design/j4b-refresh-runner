@@ -445,11 +445,12 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
             state_code for linked_action_id, state_code in state_controls
             if linked_action_id == current_action_id
         }
-        current_state_code = next(iter(latest_action_states)) if len(latest_action_states) == 1 else None
+        current_state_codes = sorted(latest_action_states)
+        current_state_code = current_state_codes[0] if len(current_state_codes) == 1 else None
         current_state_resolution = (
             "EXPLICIT_UNASSIGNED" if explicitly_unassigned else
             "RESOLVED_LATEST_ACTION" if current_state_code is not None else
-            "AMBIGUOUS_LATEST_ACTION" if latest_action_states else
+            "RESOLVED_LATEST_ACTION_MEMBERSHIPS" if current_state_codes else
             "NO_WORKFLOW_STATE"
         )
         rows.append({
@@ -457,6 +458,10 @@ def parse_action_table(html: str, target_project_id: str) -> list[dict[str, Any]
             "action_id": action_id,
             "current_action_id": current_action_id,
             "current_state_code": str(current_state_code) if current_state_code is not None else "",
+            # Workflow codes are overlapping predicates. Preserve every code
+            # attached to the latest action instead of treating a multi-code
+            # action as an ambiguous single-valued state.
+            "current_state_codes": [str(code) for code in current_state_codes],
             "current_state_resolution": current_state_resolution,
             "participant_assigned": participant_assigned,
             "assignment_state": "UNASSIGNED_FREE" if explicitly_unassigned else None,

@@ -5,11 +5,14 @@ from src.workflow_analytics import successful_visit_metrics
 
 
 def visit(visit_id, action_id, state, project_id="42", **extra):
+    codes = list(state) if isinstance(state, (list, tuple, set)) else ([] if state is None else [state])
+    scalar = codes[0] if len(codes) == 1 else None
     row = {
         "project_id": project_id,
         "visit_id": str(visit_id),
         "action_id": {"value": str(action_id)},
-        "current_state_code": {"value": str(state) if state is not None else None},
+        "current_state_code": {"value": str(scalar) if scalar is not None else None},
+        "current_state_codes": {"value": [str(code) for code in codes]},
     }
     row.update(extra)
     return row
@@ -28,7 +31,7 @@ class PortalSession:
         return next(self.responses)
 
 
-def test_current_40_and_confirmed_paid_50_are_successful_but_37_and_45_are_not():
+def test_current_states_37_40_and_50_are_successful_but_45_is_not():
     result = successful_visit_metrics("42", [
         visit(1, 101, 40),
         visit(2, 102, 50),
@@ -36,8 +39,8 @@ def test_current_40_and_confirmed_paid_50_are_successful_but_37_and_45_are_not()
         visit(4, 104, 45),
     ], 2)
     assert result["total_project_visits"] == 4
-    assert result["successful_visits_current"] == 2
-    assert result["execution_pct_successful"] == 1.0
+    assert result["successful_visits_current"] == 3
+    assert result["execution_pct_successful"] == 1.5
     assert result["current_state_unresolved_visits"] == 0
 
 
@@ -52,16 +55,15 @@ def test_transition_40_to_45_uses_latest_action_not_historical_approval():
     assert result["execution_pct_successful"] == 0.5
 
 
-def test_multiple_rows_for_same_action_are_deduplicated_and_conflicting_latest_state_fails_closed():
+def test_multiple_predicates_for_same_action_are_unioned_without_false_unresolved():
     result = successful_visit_metrics("42", [
         visit(1, 200, 40),
         visit(1, 200, 40),  # duplicate current action row
-        visit(2, 201, 40),
-        visit(2, 201, 45),  # same action ID, conflicting statuses
+        visit(2, 201, [40, 45]),  # same action exposes overlapping predicates
     ], 2)
     assert result["total_project_visits"] == 2
-    assert result["successful_visits_current"] == 1
-    assert result["current_state_unresolved_visits"] == 1
+    assert result["successful_visits_current"] == 2
+    assert result["current_state_unresolved_visits"] == 0
 
 
 def test_unknown_or_missing_current_state_is_not_successful():
@@ -75,6 +77,14 @@ def test_unknown_or_missing_current_state_is_not_successful():
     assert result["execution_pct_successful"] is None
 
 
+def test_empty_membership_list_falls_back_to_legacy_scalar_when_present():
+    row = visit(1, 100, 40)
+    row["current_state_codes"] = {"value": []}
+    result = successful_visit_metrics("42", [row], 1)
+    assert result["successful_visits_current"] == 1
+    assert result["current_state_unresolved_visits"] == 0
+
+
 def test_later_assigned_action_supersedes_an_older_explicit_free_marker():
     result = successful_visit_metrics("42", [
         visit(1, 0, None, assignment_state={"value": "UNASSIGNED_FREE"}),
@@ -82,6 +92,46 @@ def test_later_assigned_action_supersedes_an_older_explicit_free_marker():
     ], 1)
     assert result["total_project_visits"] == 1
     assert result["successful_visits_current"] == 1
+
+
+def test_older_assignment_does_not_supersede_newer_free_marker():
+    result = successful_visit_metrics("42", [
+        visit(1, 100, 40, assignment_state={"value": "ASSIGNED"}),
+        visit(1, 200, [40, 50], assignment_state={"value": "UNASSIGNED_FREE"}),
+    ], 1)
+    assert result["successful_visits_current"] == 0
+
+
+def test_unassigned_free_marker_excludes_success_membership_without_assignment_evidence():
+    result = successful_visit_metrics("sample", [
+        visit("free-a", 50001, [45, 50], project_id="sample", assignment_state={"value": "UNASSIGNED_FREE"}),
+        visit("free-b", 50002, [45, 50], project_id="sample", assignment_state={"value": "UNASSIGNED_FREE"}),
+        visit("assigned", 50003, [40, 45], project_id="sample", assignment_state={"value": "ASSIGNED"}),
+    ], 2)
+    assert result["successful_visits_current"] == 1
+    assert result["current_state_unresolved_visits"] == 0
+
+
+def test_sanitized_166_visit_status_distribution_reconciles_to_plan():
+    rows = [visit(f"resolved-{i}", 1000 + i, [40], project_id="sample") for i in range(106)]
+    # Anonymized aggregate shape of the 58 multi-predicate latest actions:
+    # 56 include 40, 42 include 50, their unique union is 58.
+    rows.extend(visit(f"multi-40-{i}", 2000 + i, [40], project_id="sample") for i in range(16))
+    rows.extend(visit(f"multi-40-50-{i}", 2100 + i, [40, 45, 50] if i < 3 else [40, 50], project_id="sample") for i in range(38))
+    rows.extend([
+        visit("free-success-a", 50004, [40, 45, 50], project_id="sample", assignment_state={"value": "UNASSIGNED_FREE"}),
+        visit("free-success-b", 50005, [40, 45, 50], project_id="sample", assignment_state={"value": "UNASSIGNED_FREE"}),
+    ])
+    rows.extend(visit(f"multi-50-{i}", 2200 + i, [50], project_id="sample") for i in range(2))
+    rows.extend([
+        visit("other-1", 50006, [45], project_id="sample", assignment_state={"value": "UNASSIGNED_FREE"}),
+        visit("other-2", 50007, [45], project_id="sample", assignment_state={"value": "UNASSIGNED_FREE"}),
+    ])
+    result = successful_visit_metrics("sample", rows, 162)
+    assert result["total_project_visits"] == 166
+    assert result["successful_visits_current"] == 162
+    assert result["current_state_unresolved_visits"] == 0
+    assert result["execution_pct_successful"] == 1.0
 
 
 def test_current_explicit_free_visit_is_not_successful():
@@ -121,16 +171,16 @@ def test_materializer_keeps_legacy_membership_union_separate_from_current_succes
         visit(1, 100, 40),
         visit(1, 200, 45),  # current state supersedes historical 40
         visit(2, 201, 40),
-        visit(3, 202, 37),  # checked only is not success
+        visit(3, 202, 37),  # owner-qualified successful state
         visit(4, 203, 50),  # paid is success
     ]
     row = materialize([project], visits, "2026-10-27T00:00:00+00:00")[0]
     assert row["total_project_visits"] == row["project_visit_count"] == 4
-    assert row["successful_visits_current"] == 2
+    assert row["successful_visits_current"] == 3
     assert row["completed"] == 0  # legacy raw-status metric remains independent
     assert row["historically_approved_visits"] == 3  # states 40/50; state 37 excluded
     assert row["finished_visits"] == 4  # legacy union still includes state 37
-    assert row["execution_pct_successful"] == 1.0
+    assert row["execution_pct_successful"] == 1.5
     assert row["execution_pct"] == 0.0
 
 

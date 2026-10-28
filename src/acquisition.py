@@ -253,6 +253,7 @@ def action_index(markup: str, project_id: str) -> dict[str, dict[str, Any]]:
             # approved current-success metric uses current_state_index instead.
             "raw_status": row.get("visit_status") or None,
             "current_state_code": row.get("current_state_code") or None,
+            "current_state_codes": row.get("current_state_codes", []),
             "current_state_resolution": row.get("current_state_resolution", "UNKNOWN"),
             "status_label": row.get("visit_status_label") or None,
             "assignment_state": explicit_assignment,
@@ -279,21 +280,33 @@ def current_state_index(markup: str, project_id: str) -> dict[str, dict[str, Any
             action_order = int(action_id)
         except (TypeError, ValueError):
             action_order = 0
-        state_code = row.get("current_state_code")
+        state_codes = row.get("current_state_codes")
+        if state_codes is None:
+            state_code = row.get("current_state_code")
+            state_codes = [state_code] if state_code not in (None, "") else []
+        normalized_codes = sorted({int(code) for code in state_codes if str(code).isdigit()})
         current = result.get(visit_id)
         if current is None or action_order > int(current.get("action_id") or 0):
+            scalar_code = normalized_codes[0] if len(normalized_codes) == 1 else None
             result[visit_id] = {
                 "action_id": str(action_id),
-                "current_state_code": int(state_code) if state_code not in (None, "") else None,
-                "current_state_resolution": resolution,
+                "current_state_code": scalar_code,
+                "current_state_codes": normalized_codes,
+                "current_state_resolution": (
+                    "RESOLVED_LATEST_ACTION" if scalar_code is not None else
+                    "RESOLVED_LATEST_ACTION_MEMBERSHIPS" if normalized_codes else resolution
+                ),
             }
             continue
         if action_order == int(current.get("action_id") or 0):
-            prior_state = current.get("current_state_code")
-            candidate_state = int(state_code) if state_code not in (None, "") else None
-            if prior_state != candidate_state or resolution == "AMBIGUOUS_LATEST_ACTION":
-                current["current_state_code"] = None
-                current["current_state_resolution"] = "AMBIGUOUS_LATEST_ACTION"
+            merged_codes = sorted(set(current.get("current_state_codes", [])) | set(normalized_codes))
+            scalar_code = merged_codes[0] if len(merged_codes) == 1 else None
+            current["current_state_codes"] = merged_codes
+            current["current_state_code"] = scalar_code
+            current["current_state_resolution"] = (
+                "RESOLVED_LATEST_ACTION" if scalar_code is not None else
+                "RESOLVED_LATEST_ACTION_MEMBERSHIPS" if merged_codes else resolution
+            )
     return result
 
 
@@ -491,6 +504,7 @@ def acquire_project(
         action_row = actions.get(visit_id, {})
         current_row = current_states.get(visit_id, {})
         raw = current_row.get("current_state_code")
+        raw_codes = current_row.get("current_state_codes", [])
         resolution = current_row.get("current_state_resolution")
         visits.append({
             "project_id": project_id,
@@ -499,6 +513,11 @@ def acquire_project(
             "current_state_code": field(
                 raw,
                 "VALUE_PRESENT" if raw is not None else "UNKNOWN",
+                f"/action?project={project_id}",
+            ),
+            "current_state_codes": field(
+                raw_codes,
+                "VALUE_PRESENT" if raw_codes else "UNKNOWN",
                 f"/action?project={project_id}",
             ),
             "current_state_resolution": field(

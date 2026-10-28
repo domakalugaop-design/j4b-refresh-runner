@@ -53,8 +53,9 @@ def test_parser_and_aggregation_preserve_valid_15_20_overlap():
     html = "<!doctype html><html><body>" + action_row("1", [15, 20]) + "</body></html>"
     rows = parse_action_table(html, "42")
     assert rows[0]["workflow_state_codes"] == ["15", "20"]
+    assert rows[0]["current_state_codes"] == ["15", "20"]
     assert rows[0]["current_state_code"] == ""
-    assert rows[0]["current_state_resolution"] == "AMBIGUOUS_LATEST_ACTION"
+    assert rows[0]["current_state_resolution"] == "RESOLVED_LATEST_ACTION_MEMBERSHIPS"
     memberships = [{"project_id": "42", "visit_id": "1", "workflow_state_code": int(code)} for code in rows[0]["workflow_state_codes"]]
     metrics = project_workflow_metrics("42", ["1"], memberships)
     assert metrics["workflow_state_15_visits"] == 1
@@ -90,13 +91,14 @@ def test_state_code_stays_paired_with_its_action_id_inside_one_portal_row():
     ]
 
 
-def test_action_row_with_multiple_codes_on_same_latest_action_fails_closed_for_current_state():
+def test_action_row_with_multiple_codes_on_same_latest_action_preserves_current_memberships():
     html = "<!doctype html><html><body>" + action_row("9", [40, 45], action="200") + "</body></html>"
     indexed = action_index(html, "42")["9"]
     assert indexed["action_id"] == "200"
     assert indexed["current_state_code"] is None
+    assert indexed["current_state_codes"] == ["40", "45"]
     assert indexed["raw_status"] == "45"  # legacy membership remains available but is not current success
-    assert indexed["current_state_resolution"] == "AMBIGUOUS_LATEST_ACTION"
+    assert indexed["current_state_resolution"] == "RESOLVED_LATEST_ACTION_MEMBERSHIPS"
 
 
 def test_current_state_index_uses_later_real_action_after_legacy_free_assignment_marker():
@@ -112,8 +114,22 @@ def test_current_state_index_uses_later_real_action_after_legacy_free_assignment
     assert current == {
         "action_id": "200",
         "current_state_code": 40,
+        "current_state_codes": [40],
         "current_state_resolution": "RESOLVED_LATEST_ACTION",
     }
+
+
+def test_current_state_index_keeps_all_codes_from_the_latest_action():
+    html = (
+        labeled_action_row("9", 40, "Анкета утверждена", action="200")
+        + labeled_action_row("9", 50, "Оплачено", action="200")
+        + labeled_action_row("9", 45, "В оплате отказано", action="100")
+    )
+    current = current_state_index(html, "42")["9"]
+    assert current["action_id"] == "200"
+    assert current["current_state_codes"] == [40, 50]
+    assert current["current_state_code"] is None
+    assert current["current_state_resolution"] == "RESOLVED_LATEST_ACTION_MEMBERSHIPS"
 
 
 def test_memberships_keep_each_action_id_without_changing_visit_state_deduplication():
