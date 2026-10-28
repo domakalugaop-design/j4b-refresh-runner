@@ -1402,9 +1402,9 @@ def run_incremental_live(config: RuntimeConfig, batch_size: int) -> "ChangeDetec
 
     - Reads checkpoint from ops.etl_checkpoint
     - Detects changes via log table + new projects
-    - Runs cohort ETL on changed projects only
+    - Runs ETL on changed projects only
     - Updates checkpoint on success
-    - Falls back to full cohort if detection fails or too many changes
+    - On detection failure or too many changes: returns error status, does NOT run full cohort
     """
     import time
 
@@ -1412,7 +1412,7 @@ def run_incremental_live(config: RuntimeConfig, batch_size: int) -> "ChangeDetec
         ChangeDetectionResult, detect_changes_incremental, get_checkpoint,
         update_checkpoint,
     )
-    from .portal_cohort import cohort_hash, cohort_window_start
+    from .portal_cohort import cohort_hash
 
     with open_postgres_tunnel(config) as target_endpoint:
         source_connection = connect_mariadb(config)
@@ -1427,26 +1427,30 @@ def run_incremental_live(config: RuntimeConfig, batch_size: int) -> "ChangeDetec
             last_run_ts, last_full_ts, cohort_hash_val = get_checkpoint(target_connection, "sql")
             now_ts = int(time.time())
 
-            # Detect changes
+            # Detect changes - use now_ts as window upper bound (fixed before detection)
             detection = detect_changes_incremental(source, last_run_ts, now_ts)
             if not detection.project_ids:
-                # No changes - update checkpoint to now and return success
+                # No changes - update checkpoint to now_ts (the window upper bound we used)
                 update_checkpoint(target_connection, "sql", now_ts, cohort_hash_val)
                 detection.details["action"] = "skipped_no_changes"
                 return detection
 
-            # Safety: if too many changes, fall back to full cohort
+            # Safety: if too many changes, DO NOT fall back to full cohort
+            # Return error status requiring explicit full refresh
             MAX_INCREMENTAL_PROJECTS = 1000
             if len(detection.project_ids) > MAX_INCREMENTAL_PROJECTS:
-                detection.details["action"] = "fallback_full_cohort"
-                # Run full cohort instead
-                return run_cohort_live(config, batch_size, backfill=False)
+                detection.details["action"] = "threshold_exceeded"
+                detection.details["error"] = f"Detected {len(detection.project_ids)} changed projects, exceeds MAX_INCREMENTAL_PROJECTS={MAX_INCREMENTAL_PROJECTS}. Explicit full refresh required."
+                detection.status = "THRESHOLD_EXCEEDED"
+                # Do NOT update checkpoint - next run will re-evaluate
+                return detection
 
             # Run ETL on changed projects
             runner = ETLRunner(source, target, guard, batch_size=batch_size)
             summary = runner.run(detection.project_ids)
 
             if summary.status == "SUCCEEDED":
+                # Update checkpoint to the window upper bound we used for detection
                 update_checkpoint(target_connection, "sql", now_ts, cohort_hash_val)
                 detection.details["action"] = "incremental_run"
                 detection.details["etl_run_id"] = summary.run_id
@@ -1457,6 +1461,20 @@ def run_incremental_live(config: RuntimeConfig, batch_size: int) -> "ChangeDetec
                 detection.details["etl_status"] = summary.status
                 # Don't update checkpoint on failure
 
+            return detection
+        except Exception as exc:
+            # Detection or ETL failed - do not update checkpoint
+            detection = ChangeDetectionResult(
+                project_ids=(),
+                log_events_scanned=0,
+                log_events_matched=0,
+                new_projects=0,
+                changed_projects=0,
+                window_start=0,
+                window_end=now_ts,
+                details={"action": "error", "error": str(exc)},
+            )
+            detection.status = "ERROR"
             return detection
         finally:
             close_mariadb(source_connection)

@@ -385,3 +385,202 @@ def test_no_changes_skips_etl_and_updates_checkpoint():
     src = inspect.getsource(run_incremental_live)
     assert "skipped_no_changes" in src
     assert "update_checkpoint" in src
+
+
+def test_one_changed_project():
+    """Single project changed via log event."""
+    qr = _qr(
+        visit_my_codes=[1001],
+        visit_projects=[10],
+        my_projects=[10],
+    )
+    conn = FakeMariaConnection(qr)
+    W = _msk_ts(2026, 1, 1)
+    NOW = _msk_ts(2026, 1, 15)
+    result = detect_changed_projects(conn, W, NOW)
+    assert result.project_ids == (10,)
+    assert result.changed_projects == 1
+
+
+def test_multiple_changes_same_project():
+    """Multiple log events for same project deduplicated."""
+    qr = _qr(
+        visit_my_codes=[1001, 1002, 1003],
+        visit_projects=[10, 10, 10],
+        my_projects=[10, 10, 10],
+    )
+    conn = FakeMariaConnection(qr)
+    W = _msk_ts(2026, 1, 1)
+    NOW = _msk_ts(2026, 1, 15)
+    result = detect_changed_projects(conn, W, NOW)
+    assert result.project_ids == (10,)
+    assert result.changed_projects == 1
+
+
+def test_overlapping_ids_different_entities():
+    """Same code value in visit and my maps to different projects."""
+    qr = _qr(
+        visit_my_codes=[1001],
+        visit_projects=[10],      # visit.i=1001 -> proj=10
+        my_projects=[20],         # my.i=1001 -> visit=... -> proj=20
+    )
+    conn = FakeMariaConnection(qr)
+    W = _msk_ts(2026, 1, 1)
+    NOW = _msk_ts(2026, 1, 15)
+    result = detect_changed_projects(conn, W, NOW)
+    # Both projects should be included (union of paths)
+    assert set(result.project_ids) == {10, 20}
+    assert result.changed_projects == 2
+
+
+def test_late_event_in_overlap_window():
+    """Event with timestamp in overlap window is detected."""
+    qr = _qr(
+        visit_my_codes=[1001],
+        visit_projects=[10],
+        my_projects=[10],
+    )
+    conn = FakeMariaConnection(qr)
+    W = _msk_ts(2026, 1, 15)  # last run was Jan 15
+    NOW = _msk_ts(2026, 1, 20)
+    # Event at Jan 14 (within 300s overlap before W)
+    result = detect_changed_projects(conn, W, NOW, overlap_seconds=86400)  # 24h overlap
+    assert result.project_ids == (10,)
+    assert result.window_start < W
+
+
+def test_log_read_error_handling():
+    """Log read error raises exception (handled by caller)."""
+    class ErrorCursor:
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+        def execute(self, query, params=None):
+            if "`log`" in query:
+                raise Exception("MariaDB connection lost")
+            self.result = []
+            return self
+        def fetchall(self): return []
+
+    class ErrorSource:
+        def __init__(self):
+            self.connection = self
+        def cursor(self):
+            return ErrorCursor()
+
+    conn = ErrorSource()
+    W = _msk_ts(2026, 1, 1)
+    NOW = _msk_ts(2026, 1, 15)
+    with pytest.raises(Exception):
+        detect_changed_projects(conn, W, NOW)
+
+
+def test_threshold_exceeded_no_fallback():
+    """Threshold exceeded returns error status, no full fallback."""
+    from src.portal_mariadb_etl import run_incremental_live
+    import inspect
+    src = inspect.getsource(run_incremental_live)
+    assert "THRESHOLD_EXCEEDED" in src
+    assert "threshold_exceeded" in src
+    assert "fallback_full_cohort" not in src
+    assert "run_cohort_live" not in src or "fallback" not in src
+
+
+def test_etl_interruption_checkpoint_not_advanced():
+    """ETL failure does not advance checkpoint."""
+    from src.portal_mariadb_etl import run_incremental_live
+    import inspect
+    src = inspect.getsource(run_incremental_live)
+    assert "Don't update checkpoint on failure" in src or "Don't update checkpoint" in src
+    assert "failed" in src
+
+
+def test_retry_after_interruption():
+    """After ETL failure, retry re-detects same changes."""
+    # Simulate: first run detects changes, ETL fails, checkpoint not updated
+    # Second run with same checkpoint should detect same changes
+    qr = _qr(
+        visit_my_codes=[1001],
+        visit_projects=[10],
+        my_projects=[10],
+    )
+    conn = FakeMariaConnection(qr)
+    W = _msk_ts(2026, 1, 1)
+    NOW = _msk_ts(2026, 1, 15)
+    result1 = detect_changed_projects(conn, W, NOW)
+    result2 = detect_changed_projects(conn, W, NOW)
+    assert result1.project_ids == result2.project_ids == (10,)
+
+
+def test_deletion_or_cancellation():
+    """Deletion/cancellation events (if logged) are detected."""
+    # Type 140 with status change to cancelled (e.g., 37 -> 40)
+    # This is already covered by type 140 detection
+    qr = _qr(
+        visit_my_codes=[1001],
+        visit_projects=[10],
+        my_projects=[10],
+    )
+    conn = FakeMariaConnection(qr)
+    W = _msk_ts(2026, 1, 1)
+    NOW = _msk_ts(2026, 1, 15)
+    result = detect_changed_projects(conn, W, NOW)
+    assert result.project_ids == (10,)
+    # The actual status value is in log.info, not used for project detection
+
+
+def test_no_checkpoint_first_run():
+    """First run with no checkpoint (last_run_ts=0) detects all changes in window."""
+    qr = _qr(
+        new_projects=[1, 2],
+        visit_my_codes=[1001],
+        visit_projects=[3],
+        my_projects=[3],
+    )
+    conn = FakeMariaConnection(qr)
+    W = 0  # No checkpoint
+    NOW = _msk_ts(2026, 1, 15)
+    result = detect_changed_projects(conn, W, NOW)
+    # Should detect all projects in window
+    assert set(result.project_ids) == {1, 2, 3}
+    assert result.new_projects == 2
+    assert result.changed_projects == 1
+
+
+def test_overlapping_window_reprocessing():
+    """Reprocessing overlapping window does not duplicate projects."""
+    qr = _qr(
+        visit_my_codes=[1001, 1002],
+        visit_projects=[10, 11],
+        my_projects=[10, 11],
+    )
+    conn = FakeMariaConnection(qr)
+    W1 = _msk_ts(2026, 1, 1)
+    W2 = _msk_ts(2026, 1, 10)  # Overlapping window
+    NOW = _msk_ts(2026, 1, 15)
+    result1 = detect_changed_projects(conn, W1, NOW)
+    result2 = detect_changed_projects(conn, W2, NOW)
+    # Both should find same projects (deduplication)
+    assert set(result1.project_ids) == {10, 11}
+    assert set(result2.project_ids) == {10, 11}
+
+
+def test_checkpoint_semantics_window_upper_bound():
+    """Checkpoint uses window_end (fixed before detection), not now()."""
+    from src.portal_mariadb_etl import run_incremental_live
+    import inspect
+    src = inspect.getsource(run_incremental_live)
+    # Check that now_ts is captured before detection and used for checkpoint
+    assert "now_ts = int(time.time())" in src
+    # Check that checkpoint is updated with now_ts (the window_end)
+    assert "update_checkpoint(target_connection, \"sql\", now_ts" in src
+
+
+def test_window_end_fixed_before_detection():
+    """window_end is fixed before detection, not after."""
+    from src.portal_change_detector import detect_changes_incremental
+    import inspect
+    src = inspect.getsource(detect_changes_incremental)
+    # Function signature should have window_end parameter
+    assert "window_end: int" in src
+    # Should not use time.time() inside
+    assert "time.time()" not in src

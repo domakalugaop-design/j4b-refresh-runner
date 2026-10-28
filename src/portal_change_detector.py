@@ -236,9 +236,122 @@ def detect_changed_projects(
 def detect_changes_incremental(
     source: Any,
     last_run_ts: int,
-    now_ts: int,
+    window_end: int,
     *,
     overlap_seconds: int = 300,
 ) -> ChangeDetectionResult:
-    """High-level incremental detection using last successful run timestamp."""
-    return detect_changed_projects(source, last_run_ts, now_ts, overlap_seconds=overlap_seconds)
+    """High-level incremental detection using last successful run timestamp.
+
+    Args:
+        source: MariaDBSource with connection
+        last_run_ts: Last successful run timestamp (checkpoint)
+        window_end: Fixed upper bound of detection window (set before detection)
+        overlap_seconds: Safe overlap extending window backwards
+    """
+    return detect_changed_projects(source, last_run_ts, window_end, overlap_seconds=overlap_seconds)
+
+
+def analyze_log_code_ambiguity(source: Any) -> Dict[str, Any]:
+    """Analyze log.code ambiguity across entity tables.
+
+    Returns a report with:
+    - total events per log.typ
+    - how many codes map to visit only, my only, both, or neither
+    - ambiguous events count (codes found in both visit and my)
+    """
+    connection = source.connection
+    report = {
+        "total_events": 0,
+        "by_type": {},
+        "ambiguous_events": 0,
+        "unmapped_events": 0,
+    }
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT `typ`, COUNT(*) FROM `log` GROUP BY `typ` ORDER BY `typ`")
+        all_types = cursor.fetchall()
+
+    for typ, count in all_types:
+        report["total_events"] += count
+        type_report = {
+            "count": count,
+            "visit_only": 0,
+            "my_only": 0,
+            "both": 0,
+            "neither": 0,
+        }
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT DISTINCT `code` FROM `log` WHERE `typ`=%s LIMIT 5000",
+                (typ,),
+            )
+            codes = [row[0] for row in cursor.fetchall()]
+
+        if not codes:
+            report["by_type"][typ] = type_report
+            continue
+
+        placeholders = ",".join(["%s"] * len(codes))
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT i FROM `visit` WHERE i IN ({placeholders})",
+                tuple(codes),
+            )
+            visit_codes = {row[0] for row in cursor.fetchall()}
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT i FROM `my` WHERE i IN ({placeholders})",
+                tuple(codes),
+            )
+            my_codes = {row[0] for row in cursor.fetchall()}
+
+        for code in codes:
+            in_visit = code in visit_codes
+            in_my = code in my_codes
+            if in_visit and in_my:
+                type_report["both"] += 1
+                report["ambiguous_events"] += 1
+            elif in_visit:
+                type_report["visit_only"] += 1
+            elif in_my:
+                type_report["my_only"] += 1
+            else:
+                type_report["neither"] += 1
+                report["unmapped_events"] += 1
+
+        report["by_type"][typ] = type_report
+
+    return report
+
+
+def get_unmapped_change_events(source: Any) -> Dict[str, Any]:
+    """Identify log types that may represent changes but are not in CHANGE_LOG_TYPES.
+
+    Returns a report of potentially relevant unmapped types with event counts.
+    """
+    connection = source.connection
+    report = {
+        "mapped_types": sorted(CHANGE_LOG_TYPES),
+        "unmapped_types": {},
+        "total_unmapped_events": 0,
+    }
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT `typ`, COUNT(*) FROM `log` GROUP BY `typ` ORDER BY `typ`")
+        all_types = cursor.fetchall()
+
+    for typ, count in all_types:
+        if typ not in CHANGE_LOG_TYPES:
+            report["unmapped_types"][typ] = {
+                "count": count,
+                "potentially_relevant": typ in {
+                    1, 2, 3, 4, 5, 8, 15, 73, 75, 94, 95, 99, 100, 101, 105,
+                    110, 115, 120, 122, 125, 127, 130, 131, 132, 135, 137, 138,
+                    139, 142, 145, 150, 190, 1001,
+                },
+            }
+            report["total_unmapped_events"] += count
+
+    return report
