@@ -7,6 +7,7 @@ import math
 import os
 import tempfile
 import time
+import traceback
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -819,6 +820,54 @@ def _production_target() -> str:
 
 def _stage(name: str) -> None:
     print(name, flush=True)
+
+
+def _project_type_exception_diagnostic(exc: Exception, inputs: dict[str, Any]) -> dict[str, Any]:
+    """Describe a project-type stage failure without serializing its message or inputs."""
+    frames = traceback.extract_tb(exc.__traceback__)
+    frame = frames[-1] if frames else None
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    filename = os.path.abspath(frame.filename) if frame else "unknown"
+    try:
+        in_repo = os.path.commonpath((repo_root, filename)) == repo_root
+    except ValueError:
+        in_repo = False
+    safe_file = os.path.relpath(filename, repo_root) if in_repo else os.path.basename(filename)
+    return {
+        "stage": "PROJECT_TYPE_ACQUISITION",
+        "exception_type": type(exc).__name__,
+        "file": safe_file,
+        "line": frame.lineno if frame else None,
+        "function": frame.name if frame else "unknown",
+        "input_classes": {name: type(value).__name__ for name, value in sorted(inputs.items())},
+    }
+
+
+def _acquire_current_types_with_diagnostics(
+    session: Any,
+    universe: list[dict[str, Any]],
+    state: dict[str, tuple[str, str]],
+    catalog: dict[str, str],
+    delay_config: str,
+    today: date,
+) -> tuple[dict[str, tuple[str, str]], Any, set[str]]:
+    try:
+        delay = float(delay_config)
+        return acquire_current_types(session, universe, state, catalog, delay, today=today)
+    except Exception as exc:
+        diagnostic = _project_type_exception_diagnostic(
+            exc,
+            {
+                "session": session,
+                "universe": universe,
+                "persisted_state": state,
+                "type_catalog": catalog,
+                "request_delay_config": delay_config,
+                "today": today,
+            },
+        )
+        _stage("PROJECT_TYPE_ACQUISITION_EXCEPTION " + json.dumps(diagnostic, sort_keys=True))
+        raise
 
 
 def _payment_telemetry(event: str, fields: dict[str, Any]) -> None:
@@ -1663,13 +1712,9 @@ def run() -> dict[str, Any]:
                 _stage(f"PROJECT_TYPE_PERSISTED_STATE_AUTHORITATIVE | rows={len(state)}")
             state_before_project_type_refresh = dict(state)
             _stage("PROJECT_TYPE_ACQUISITION_START")
-            state, type_telemetry, applicable_ids = acquire_current_types(
-                session,
-                universe,
-                state,
-                type_catalog,
-                float(os.environ.get("PORTAL_REQUEST_DELAY", "0.15")),
-                today=moscow_today,
+            raw_project_type_delay = os.environ.get("PORTAL_REQUEST_DELAY", "0.15")
+            state, type_telemetry, applicable_ids = _acquire_current_types_with_diagnostics(
+                session, universe, state, type_catalog, raw_project_type_delay, moscow_today
             )
             type_project_failures = [
                 _project_failure_from_type_error(error)
