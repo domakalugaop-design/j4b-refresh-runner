@@ -1375,8 +1375,17 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         merged, stale_ids = reconcile_current_rows(
             merged, authoritative_ids, acquisition_complete=True
         )
+        workflow_validation: dict[str, int] = {}
         if workflow_enabled:
-            validate_materialized_rows(merged)
+            workflow_validation = validate_materialized_rows(
+                merged,
+                required_success_project_ids={str(item["project_id"]) for item in selected},
+            )
+            _stage(
+                "SUCCESS_METRIC_COVERAGE_PASS | "
+                f"materialized={workflow_validation['success_metrics_materialized_rows']} | "
+                f"unmaterialized={workflow_validation['success_metrics_unmaterialized_rows']}"
+            )
         apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
         materialize_project_types(merged, state, project_type_applicable_ids(universe))
         candidate = sheet_rows(merged, columns=columns)
@@ -1384,7 +1393,11 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         if candidate_summary["duplicates"]:
             raise RuntimeError("candidate validation failed: duplicate project IDs")
         _stage(f"MATERIALIZATION_PREFLIGHT_PASS | rows={candidate_summary['rows']} | unique={candidate_summary['unique']} | stale_pruned={len(stale_ids)}")
-        return {"FINAL_STATUS": "MATERIALIZATION_PREFLIGHT_PASS", "CANDIDATE_ROWS": candidate_summary["rows"]}
+        return {
+            "FINAL_STATUS": "MATERIALIZATION_PREFLIGHT_PASS",
+            "CANDIDATE_ROWS": candidate_summary["rows"],
+            "SUCCESS_METRIC_COVERAGE": workflow_validation,
+        }
     meta = _destination_preflight(token, sid)
     physical = next(s.get("properties", {}) for s in meta["sheets"] if s.get("properties", {}).get("title") == "projects_current")
     if physical.get("gridProperties", {}).get("columnCount", 0) < len(source_columns):
@@ -1432,7 +1445,15 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
     merged, stale_ids = reconcile_current_rows(
         merged, authoritative_ids, acquisition_complete=True
     )
-    validate_materialized_rows(merged)
+    workflow_validation = validate_materialized_rows(
+        merged,
+        required_success_project_ids={str(item["project_id"]) for item in selected},
+    )
+    _stage(
+        "SUCCESS_METRIC_COVERAGE_PASS | "
+        f"materialized={workflow_validation['success_metrics_materialized_rows']} | "
+        f"unmaterialized={workflow_validation['success_metrics_unmaterialized_rows']}"
+    )
     apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
     applicable = project_type_applicable_ids(universe)
     materialize_project_types(merged, state, applicable)
@@ -1521,6 +1542,7 @@ def run_from_acquisition_checkpoint() -> dict[str, Any]:
         "PORTAL_HTTP_REQUEST_COUNT": payment_portal_requests,
         "CORE_PROJECTS": len(universe), "CORE_FINAL_ROWS": candidate_summary["rows"],
         "WORKFLOW_PROJECTS_REFRESHED": len(selected), "WORKFLOW_FINAL_ROWS": len(third_tab_rows(merged)) - 1,
+        "SUCCESS_METRIC_COVERAGE": workflow_validation,
         "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
         "PROJECT_ERRORS": error_records,
         "PREPUBLICATION_BACKUP": private_backup,
@@ -1871,8 +1893,17 @@ def run() -> dict[str, Any]:
             merged, authoritative_ids, acquisition_complete=True
         )
         workflow_backup: dict[str, Any] | None = None
+        workflow_validation: dict[str, int] = {}
         if workflow_enabled:
-            validate_materialized_rows(merged)
+            workflow_validation = validate_materialized_rows(
+                merged,
+                required_success_project_ids={str(item["project_id"]) for item in selected},
+            )
+            _stage(
+                "SUCCESS_METRIC_COVERAGE_PASS | "
+                f"materialized={workflow_validation['success_metrics_materialized_rows']} | "
+                f"unmaterialized={workflow_validation['success_metrics_unmaterialized_rows']}"
+            )
         if project_type_enabled:
             apply_canonical_project_names(merged, universe, {str(item["project_id"]) for item in selected})
             applicable_ids = project_type_applicable_ids(universe)
@@ -2040,6 +2071,7 @@ def run() -> dict[str, Any]:
             "CORE_FINAL_ROWS": candidate_summary["rows"],
             "WORKFLOW_PROJECTS_REFRESHED": len(selected) if workflow_enabled else 0,
             "WORKFLOW_FINAL_ROWS": len(third_tab_rows(merged)) - 1 if workflow_enabled else 0,
+            "SUCCESS_METRIC_COVERAGE": workflow_validation if workflow_enabled else None,
             "PAYMENT_SUMMARY": _payment_report(payment_publication, selected),
             "PREPUBLICATION_BACKUP": private_backup if project_type_enabled else None,
             "NON_TARGET_TABS_UNCHANGED": len(non_target_before) if project_type_enabled else None,

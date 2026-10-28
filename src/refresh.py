@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 
-from .acquisition import MAX_REQUEST_RETRIES, Reader, acquire_project, discover_universe
+from .acquisition import COMPLETED_CODES, MAX_REQUEST_RETRIES, Reader, acquire_project, discover_universe
 from .portal_transport import PortalSession
 from .project_types import STATE_COLUMNS, serialize_state, state_rows_equivalent, validate_state_rows
 from .workflow_analytics import project_workflow_metrics, successful_visit_metrics
@@ -278,9 +278,9 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
             "plan": plan,
             "plan_value": plan,
             "plan_status": "PLAN_MISSING_DATA" if plan is None else "VALID_PLAN",
-            # The legacy field is now at the unique-Visit grain; the old raw
-            # row count was not a safe basis for completion or plan execution.
-            "created": current_success["total_project_visits"],
+            # Preserve legacy fields and their original source-row semantics.
+            # The current-state successful-Visit measure is additive below.
+            "created": len(pv),
             # Portal-defined free Visits are explicit /action/0 rows.  Count
             # unique existing Visit IDs; never infer from plan or sum states.
             "unassigned": len({
@@ -289,8 +289,12 @@ def materialize(projects: list[dict[str, Any]], visits: list[dict[str, Any]], ti
                 if str(value(v.get("assignment_state")) or "") == "UNASSIGNED_FREE"
                 or str(value(v.get("action_id")) or "") == "0"
             }),
-            "completed": current_success["successful_visits_current"],
-            "execution_pct": current_success["execution_pct_successful"],
+            "completed": sum(code in COMPLETED_CODES for code in codes),
+            "execution_pct": (
+                sum(code in COMPLETED_CODES for code in codes) / plan
+                if isinstance(plan, (int, float)) and not isinstance(plan, bool) and plan > 0
+                else None
+            ),
             "successful_visits_current": current_success["successful_visits_current"],
             "historically_approved_visits": None,
             "total_project_visits": current_success["total_project_visits"],
@@ -338,27 +342,13 @@ def _finite_number(value: Any) -> float | None:
 
 
 def _recalculate_project_health(row: dict[str, Any]) -> dict[str, Any]:
-    """Apply the approved 10/20 pp lag bands without inventing missing inputs."""
-    plan = _finite_number(row.get("plan"))
+    """Calculate the additive success gap without redefining legacy risk fields."""
     execution = _finite_number(row.get("execution_pct_successful"))
     elapsed = _finite_number(row.get("elapsed_pct"))
-    if plan is None or plan <= 0 or execution is None or elapsed is None:
+    if execution is None or elapsed is None:
         row["gap_pp"] = None
-        if row.get("plan_status") != "PLAN_MISSING_DATA":
-            row["risk_status"] = "NOT_QUALIFIED"
         return row
-
-    # Round only floating-point representation noise so exact 10/20 pp
-    # boundaries remain in the owner-approved next band.
-    gap_pp = round((execution - elapsed) * 100.0, 10)
-    lag_pp = max(0.0, -gap_pp)
-    row["gap_pp"] = gap_pp
-    if lag_pp < 10.0:
-        row["risk_status"] = "GREEN"
-    elif lag_pp < 20.0:
-        row["risk_status"] = "YELLOW"
-    else:
-        row["risk_status"] = "RED"
+    row["gap_pp"] = round((execution - elapsed) * 100.0, 10)
     return row
 
 

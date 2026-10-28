@@ -31,6 +31,12 @@ THIRD_TAB_COLUMNS += [
     "Всего уникальных визитов", "Состояние не разрешено", "Выполнение плана (успешные визиты)",
     "Разница с графиком, п.п.",
 ]
+SUCCESS_METRIC_COLUMNS = (
+    "successful_visits_current", "historically_approved_visits",
+    "total_project_visits", "current_state_unresolved_visits",
+    "execution_pct_successful", "gap_pp",
+)
+SUCCESS_METRIC_COUNT_COLUMNS = SUCCESS_METRIC_COLUMNS[:4]
 
 
 def primary_columns(existing_columns: Iterable[str]) -> list[str]:
@@ -42,8 +48,16 @@ def primary_columns(existing_columns: Iterable[str]) -> list[str]:
     return result
 
 
-def validate_materialized_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def validate_materialized_rows(
+    rows: list[dict[str, Any]],
+    *,
+    required_success_project_ids: set[str] | None = None,
+) -> dict[str, Any]:
     ids: list[str] = []
+    materialized_success_ids: set[str] = set()
+    required_success_project_ids = {
+        str(project_id) for project_id in (required_success_project_ids or set())
+    }
     for row in rows:
         pid = str(row.get("project_id", ""))
         if not pid:
@@ -55,6 +69,20 @@ def validate_materialized_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError(f"materialized row missing workflow fields: {','.join(missing)}")
         validate_workflow_metrics(metrics)
         total = int(row.get("project_visit_count", 0) or 0)
+        success_count_values = [row.get(field) for field in SUCCESS_METRIC_COUNT_COLUMNS]
+        success_optional_values = [row.get(field) for field in SUCCESS_METRIC_COLUMNS[4:]]
+        counts_missing = [value in (None, "") for value in success_count_values]
+        optional_missing = [value in (None, "") for value in success_optional_values]
+        if all(counts_missing) and all(optional_missing):
+            if pid in required_success_project_ids:
+                raise ValueError("selected project is missing current successful-visit metrics")
+            # Existing production projects outside a bounded refresh scope have
+            # no current-state payload. Keep those cells blank; never turn
+            # unknown scope into zero or apply the selected-row invariants.
+            continue
+        if any(counts_missing):
+            raise ValueError("current successful-visit metric group is partially populated")
+        materialized_success_ids.add(pid)
         total_project_visits = row.get("total_project_visits")
         successful = row.get("successful_visits_current")
         historical = row.get("historically_approved_visits")
@@ -69,10 +97,7 @@ def validate_materialized_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             raise ValueError("total_project_visits must match project_visit_count")
         if successful > total or historical > total or unresolved > total:
             raise ValueError("successful-visit metrics exceed total_project_visits")
-        completed = row.get("completed")
         finished = row.get("finished_visits")
-        if isinstance(completed, bool) or not isinstance(completed, int) or completed != successful:
-            raise ValueError("completed must equal successful_visits_current")
         if isinstance(finished, bool) or not isinstance(finished, int) or historical > finished:
             raise ValueError("historically_approved_visits must be a subset of legacy finished_visits")
         plan = row.get("plan")
@@ -85,25 +110,30 @@ def validate_materialized_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
             expected = successful / plan_number
             if not isinstance(execution, (int, float)) or isinstance(execution, bool) or not math.isclose(float(execution), expected, rel_tol=1e-12, abs_tol=1e-12):
                 raise ValueError("execution_pct_successful does not match successful_visits_current / plan")
-        if row.get("execution_pct") != execution:
-            raise ValueError("execution_pct must match execution_pct_successful")
         elapsed = row.get("elapsed_pct")
         gap_pp = row.get("gap_pp")
         elapsed_number = float(elapsed) if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) else None
         if execution is None or elapsed_number is None or not math.isfinite(elapsed_number):
-            if gap_pp is not None:
+            # Sheets values.get round-trips an empty cell as "". Treat that
+            # representation as the same missing value as None; never invent
+            # a numeric gap when plan/execution/elapsed inputs are unavailable.
+            if gap_pp not in (None, ""):
                 raise ValueError("gap_pp must be empty when plan/execution/elapsed data is unavailable")
         else:
             expected_gap = round((float(execution) - elapsed_number) * 100.0, 10)
             if not isinstance(gap_pp, (int, float)) or isinstance(gap_pp, bool) or not math.isclose(float(gap_pp), expected_gap, rel_tol=1e-12, abs_tol=1e-12):
                 raise ValueError("gap_pp does not match execution_pct_successful - elapsed_pct")
-            lag_pp = max(0.0, -expected_gap)
-            expected_risk = "GREEN" if lag_pp < 10.0 else "YELLOW" if lag_pp < 20.0 else "RED"
-            if row.get("risk_status") != expected_risk:
-                raise ValueError("risk_status does not match the approved 10/20 pp lag bands")
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate project_id in materialized workflow rows")
-    return {"rows": len(ids), "unique_project_ids": len(set(ids)), "duplicates": 0}
+    if not required_success_project_ids.issubset(materialized_success_ids):
+        raise ValueError("required projects are missing current successful-visit metrics")
+    return {
+        "rows": len(ids),
+        "unique_project_ids": len(set(ids)),
+        "duplicates": 0,
+        "success_metrics_materialized_rows": len(materialized_success_ids),
+        "success_metrics_unmaterialized_rows": len(ids) - len(materialized_success_ids),
+    }
 
 
 def third_tab_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
@@ -122,9 +152,10 @@ def third_tab_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
         line += [row.get(f"workflow_state_{code}_visits", 0) for code in WORKFLOW_STATES]
         line += [row.get("assigned_visits", 0), row.get("executed_visits_customer", 0), row.get("finished_visits", 0)]
         line += [row.get("workflow_covered_visits", 0), row.get("workflow_unclassified_visits", 0), row.get("workflow_multi_match_visits", 0)]
-        line += [row.get("successful_visits_current", 0), row.get("historically_approved_visits", 0),
-                 row.get("total_project_visits", row.get("project_visit_count", 0)),
-                 row.get("current_state_unresolved_visits", 0),
+        line += [row.get("successful_visits_current", "") if row.get("successful_visits_current") is not None else "",
+                 row.get("historically_approved_visits", "") if row.get("historically_approved_visits") is not None else "",
+                 row.get("total_project_visits", "") if row.get("total_project_visits") is not None else "",
+                 row.get("current_state_unresolved_visits", "") if row.get("current_state_unresolved_visits") is not None else "",
                  row.get("execution_pct_successful"), row.get("gap_pp")]
         output.append(line)
     return output

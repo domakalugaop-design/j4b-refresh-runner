@@ -126,10 +126,12 @@ def test_materializer_keeps_legacy_membership_union_separate_from_current_succes
     ]
     row = materialize([project], visits, "2026-10-27T00:00:00+00:00")[0]
     assert row["total_project_visits"] == row["project_visit_count"] == 4
-    assert row["successful_visits_current"] == row["completed"] == 2
+    assert row["successful_visits_current"] == 2
+    assert row["completed"] == 0  # legacy raw-status metric remains independent
     assert row["historically_approved_visits"] == 3  # states 40/50; state 37 excluded
     assert row["finished_visits"] == 4  # legacy union still includes state 37
-    assert row["execution_pct_successful"] == row["execution_pct"] == 1.0
+    assert row["execution_pct_successful"] == 1.0
+    assert row["execution_pct"] == 0.0
 
 
 def test_portal_acquisition_to_materializer_does_not_count_a_visit_after_40_to_45():
@@ -170,7 +172,9 @@ def test_portal_acquisition_to_materializer_does_not_count_a_visit_after_40_to_4
     current_by_visit = {item["visit_id"]: item["current_state_code"]["value"] for item in visits}
     assert current_by_visit == {"1": 45, "2": 40}
     assert row["total_project_visits"] == 2
-    assert row["successful_visits_current"] == row["completed"] == 1
+    assert row["successful_visits_current"] == 1
+    assert row["completed"] == 1  # legacy source-row count remains separate
+    assert row["execution_pct"] == 0.5
     assert row["historically_approved_visits"] == 2
     assert row["execution_pct_successful"] == 0.5
 
@@ -179,12 +183,13 @@ def test_materializer_uses_unique_visit_count_and_preserves_100_plus_completion(
     project = {"project_id": "42", "planned_visit_count": {"value": 1}, "acquisition_state": "ACQUIRED"}
     visits = [visit(1, 100, 40), visit(1, 100, 40), visit(2, 101, 50)]
     row = materialize([project], visits, "2026-10-27T00:00:00+00:00")[0]
-    assert row["created"] == row["total_project_visits"] == 2
+    assert row["created"] == 3  # preserve legacy raw-row count
+    assert row["total_project_visits"] == 2  # new metric counts unique Visit IDs
     assert row["successful_visits_current"] == 2
     assert row["execution_pct_successful"] == 2.0
 
 
-def test_project_health_uses_current_success_and_existing_elapsed_ratio_with_fixed_thresholds():
+def test_project_health_adds_success_gap_without_redefining_legacy_risk_status():
     project = {"project_id": "42", "planned_visit_count": {"value": 10}, "acquisition_state": "ACQUIRED"}
     visits = [visit(i, 100 + i, 40) for i in range(1, 5)]
     materialized_row = materialize([project], visits, "2026-10-27T00:00:00+00:00")[0]
@@ -194,11 +199,11 @@ def test_project_health_uses_current_success_and_existing_elapsed_ratio_with_fix
                             {"42"}, "2026-10-27T00:00:00+00:00", columns=COLUMNS)[0]
     assert merged["execution_pct_successful"] == 0.4
     assert merged["gap_pp"] == -10.0
-    assert merged["risk_status"] == "YELLOW"
+    assert merged["risk_status"] == "NOT_QUALIFIED"
     assert validate_materialized_rows([merged])["unique_project_ids"] == 1
 
 
-def test_project_health_threshold_edges_and_missing_elapsed_are_not_guessed():
+def test_success_gap_never_changes_legacy_risk_status_and_missing_elapsed_stays_null():
     from src.refresh import _recalculate_project_health
 
     def row(elapsed):
@@ -211,11 +216,15 @@ def test_project_health_threshold_edges_and_missing_elapsed_are_not_guessed():
             "gap_pp": None,
         }
 
-    assert _recalculate_project_health(row(0.499))["risk_status"] == "GREEN"
-    assert _recalculate_project_health(row(0.5))["risk_status"] == "YELLOW"
-    red = _recalculate_project_health(row(0.6))
-    assert red["risk_status"] == "RED"
-    assert red["gap_pp"] == -20.0
+    near = _recalculate_project_health(row(0.499))
+    assert near["risk_status"] == "NOT_QUALIFIED"
+    assert near["gap_pp"] == -9.9
+    boundary = _recalculate_project_health(row(0.5))
+    assert boundary["risk_status"] == "NOT_QUALIFIED"
+    assert boundary["gap_pp"] == -10.0
+    lower = _recalculate_project_health(row(0.6))
+    assert lower["risk_status"] == "NOT_QUALIFIED"
+    assert lower["gap_pp"] == -20.0
     no_elapsed = _recalculate_project_health(row(None))
     assert no_elapsed["risk_status"] == "NOT_QUALIFIED"
     assert no_elapsed["gap_pp"] is None

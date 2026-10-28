@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from src import production
-from src.refresh import COLUMNS
+from src.refresh import COLUMNS, merge_previous
 from src.production import _log_publication_failure
 from src.refresh import PublicationRollbackError
 from src.workflow_publication import (
@@ -41,13 +41,11 @@ def materialized(pid, **overrides):
     row["workflow_unclassified_visits"] = row["project_visit_count"] - row["workflow_covered_visits"]
     row["total_project_visits"] = row["project_visit_count"]
     row["historically_approved_visits"] = row.get("finished_visits", 0)
-    row["completed"] = row["successful_visits_current"]
     plan = row.get("plan")
     row["execution_pct_successful"] = (
         row["successful_visits_current"] / plan
         if isinstance(plan, (int, float)) and not isinstance(plan, bool) and plan > 0 else None
     )
-    row["execution_pct"] = row["execution_pct_successful"]
     return row
 
 
@@ -183,6 +181,48 @@ def test_third_tab_is_one_row_per_project_and_deterministically_sorted():
     rows = third_tab_rows([materialized("10", project_visit_count=2), materialized("2")])
     assert [row[0] for row in rows[1:]] == [2, 10]
     assert len(rows) == 3
+
+
+def test_partial_scope_preserves_unselected_rows_and_serializes_new_metrics_as_blanks():
+    selected = materialized("200", project_visit_count=2, successful_visits_current=2)
+    prior = materialized("100", project_visit_count=4)
+    prior.update({"completed": 3, "execution_pct": 0.75, "risk_status": "LEGACY"})
+    old_columns = primary_columns(COLUMNS[:-6])
+    target_columns = old_columns + COLUMNS[-6:]
+    previous = [old_columns, [prior.get(column, "") for column in old_columns]]
+
+    merged = merge_previous(
+        [selected], previous, {"200"}, "2026-10-28T00:00:00+00:00", columns=target_columns
+    )
+
+    coverage = validate_materialized_rows(merged, required_success_project_ids={"200"})
+    assert coverage["success_metrics_materialized_rows"] == 1
+    assert coverage["success_metrics_unmaterialized_rows"] == 1
+    unselected = next(row for row in merged if row["project_id"] == "100")
+    assert (unselected["completed"], unselected["execution_pct"], unselected["risk_status"]) == (3, 0.75, "LEGACY")
+    rendered = third_tab_rows(merged)
+    unselected_rendered = next(row for row in rendered[1:] if row[0] == 100)
+    assert unselected_rendered[-6:] == [""] * 6
+
+
+def test_full_scope_gate_rejects_unmaterialized_project_metrics():
+    selected = materialized("200", project_visit_count=2, successful_visits_current=2)
+    prior = materialized("100", project_visit_count=4)
+    old_columns = primary_columns(COLUMNS[:-6])
+    target_columns = old_columns + COLUMNS[-6:]
+    previous = [old_columns, [prior.get(column, "") for column in old_columns]]
+    merged = merge_previous(
+        [selected], previous, {"200"}, "2026-10-28T00:00:00+00:00", columns=target_columns
+    )
+    with pytest.raises(ValueError, match="selected project is missing current successful-visit metrics"):
+        validate_materialized_rows(merged, required_success_project_ids={"100", "200"})
+
+
+def test_partially_populated_success_metric_group_fails_closed():
+    row = materialized("1")
+    row["successful_visits_current"] = ""
+    with pytest.raises(ValueError, match="metric group is partially populated"):
+        validate_materialized_rows([row], required_success_project_ids={"1"})
 
 
 def test_missing_project_dimensions_are_written_as_explicit_blanks_for_exact_readback():

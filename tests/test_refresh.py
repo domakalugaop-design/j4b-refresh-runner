@@ -120,7 +120,8 @@ def test_free_visits_counts_distinct_explicit_unassigned_ids_not_plan_or_states(
     ]
     row = materialize(projects, visits, "2026-10-05T00:00:00+00:00")[0]
     assert row["plan"] == 13
-    assert row["created"] == row["total_project_visits"] == 4
+    assert row["created"] == 5  # legacy raw-source-row count is unchanged
+    assert row["total_project_visits"] == 4  # new metric uses unique Visit IDs
     assert row["unassigned"] == 1
     assert row["successful_visits_current"] == 0
     assert row["current_state_unresolved_visits"] == 1
