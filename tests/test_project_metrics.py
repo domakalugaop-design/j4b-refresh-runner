@@ -10,10 +10,12 @@ from src.project_metrics import (
     compare_project_metric_rows,
     compare_project_metrics_detailed,
     merge_project_metrics_candidates,
+    parse_coordinator_field,
     parse_coordinator_ids,
     project_distribution_counts,
     project_select_sql,
     read_project_metrics_chunk,
+    read_project_metrics_population,
     user_select_sql,
     visit_select_sql,
 )
@@ -82,6 +84,10 @@ def test_coordinator_ids_parse_as_a_distinct_bridge_and_reject_unknown_format():
         parse_coordinator_ids("21/name")
     with pytest.raises(ProjectMetricsError):
         parse_coordinator_ids("21,21")
+    assert parse_coordinator_field(None) == ((), "EMPTY")
+    assert parse_coordinator_field("21;22") == ((21, 22), "RESOLVED")
+    assert parse_coordinator_field("0") == ((), "UNRESOLVED")
+    assert parse_coordinator_field("21/bad") == ((), "UNRESOLVED")
 
 
 def test_project_metrics_use_distinct_visits_and_do_not_fan_out_for_actions_or_coordinators():
@@ -94,6 +100,9 @@ def test_project_metrics_use_distinct_visits_and_do_not_fan_out_for_actions_or_c
         "projects_missing_client_label": 0,
         "projects_missing_manager_label": 0,
         "coordinator_links_missing_user_label": 0,
+        "projects_with_empty_coordinators": 0,
+        "projects_with_unresolved_coordinators": 0,
+        "projects_with_extreme_plans": 0,
     }
     metric = candidate.metrics[0]
     assert metric["project_id"] == 8314
@@ -110,6 +119,124 @@ def test_project_metrics_use_distinct_visits_and_do_not_fan_out_for_actions_or_c
     assert candidate.projects[0]["coordinator_ids"] == (21, 22, 23)
 
 
+
+def test_unknown_coordinator_sentinel_preserves_project_and_visit_metrics():
+    projects, visits, actions, clients, users = sample_rows()
+    projects[0] = {**projects[0], "coordinator_ids_raw": "0"}
+    candidate = build(projects, visits, actions, clients, users)
+    project = candidate.projects[0]
+    assert candidate.qa["projects"] == 1
+    assert candidate.qa["visits"] == 3
+    assert candidate.qa["projects_with_unresolved_coordinators"] == 1
+    assert candidate.qa["projects_with_empty_coordinators"] == 0
+    assert project["coordinator_ids_raw"] == "0"
+    assert project["coordinator_ids"] == ()
+    assert project["coordinator_state"] == "UNRESOLVED"
+    assert candidate.metrics[0]["total_visits"] == 3
+    assert candidate.metrics[0]["finished_visits"] == 1
+    assert candidate.project_coordinators == ()
+
+
+def test_full_population_candidate_keeps_all_projects_with_52_unresolved_sentinels():
+    project_ids = tuple(range(1, 8101))
+    chunks = []
+    for start in range(0, len(project_ids), 250):
+        ids = project_ids[start:start + 250]
+        projects = [{
+            "project_id": project_id,
+            "project_name": None,
+            "client_id": None,
+            "manager_id": None,
+            "coordinator_ids_raw": "0" if project_id <= 52 else "",
+            "plan_visits": 0,
+        } for project_id in ids]
+        chunks.append(build_project_metrics_candidate(ids, projects, [], [], [], []))
+    candidate = merge_project_metrics_candidates(chunks)
+    assert candidate.qa["projects"] == 8100
+    assert candidate.qa["projects_with_unresolved_coordinators"] == 52
+    assert candidate.qa["projects_with_empty_coordinators"] == 8048
+    assert len({row["project_id"] for row in candidate.projects}) == 8100
+    assert len(candidate.metrics) == 8100
+
+
+def test_population_reader_uses_one_read_only_snapshot_and_retains_unresolved_project():
+    class Cursor:
+        def __init__(self, connection):
+            self.connection = connection
+            self.description = None
+            self.rows = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            assert isinstance(params, tuple)
+            if sql.startswith("START TRANSACTION"):
+                self.connection.started += 1
+                return
+            if "UTC_TIMESTAMP(6)" in sql:
+                columns, rows = ("captured_at_utc", "source_timezone"), [("2026-10-29 00:00:00", "SYSTEM")]
+            elif "SELECT p.i AS project_id FROM proj AS p ORDER BY p.i" in sql:
+                columns, rows = ("project_id",), [(8314,)]
+            elif "FROM proj AS p WHERE" in sql:
+                columns = (
+                    "project_id", "project_name", "client_id", "manager_id",
+                    "coordinator_ids_raw", "plan_visits", "project_type_code",
+                    "project_created_epoch", "date_from_epoch", "date_to_epoch",
+                )
+                rows = [(8314, "Synthetic", None, None, "0", 13, 4, 100, 200, 300)]
+            elif "FROM visit AS v WHERE" in sql:
+                columns = ("visit_id", "project_id", "visit_epoch", "visit_start_epoch", "visit_end_epoch")
+                rows = [(501, 8314, 1000, None, None)]
+            elif "FROM `my` AS m INNER JOIN visit" in sql:
+                columns = ("action_id", "project_id", "visit_id", "state_code", "action_epoch", "action_visit_epoch")
+                rows = [(601, 8314, 501, 40, 1001, 1002)]
+            elif "LEFT JOIN visit AS v ON v.i=m.visit WHERE v.i IS NULL" in sql:
+                columns = ("action_id", "project_id", "visit_id", "state_code", "action_epoch", "action_visit_epoch")
+                rows = [(602, None, 999, 39, 1003, 1004)]
+            elif "FROM client AS c" in sql:
+                columns, rows = ("client_id", "client_name"), []
+            elif "FROM `user` AS u" in sql:
+                columns = ("user_id", "name_first", "name_middle", "name_last")
+                rows = []
+            else:
+                raise AssertionError("unexpected source query")
+            self.description = tuple((name,) for name in columns)
+            self.rows = list(rows)
+
+        def fetchmany(self, size):
+            batch, self.rows = self.rows[:size], self.rows[size:]
+            return batch
+
+    class Connection:
+        def __init__(self):
+            self.started = 0
+            self.rolled_back = 0
+
+        def cursor(self):
+            return Cursor(self)
+
+        def rollback(self):
+            self.rolled_back += 1
+
+    connection = Connection()
+    population = read_project_metrics_population(connection)
+    candidate = population.candidate
+    assert connection.started == 1
+    assert connection.rolled_back == 1
+    assert candidate.qa["projects"] == 1
+    assert candidate.qa["projects_with_unresolved_coordinators"] == 1
+    assert candidate.projects[0]["coordinator_ids_raw"] == "0"
+    assert candidate.metrics[0]["finished_visits"] == 1
+    assert population.orphan_actions == ({
+        "action_id": 602, "project_id": None, "visit_id": 999,
+        "state_code": 39, "action_epoch": 1003, "action_visit_epoch": 1004,
+    },)
+    assert population.source_timezone == "SYSTEM"
+
 def test_status_39_is_retained_as_raw_membership_but_excluded_from_finished():
     candidate = build()
     metric = candidate.metrics[0]
@@ -124,7 +251,19 @@ def test_plan_and_created_visits_are_independent_source_values():
     assert candidate.metrics[0]["planned_visits"] == 2
     assert candidate.metrics[0]["total_visits"] == 3
     assert candidate.projects[0]["planned_visits"] == 2
+    assert candidate.projects[0]["plan_visits_raw"] == 2
+    assert candidate.projects[0]["plan_extreme_gt_10000"] is False
 
+
+
+def test_extreme_plan_is_preserved_and_flagged_without_normalization():
+    projects, visits, actions, clients, users = sample_rows()
+    projects[0] = {**projects[0], "plan_visits": 3_100_000}
+    candidate = build(projects, visits, actions, clients, users)
+    assert candidate.projects[0]["plan_visits_raw"] == 3_100_000
+    assert candidate.projects[0]["planned_visits"] == 3_100_000
+    assert candidate.projects[0]["plan_extreme_gt_10000"] is True
+    assert candidate.qa["projects_with_extreme_plans"] == 1
 
 def test_raw_ids_epochs_and_nullable_dates_are_preserved():
     candidate = build()

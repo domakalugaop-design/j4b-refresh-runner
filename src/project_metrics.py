@@ -18,6 +18,9 @@ from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 MAX_PROJECT_IDS_PER_QUERY = 250
 MAX_SOURCE_ROWS_PER_ENTITY = 50_000
 FETCH_BATCH_SIZE = 1_000
+# Triage threshold based on the observed source distribution; it does not
+# change or normalize the business plan value.
+PLAN_EXTREME_THRESHOLD = 10_000
 FINISHED_STATUS_CODES = frozenset({37, 40, 50})
 ASSIGNED_STATUS_CODE = 20
 EXECUTED_STATUS_CODE = 30
@@ -147,7 +150,8 @@ def read_project_metrics_chunk(connection: Any, project_ids: Sequence[int]) -> "
             manager_id = _optional_int(row.get("manager_id"))
             if manager_id is not None:
                 user_ids.add(manager_id)
-            user_ids.update(parse_coordinator_ids(row.get("coordinator_ids_raw")))
+            coordinator_ids, _ = parse_coordinator_field(row.get("coordinator_ids_raw"))
+            user_ids.update(coordinator_ids)
 
         visits = _fetch_named_rows(connection, visit_select_sql(len(selected)), selected)
         actions = _fetch_named_rows(connection, action_select_sql(len(selected)), selected)
@@ -160,6 +164,78 @@ def read_project_metrics_chunk(connection: Any, project_ids: Sequence[int]) -> "
             for row in _fetch_named_rows(connection, user_select_sql(len(batch)), batch)
         )
         return build_project_metrics_candidate(selected, projects, visits, actions, clients, users)
+    finally:
+        connection.rollback()
+
+
+def read_project_metrics_population(connection: Any) -> "ProjectMetricsPopulation":
+    """Read the complete current project population in one consistent snapshot.
+
+    Project-dependent queries are still split into at most 250 IDs per batch,
+    but every batch shares the same MariaDB read-only transaction. This is for
+    a single explicitly approved staging snapshot, not a scheduled publisher.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+    try:
+        snapshot_rows = _fetch_named_rows(
+            connection,
+            "SELECT UTC_TIMESTAMP(6) AS captured_at_utc, @@system_time_zone AS source_timezone",
+            (),
+        )
+        if len(snapshot_rows) != 1:
+            raise ProjectMetricsError("source snapshot metadata is unavailable")
+        snapshot_metadata = snapshot_rows[0]
+        id_rows = _fetch_named_rows(
+            connection,
+            "SELECT p.i AS project_id FROM proj AS p ORDER BY p.i",
+            (),
+        )
+        project_ids = tuple(_required_int(row, "project_id") for row in id_rows)
+        if not project_ids or len(set(project_ids)) != len(project_ids):
+            raise ProjectMetricsError("source project population is empty or contains duplicate IDs")
+
+        candidates = []
+        for selected in _chunks(project_ids):
+            projects = _fetch_named_rows(connection, project_select_sql(len(selected)), selected)
+            visits = _fetch_named_rows(connection, visit_select_sql(len(selected)), selected)
+            actions = _fetch_named_rows(connection, action_select_sql(len(selected)), selected)
+            client_ids = tuple(sorted({
+                parsed for row in projects
+                if (parsed := _optional_int(row.get("client_id"))) is not None
+            }))
+            user_ids = set()
+            for row in projects:
+                manager_id = _optional_int(row.get("manager_id"))
+                if manager_id is not None:
+                    user_ids.add(manager_id)
+                coordinator_ids, _ = parse_coordinator_field(row.get("coordinator_ids_raw"))
+                user_ids.update(coordinator_ids)
+            clients = tuple(
+                row for batch in _chunks(client_ids)
+                for row in _fetch_named_rows(connection, client_select_sql(len(batch)), batch)
+            )
+            users = tuple(
+                row for batch in _chunks(tuple(sorted(user_ids)))
+                for row in _fetch_named_rows(connection, user_select_sql(len(batch)), batch)
+            )
+            candidates.append(build_project_metrics_candidate(selected, projects, visits, actions, clients, users))
+
+        # Keep source action IDs whose visit does not resolve. They are not
+        # assigned to a project and therefore must not affect project metrics.
+        orphan_actions = _fetch_named_rows(
+            connection,
+            "SELECT m.i AS action_id, NULL AS project_id, m.visit AS visit_id, "
+            "m.state AS state_code, m.dt AS action_epoch, m.dt_visit AS action_visit_epoch "
+            "FROM `my` AS m LEFT JOIN visit AS v ON v.i=m.visit WHERE v.i IS NULL",
+            (),
+        )
+        return ProjectMetricsPopulation(
+            merge_project_metrics_candidates(candidates),
+            orphan_actions,
+            snapshot_metadata["captured_at_utc"],
+            str(snapshot_metadata["source_timezone"]),
+        )
     finally:
         connection.rollback()
 
@@ -178,6 +254,21 @@ def parse_coordinator_ids(value: Any) -> Tuple[int, ...]:
     if len(set(parsed)) != len(parsed):
         raise ProjectMetricsError("coordinator ID list contains duplicates")
     return parsed
+
+
+def parse_coordinator_field(value: Any) -> Tuple[Tuple[int, ...], str]:
+    """Parse known IDs while explicitly classifying empty and unknown values.
+
+    Unsupported non-empty values (including ``"0"``) are not guessed to mean
+    no coordinator. The caller retains the original source value and may keep
+    the project and its visit metrics with an UNRESOLVED quality state.
+    """
+    if value is None or str(value).strip() == "":
+        return (), "EMPTY"
+    try:
+        return parse_coordinator_ids(value), "RESOLVED"
+    except ProjectMetricsError:
+        return (), "UNRESOLVED"
 
 
 def _required_int(row: Mapping[str, Any], key: str) -> int:
@@ -235,6 +326,14 @@ class ProjectMetricsCandidate:
     qa: Mapping[str, int]
 
 
+@dataclass(frozen=True)
+class ProjectMetricsPopulation:
+    candidate: ProjectMetricsCandidate
+    orphan_actions: Tuple[Mapping[str, Any], ...]
+    captured_at_utc: Any
+    source_timezone: str
+
+
 def build_project_metrics_candidate(
     project_ids: Sequence[int],
     project_rows: Sequence[Mapping[str, Any]],
@@ -272,11 +371,21 @@ def build_project_metrics_candidate(
     missing_clients = 0
     missing_managers = 0
     missing_coordinators = 0
+    unresolved_coordinators = 0
+    empty_coordinators = 0
+    extreme_plans = 0
     for project_id in selected:
         source = projects_by_id[project_id]
         client_id = _optional_int(source.get("client_id"))
         manager_id = _optional_int(source.get("manager_id"))
-        coordinator_ids = parse_coordinator_ids(source.get("coordinator_ids_raw"))
+        coordinator_raw = source.get("coordinator_ids_raw")
+        coordinator_ids, coordinator_state = parse_coordinator_field(coordinator_raw)
+        unresolved_coordinators += int(coordinator_state == "UNRESOLVED")
+        empty_coordinators += int(coordinator_state == "EMPTY")
+        plan_raw = source.get("plan_visits")
+        planned_visits = _optional_int(plan_raw)
+        plan_extreme = planned_visits is not None and planned_visits > PLAN_EXTREME_THRESHOLD
+        extreme_plans += int(plan_extreme)
         client = client_map.get(client_id) if client_id is not None else None
         manager = user_map.get(manager_id) if manager_id is not None else None
         missing_clients += int(client_id is not None and client is None)
@@ -288,12 +397,16 @@ def build_project_metrics_candidate(
             "client_name": client.get("client_name") if client else None,
             "manager_id": manager_id,
             "manager_name": _display_name(manager),
-            "planned_visits": _optional_int(source.get("plan_visits")),
+            "plan_visits_raw": plan_raw,
+            "planned_visits": planned_visits,
+            "plan_extreme_gt_10000": plan_extreme,
             "project_type_code": _optional_int(source.get("project_type_code")),
             "project_created_epoch": _optional_int(source.get("project_created_epoch")),
             "date_from_epoch": _optional_int(source.get("date_from_epoch")),
             "date_to_epoch": _optional_int(source.get("date_to_epoch")),
+            "coordinator_ids_raw": coordinator_raw,
             "coordinator_ids": coordinator_ids,
+            "coordinator_state": coordinator_state,
         })
         for coordinator_id in coordinator_ids:
             coordinator = user_map.get(coordinator_id)
@@ -388,6 +501,9 @@ def build_project_metrics_candidate(
             "projects_missing_client_label": missing_clients,
             "projects_missing_manager_label": missing_managers,
             "coordinator_links_missing_user_label": missing_coordinators,
+            "projects_with_empty_coordinators": empty_coordinators,
+            "projects_with_unresolved_coordinators": unresolved_coordinators,
+            "projects_with_extreme_plans": extreme_plans,
         },
     )
 
