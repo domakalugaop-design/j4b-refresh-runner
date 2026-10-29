@@ -1,11 +1,12 @@
 # PORTAL-001.3 — DB-backed project dashboard TEST prototype
 
-Status: **LOCAL MODEL AND STAGING PACKAGE PREPARED; LIVE DASHBOARD BLOCKED AT THE OWNER-APPROVAL WRITE BOUNDARY**.
+Status: **STAGING OBJECTS CREATED; SOURCE SNAPSHOT DID NOT COMPLETE; NO ROWS LOADED; DASHBOARD NOT CREATED**.
 
-This stage prepares an isolated project mart contract for the existing
-`MariaDB → Analytics PostgreSQL → Yandex DataLens` path. No PostgreSQL,
-Google Sheets, DataLens, Portal, schedule, or production runtime was changed.
-The proposed PostgreSQL DDL is in
+This stage prepares an isolated project mart for the existing
+`MariaDB → Analytics PostgreSQL → Yandex DataLens` path. The new isolated
+PostgreSQL schema and its objects were created after preflight; no row data
+was loaded. No existing PostgreSQL schema, Google Sheets, DataLens object,
+Portal data, schedule, or production runtime was changed. The DDL is in
 [`../sql/project_metrics_staging.sql`](../sql/project_metrics_staging.sql)
 and has **not** been applied.
 
@@ -25,7 +26,7 @@ and has **not** been applied.
 
 ## Proposed isolated mart
 
-The unapplied DDL creates one new schema, five base tables, and three views:
+The DDL creates one new schema, five base tables, and three views:
 
 1. `snapshot_runs` — source snapshot time/timezone, scope, counts, completeness,
    and model version.
@@ -78,40 +79,71 @@ inspection did not establish that its configured endpoint resolves to this
 same Analytics PostgreSQL instance. That identity must be proven before a new
 dataset can be built on it.
 
+## Controlled deployment result — 2026-10-29
+
+The server-side full-population read began through the existing configured
+MariaDB `watch` connection and the read-only consistent-snapshot reader. It
+terminated with the safe exception class `ProjectMetricsError` before the
+loader reached PostgreSQL DML. The outer one-off runner intentionally did not
+emit the exception message or a traceback, so the precise failing validation
+step is **NOT_CAPTURED**. No retry was made.
+
+An independent PostgreSQL readback confirmed all five staging tables contain
+zero rows. The one-off staging scripts were removed from the server. Thus the
+DDL and grants are present, but the snapshot and dashboard are not.
+
+The DataLens connection detail shows PostgreSQL database `j4b_analytics`,
+read-only account `j4b_analytics_reader`, and host
+`j4b-analytics.duckdns.org:15432`. DNS resolution on `dfb` maps that host to
+the server's external address. The connection was not exercised from DataLens
+against the new views; this remains **PARTIAL**, not a read-access PASS.
+
+### Rollback of only the created PostgreSQL objects
+
+No row data or DataLens object exists. If the owner later chooses to remove
+this empty staging layer, first verify it is still the only schema with this
+name, then execute `DROP SCHEMA staging_project_metrics CASCADE` in a
+transaction. That removes only this stage's schema, tables, views, and its
+schema-scoped grants. This rollback was prepared but not run.
+
 ## DataLens and parity status
 
 - Existing management project/workflow dataset inspected in this stage is
   backed by the Google Sheets materialized layer.
 - The current Google workbook remains the control, not an atomic same-time
   parity baseline.
-- The existing `БД на ДФБ` PostgreSQL connection exists, but its endpoint-to-
-  server identity was not established. No new connection was created.
+- The existing `БД на ДФБ` PostgreSQL connection exists and is configured for
+  the Analytics database; DNS from `dfb` resolves its host to that server.
+  DataLens query access to the new views is not verified. No new connection
+  was created.
 - No new dataset or dashboard was created. There is no test dashboard URL.
 - The previously confirmed qualified metric formulas remain assigned = state
   20, executed = state 30, finished = distinct union of 37/40/50. The local
   aggregate model preserves these definitions and raw IDs. Same-snapshot
   parity remains unproven.
 
-## Exact approval boundary
+## Remaining work
 
-To continue to a working prototype, authorize these writes explicitly:
+The owner has already authorized creation of the staging objects and a
+private test dashboard. The load stopped before PostgreSQL DML due the
+uncaptured `ProjectMetricsError`; it must not be retried without first
+instrumenting that failure safely and confirming the precise cause. After
+that:
 
-1. In the existing `j4b_analytics` PostgreSQL database, create only the new
-   `staging_project_metrics` schema, its five base tables and three views from
-   `sql/project_metrics_staging.sql`, then load one complete, read-only-source
-   MariaDB snapshot into that schema. This transfers project/client/employee
-   labels and all project/visit/action IDs, including unlinked actions, into
-   the isolated test schema. Grant `j4b_analytics_reader` schema usage and
-   SELECT on only the three staging views so the existing DataLens connection
-   can read the test data. Do not
-   alter any existing schema, ETL, service, timer, or `publish.*` object.
-2. After verifying which DataLens PostgreSQL connection reaches this database,
-   create a separate test dataset and a private dashboard named
-   `JFB Portal — Проекты (DB TEST)` using only the new staging views. Do not
-   alter existing DataLens objects.
+1. Capture a safe diagnostic location (exception source file/line/function
+   and symbolic source-validation step, never message or row content) during a
+   single authorized retry after the failure cause is established.
+2. Complete one full read-only source snapshot and load only into the existing
+   `staging_project_metrics` schema. Verify all source IDs, row counts,
+   aggregate parity against the local candidate, unresolved coordinator
+   count, orphan-action preservation, and nullable successful KPI.
+3. Exercise the existing DataLens connection against the new views. Only if
+   that succeeds, create the separate dataset(s) and private dashboard
+   `JFB Portal — Проекты (DB TEST)` using only the staging views.
 
-No approval is requested to write to MariaDB, the existing Google workbook,
-or production dashboard. The test dashboard should not claim successful
+No additional approval is requested for the already authorized isolated
+staging and new private dashboard. No writes to MariaDB, the existing Google
+workbook, or production dashboard are authorized. The test dashboard should not claim successful
 visits until its exclusion-marker source is qualified. Date filters should
 remain unavailable until the epoch and timezone behavior is explicitly
 verified for the dashboard contract.
