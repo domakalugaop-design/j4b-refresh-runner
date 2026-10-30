@@ -8,10 +8,15 @@ than a fan-out join across visits, actions, and coordinator memberships.
 """
 from __future__ import annotations
 
+import logging
 import re
+import time
+import traceback
 from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Sequence, Tuple
 
 
@@ -24,6 +29,7 @@ PLAN_EXTREME_THRESHOLD = 10_000
 FINISHED_STATUS_CODES = frozenset({37, 40, 50})
 ASSIGNED_STATUS_CODE = 20
 EXECUTED_STATUS_CODE = 30
+_LOG = logging.getLogger(__name__)
 
 # Descriptive labels only. Unknown codes remain raw and are not discarded.
 WORKFLOW_STATUS_LABELS: Mapping[int, str] = {
@@ -49,6 +55,37 @@ _CANONICAL_ID = re.compile(r"[1-9][0-9]*\Z")
 
 class ProjectMetricsError(ValueError):
     """Safe validation error with no source row values in the message."""
+
+    def __init__(self, message: str, *, code: str | None = None, processed_rows: int | None = None):
+        super().__init__(message)
+        self.code = code
+        self.processed_rows = processed_rows
+
+
+@contextmanager
+def _snapshot_stage(stage: str, progress: Mapping[str, int], *, entity: str, entity_id: str):
+    started = time.monotonic()
+    try:
+        yield
+    except Exception as exc:
+        origin = traceback.extract_tb(exc.__traceback__)[-1]
+        rows = sum(progress.values()) + (getattr(exc, "processed_rows", 0) or 0)
+        _LOG.error(
+            "project_metrics_snapshot stage=%s outcome=FAIL exception_class=%s error_code=%s "
+            "source_file=%s source_line=%d source_function=%s entity=%s entity_id=%s "
+            "processed_rows=%d duration_ms=%d",
+            stage, type(exc).__name__, getattr(exc, "code", None) or "UNCLASSIFIED",
+            Path(origin.filename).name, origin.lineno, origin.name, entity, entity_id,
+            rows, int((time.monotonic() - started) * 1000),
+        )
+        raise
+    else:
+        _LOG.info(
+            "project_metrics_snapshot stage=%s outcome=PASS entity=%s entity_id=%s "
+            "processed_rows=%d duration_ms=%d",
+            stage, entity, entity_id, sum(progress.values()),
+            int((time.monotonic() - started) * 1000),
+        )
 
 
 def _marks(count: int) -> str:
@@ -112,13 +149,56 @@ def _fetch_named_rows(connection: Any, sql: str, params: Sequence[int]) -> Tuple
         cursor.execute(sql, tuple(params))
         names = tuple(str(column[0]) for column in cursor.description)
         while True:
-            batch = cursor.fetchmany(FETCH_BATCH_SIZE)
+            remaining_through_cap = MAX_SOURCE_ROWS_PER_ENTITY + 1 - len(result)
+            batch = cursor.fetchmany(min(FETCH_BATCH_SIZE, remaining_through_cap))
             if not batch:
                 break
             result.extend(dict(zip(names, values)) for values in batch)
             if len(result) > MAX_SOURCE_ROWS_PER_ENTITY:
-                raise ProjectMetricsError("source entity exceeded the local candidate row cap")
+                raise ProjectMetricsError(
+                    "source entity exceeded the local candidate row cap",
+                    code="SOURCE_ENTITY_ROW_CAP",
+                    processed_rows=len(result),
+                )
     return tuple(result)
+
+
+def _fetch_partitioned_rows(
+    connection: Any,
+    sql_builder: Any,
+    ids: Sequence[int],
+    *,
+    stage: str,
+    entity: str,
+) -> Tuple[Mapping[str, Any], ...]:
+    """Read a bounded ID set, bisecting only on the explicit row-cap error."""
+    selected = tuple(ids)
+    if not selected:
+        return ()
+    label = f"id_count={len(selected)};first={selected[0]};last={selected[-1]}"
+    progress: Dict[str, int] = {}
+    with _snapshot_stage(stage, progress, entity=entity, entity_id=label):
+        try:
+            rows = _fetch_named_rows(connection, sql_builder(len(selected)), selected)
+            progress["rows"] = len(rows)
+            return rows
+        except ProjectMetricsError as exc:
+            if exc.code != "SOURCE_ENTITY_ROW_CAP" or len(selected) == 1:
+                raise
+            midpoint = len(selected) // 2
+            _LOG.warning(
+                "project_metrics_snapshot stage=batch_split outcome=RETRY reason=SOURCE_ENTITY_ROW_CAP "
+                "entity=%s parent_id_count=%d left_id_count=%d right_id_count=%d",
+                entity, len(selected), midpoint, len(selected) - midpoint,
+            )
+            return (
+                _fetch_partitioned_rows(
+                    connection, sql_builder, selected[:midpoint], stage=stage, entity=entity
+                )
+                + _fetch_partitioned_rows(
+                    connection, sql_builder, selected[midpoint:], stage=stage, entity=entity
+                )
+            )
 
 
 def read_project_metrics_chunk(connection: Any, project_ids: Sequence[int]) -> "ProjectMetricsCandidate":
@@ -175,31 +255,49 @@ def read_project_metrics_population(connection: Any) -> "ProjectMetricsPopulatio
     but every batch shares the same MariaDB read-only transaction. This is for
     a single explicitly approved staging snapshot, not a scheduled publisher.
     """
-    with connection.cursor() as cursor:
-        cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+    started = time.monotonic()
+    progress = {"project_ids": 0, "projects": 0, "visits": 0, "actions": 0, "orphan_actions": 0}
     try:
-        snapshot_rows = _fetch_named_rows(
-            connection,
-            "SELECT UTC_TIMESTAMP(6) AS captured_at_utc, @@system_time_zone AS source_timezone",
-            (),
-        )
+        with connection.cursor() as cursor:
+            cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+        metadata_progress: Dict[str, int] = {}
+        with _snapshot_stage("snapshot_metadata", metadata_progress, entity="metadata", entity_id="global"):
+            snapshot_rows = _fetch_named_rows(
+                connection,
+                "SELECT UTC_TIMESTAMP(6) AS captured_at_utc, @@system_time_zone AS source_timezone",
+                (),
+            )
+            metadata_progress["rows"] = len(snapshot_rows)
         if len(snapshot_rows) != 1:
             raise ProjectMetricsError("source snapshot metadata is unavailable")
         snapshot_metadata = snapshot_rows[0]
-        id_rows = _fetch_named_rows(
-            connection,
-            "SELECT p.i AS project_id FROM proj AS p ORDER BY p.i",
-            (),
-        )
+        universe_progress: Dict[str, int] = {}
+        with _snapshot_stage("project_universe", universe_progress, entity="project", entity_id="global"):
+            id_rows = _fetch_named_rows(
+                connection,
+                "SELECT p.i AS project_id FROM proj AS p ORDER BY p.i",
+                (),
+            )
+            universe_progress["rows"] = len(id_rows)
         project_ids = tuple(_required_int(row, "project_id") for row in id_rows)
         if not project_ids or len(set(project_ids)) != len(project_ids):
             raise ProjectMetricsError("source project population is empty or contains duplicate IDs")
+        progress["project_ids"] = len(project_ids)
 
         candidates = []
-        for selected in _chunks(project_ids):
-            projects = _fetch_named_rows(connection, project_select_sql(len(selected)), selected)
-            visits = _fetch_named_rows(connection, visit_select_sql(len(selected)), selected)
-            actions = _fetch_named_rows(connection, action_select_sql(len(selected)), selected)
+        for batch_index, selected in enumerate(_chunks(project_ids), start=1):
+            projects = _fetch_partitioned_rows(
+                connection, project_select_sql, selected, stage="project_rows", entity="project"
+            )
+            visits = _fetch_partitioned_rows(
+                connection, visit_select_sql, selected, stage="visit_rows", entity="visit"
+            )
+            actions = _fetch_partitioned_rows(
+                connection, action_select_sql, selected, stage="action_rows", entity="action"
+            )
+            progress["projects"] += len(projects)
+            progress["visits"] += len(visits)
+            progress["actions"] += len(actions)
             client_ids = tuple(sorted({
                 parsed for row in projects
                 if (parsed := _optional_int(row.get("client_id"))) is not None
@@ -213,29 +311,61 @@ def read_project_metrics_population(connection: Any) -> "ProjectMetricsPopulatio
                 user_ids.update(coordinator_ids)
             clients = tuple(
                 row for batch in _chunks(client_ids)
-                for row in _fetch_named_rows(connection, client_select_sql(len(batch)), batch)
+                for row in _fetch_partitioned_rows(
+                    connection, client_select_sql, batch, stage="client_rows", entity="client"
+                )
             )
             users = tuple(
                 row for batch in _chunks(tuple(sorted(user_ids)))
-                for row in _fetch_named_rows(connection, user_select_sql(len(batch)), batch)
+                for row in _fetch_partitioned_rows(
+                    connection, user_select_sql, batch, stage="user_rows", entity="user"
+                )
             )
-            candidates.append(build_project_metrics_candidate(selected, projects, visits, actions, clients, users))
+            with _snapshot_stage(
+                "candidate_build", {"projects": len(projects), "visits": len(visits), "actions": len(actions)},
+                entity="project_batch", entity_id=f"batch={batch_index};project_count={len(selected)}",
+            ):
+                candidates.append(build_project_metrics_candidate(selected, projects, visits, actions, clients, users))
 
         # Keep source action IDs whose visit does not resolve. They are not
         # assigned to a project and therefore must not affect project metrics.
-        orphan_actions = _fetch_named_rows(
-            connection,
-            "SELECT m.i AS action_id, NULL AS project_id, m.visit AS visit_id, "
-            "m.state AS state_code, m.dt AS action_epoch, m.dt_visit AS action_visit_epoch "
-            "FROM `my` AS m LEFT JOIN visit AS v ON v.i=m.visit WHERE v.i IS NULL",
-            (),
+        orphan_progress: Dict[str, int] = {}
+        with _snapshot_stage("orphan_actions", orphan_progress, entity="action", entity_id="unmatched_visit"):
+            orphan_actions = _fetch_named_rows(
+                connection,
+                "SELECT m.i AS action_id, NULL AS project_id, m.visit AS visit_id, "
+                "m.state AS state_code, m.dt AS action_epoch, m.dt_visit AS action_visit_epoch "
+                "FROM `my` AS m LEFT JOIN visit AS v ON v.i=m.visit WHERE v.i IS NULL",
+                (),
+            )
+            orphan_progress["rows"] = len(orphan_actions)
+        progress["orphan_actions"] = len(orphan_actions)
+        with _snapshot_stage(
+            "candidate_merge", {"candidate_batches": len(candidates)}, entity="project_population", entity_id="global"
+        ):
+            merged = merge_project_metrics_candidates(candidates)
+        population = ProjectMetricsPopulation(
+            merged, orphan_actions, snapshot_metadata["captured_at_utc"], str(snapshot_metadata["source_timezone"])
         )
-        return ProjectMetricsPopulation(
-            merge_project_metrics_candidates(candidates),
-            orphan_actions,
-            snapshot_metadata["captured_at_utc"],
-            str(snapshot_metadata["source_timezone"]),
+        _LOG.info(
+            "project_metrics_snapshot stage=population_snapshot outcome=PASS project_ids=%d projects=%d "
+            "visits=%d actions=%d orphan_actions=%d duration_ms=%d",
+            progress["project_ids"], progress["projects"], progress["visits"], progress["actions"],
+            progress["orphan_actions"], int((time.monotonic() - started) * 1000),
         )
+        return population
+    except Exception as exc:
+        origin = traceback.extract_tb(exc.__traceback__)[-1]
+        _LOG.error(
+            "project_metrics_snapshot stage=population_snapshot outcome=FAIL exception_class=%s "
+            "error_code=%s source_file=%s source_line=%d source_function=%s entity=population entity_id=global "
+            "project_ids=%d projects=%d visits=%d actions=%d orphan_actions=%d duration_ms=%d",
+            type(exc).__name__, getattr(exc, "code", None) or "UNCLASSIFIED",
+            Path(origin.filename).name, origin.lineno, origin.name,
+            progress["project_ids"], progress["projects"], progress["visits"], progress["actions"],
+            progress["orphan_actions"], int((time.monotonic() - started) * 1000),
+        )
+        raise
     finally:
         connection.rollback()
 

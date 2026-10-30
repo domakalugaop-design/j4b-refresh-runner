@@ -237,6 +237,119 @@ def test_population_reader_uses_one_read_only_snapshot_and_retains_unresolved_pr
     },)
     assert population.source_timezone == "SYSTEM"
 
+
+def test_population_reader_bisects_only_row_cap_batch_and_preserves_all_rows(monkeypatch, caplog):
+    from src import project_metrics
+
+    class Connection:
+        started = 0
+        rolled_back = 0
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=()):
+            assert sql.startswith("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+            self.started += 1
+
+        def rollback(self):
+            self.rolled_back += 1
+
+    calls = []
+
+    def fetch(_connection, sql, params):
+        calls.append((sql, tuple(params)))
+        if "UTC_TIMESTAMP(6)" in sql:
+            return ({"captured_at_utc": "2026-10-30 00:00:00", "source_timezone": "SYSTEM"},)
+        if "SELECT p.i AS project_id FROM proj AS p ORDER BY p.i" in sql:
+            return ({"project_id": 1}, {"project_id": 2})
+        ids = tuple(params)
+        if "FROM proj AS p WHERE" in sql:
+            return tuple({
+                "project_id": project_id, "project_name": None, "client_id": None,
+                "manager_id": None, "coordinator_ids_raw": "", "plan_visits": 0,
+                "project_type_code": None, "project_created_epoch": None,
+                "date_from_epoch": None, "date_to_epoch": None,
+            } for project_id in ids)
+        if "FROM visit AS v WHERE" in sql:
+            if len(ids) > 1:
+                raise ProjectMetricsError(
+                    "source entity exceeded the local candidate row cap",
+                    code="SOURCE_ENTITY_ROW_CAP", processed_rows=50_001,
+                )
+            return ({"visit_id": 100 + ids[0], "project_id": ids[0], "visit_epoch": None,
+                     "visit_start_epoch": None, "visit_end_epoch": None},)
+        if "FROM `my` AS m INNER JOIN visit" in sql:
+            if len(ids) > 1:
+                raise ProjectMetricsError(
+                    "source entity exceeded the local candidate row cap",
+                    code="SOURCE_ENTITY_ROW_CAP", processed_rows=50_001,
+                )
+            return ({"action_id": 200 + ids[0], "project_id": ids[0], "visit_id": 100 + ids[0],
+                     "state_code": 40, "action_epoch": None, "action_visit_epoch": None},)
+        if "FROM client AS c" in sql or "FROM `user` AS u" in sql:
+            return ()
+        if "LEFT JOIN visit AS v ON v.i=m.visit WHERE v.i IS NULL" in sql:
+            return ()
+        raise AssertionError("unexpected source query")
+
+    monkeypatch.setattr(project_metrics, "_fetch_named_rows", fetch)
+    connection = Connection()
+    population = read_project_metrics_population(connection)
+
+    assert connection.started == connection.rolled_back == 1
+    assert population.candidate.qa["projects"] == 2
+    assert population.candidate.qa["visits"] == 2
+    assert population.candidate.qa["actions"] == 2
+    assert {row["project_id"] for row in population.candidate.projects} == {1, 2}
+    assert {row["visit_id"] for row in population.candidate.visits} == {101, 102}
+    assert {row["action_id"] for row in population.candidate.actions} == {201, 202}
+    visit_batch_sizes = [len(params) for sql, params in calls if "FROM visit AS v WHERE" in sql]
+    action_batch_sizes = [len(params) for sql, params in calls if "FROM `my` AS m INNER JOIN visit" in sql]
+    assert visit_batch_sizes == [2, 1, 1]
+    assert action_batch_sizes == [2, 1, 1]
+    assert "SOURCE_ENTITY_ROW_CAP" in caplog.text
+    assert "Synthetic" not in caplog.text
+
+
+def test_source_row_cap_error_exposes_only_safe_classification():
+    class Cursor:
+        description = (("id",),)
+        remaining = 51_000
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params):
+            pass
+
+        def fetchmany(self, size):
+            if self.remaining == 0:
+                return []
+            count = min(size, self.remaining)
+            start = 51_000 - self.remaining
+            self.remaining -= count
+            return [(index,) for index in range(start, start + count)]
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    from src.project_metrics import _fetch_named_rows
+    with pytest.raises(ProjectMetricsError) as caught:
+        _fetch_named_rows(Connection(), "SELECT id", ())
+    assert caught.value.code == "SOURCE_ENTITY_ROW_CAP"
+    assert caught.value.processed_rows == 50_001
+
 def test_status_39_is_retained_as_raw_membership_but_excluded_from_finished():
     candidate = build()
     metric = candidate.metrics[0]
